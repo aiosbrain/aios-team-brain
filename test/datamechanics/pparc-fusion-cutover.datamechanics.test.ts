@@ -1,8 +1,13 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { getFusedArcs } from "@/lib/graph/arc-fusion";
 import { writeArcCache, readArcCache } from "@/lib/graph/arc-cache";
 import { runSql } from "@/lib/db/pg/pool";
 import { db, seedTeam } from "./helpers";
+import { settleArcRefreshes } from "@/lib/graph/arcs";
+
+afterEach(async () => {
+  await settleArcRefreshes();
+});
 
 /**
  * PPARC-3 — the fused read path (design §2.2/§2.3; criteria 1-read-side, 3, 5, 7, 10).

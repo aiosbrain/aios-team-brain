@@ -10,15 +10,46 @@ import {
   TierViolationError,
 } from "@/lib/api/schemas";
 import { MAX_PAYLOAD_ROWS, wireItemPayloadSchema } from "@/lib/api/item-payload-schema";
-import { ingestItem } from "@/lib/ingest";
+import { ingestApiItem } from "@/lib/ingest";
 import { attributeIncomingItem } from "@/lib/attribution/resolve-authors";
 import { projectChangedTasksAfterWrite } from "@/lib/pm-sync";
 import {
   meetingBackfillScheduler,
   shouldScheduleMeetingBackfill,
 } from "@/lib/meetings/schedule-backfill";
+import { GdriveAuthorityError } from "@/lib/integrations/gdrive-authority";
+import { discoverGdriveContributorIdentities } from "@/lib/integrations/gdrive-identity-discovery";
+import { IdentitySnapshotChangedError } from "@/lib/identity/authority";
+import { ProjectPlanChangedError } from "@/lib/projects/project-row-locks";
+import { GdriveIngestStateChangedError } from "@/lib/ingest/gdrive-commit-locks";
 
 export const runtime = "nodejs";
+
+/**
+ * A push that lost a race, not a broken push: the identity revision or a planned project changed
+ * under its locks, a Drive plan stayed stale after its one re-plan, or a bounded lock wait ran out
+ * (55P03). Each attempt rolled back whole, so the same push may simply be sent again. The sidecar
+ * retries 429/5xx within its own bound and treats every other 4xx as permanent, so this is a 503,
+ * never a 409 — and the route itself does not retry. The transaction layer may wrap the PostgreSQL
+ * error, so the cause chain is searched (bounded).
+ */
+function isRetryableIngestConflict(error: unknown): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < 5 && current && typeof current === "object"; depth++) {
+    if (
+      current instanceof IdentitySnapshotChangedError ||
+      current instanceof ProjectPlanChangedError ||
+      current instanceof GdriveIngestStateChangedError ||
+      (current as { code?: unknown }).code === "55P03"
+    ) {
+      return true;
+    }
+    const cause = (current as { cause?: unknown }).cause;
+    if (cause === current) break;
+    current = cause;
+  }
+  return false;
+}
 
 /** The per-item `body` cap. Also enforced by `commonItemFields.body` in the payload schema. */
 const MAX_PAYLOAD = 1_000_000; // 1 MB per contract
@@ -48,6 +79,18 @@ const MAX_PAYLOAD = 1_000_000; // 1 MB per contract
  */
 const MAX_REQUEST_BYTES = Math.ceil((MAX_PAYLOAD + MAX_PAYLOAD_ROWS * 700) * 1.2);
 const PAGE_SIZE = 200;
+
+function gdriveExecution(req: NextRequest) {
+  const integrationId = req.headers.get("x-aios-integration-id") ?? "";
+  const owner = req.headers.get("x-aios-execution-owner") ?? "";
+  const generation = Number(req.headers.get("x-aios-execution-generation"));
+  const fence = Number(req.headers.get("x-aios-execution-fence"));
+  if (!/^[0-9a-f-]{36}$/i.test(integrationId) || !/^[0-9a-f-]{36}$/i.test(owner)
+      || !Number.isSafeInteger(generation) || generation < 1 || !Number.isSafeInteger(fence) || fence < 1) {
+    throw new GdriveAuthorityError("connector_principal_required", "current Google Drive execution authority is required", 403);
+  }
+  return { integrationId, owner, generation, fence };
+}
 
 export async function POST(req: NextRequest) {
   const auth = await authenticateApiKey(req);
@@ -104,16 +147,30 @@ export async function POST(req: NextRequest) {
   }
 
   try {
+    const hasExecutionHeaders = req.headers.has("x-aios-integration-id")
+      || req.headers.has("x-aios-execution-owner")
+      || req.headers.has("x-aios-execution-generation")
+      || req.headers.has("x-aios-execution-fence");
+    const execution = hasExecutionHeaders ? gdriveExecution(req) : undefined;
+    // A Drive commit first turns observed stable collaborator ids into durable identity links
+    // (AIO-1167 R44 F1) — only under the caller's LIVE execution (validated in the same transaction)
+    // and BEFORE the attribution snapshot below, which then sees them. Never for an external key.
+    if (execution && !isRestrictedTier(auth.memberTier)
+        && String(parsed.data.frontmatter?.source ?? "").toLowerCase() === "gdrive") {
+      await discoverGdriveContributorIdentities(db, auth, execution, parsed.data.frontmatter ?? {});
+    }
     // Resolve the item's author from its frontmatter at INGEST → attribute to the real human, never
     // silently to the ingesting connector. ONLY for trusted team-tier keys: an external (client) key
     // must not be able to attribute content to a team member (spoofing) — it keeps actor attribution.
     const { opts } = isRestrictedTier(auth.memberTier)
-      ? {}
+      ? { opts: undefined }
       : await attributeIncomingItem(db, auth.teamId, parsed.data, auth.memberId);
     // Pass the key's tier: ingestItem resolves the item's tier from it on BOTH write paths, so an
     // external key can neither reclassify an existing item nor declare `team` on a new one.
     const pusherTier = isRestrictedTier(auth.memberTier) ? "external" : "team";
-    const result = await ingestItem(db, auth, parsed.data, tier, opts, pusherTier);
+    const result = await ingestApiItem(
+      db,auth,parsed.data,tier,opts,pusherTier,execution,
+    );
 
     // Reactive auto-projection (brain-api v1.2 Phase 2): on a task push that actually changed
     // projected fields, schedule a bounded projection of ONLY the changed rows into the team's
@@ -154,7 +211,9 @@ export async function POST(req: NextRequest) {
     // §11 first-create/repair hook: new content keeps the existing post-response placement path,
     // with the scheduler as backstop. Existing-item access changes already moved item + context in
     // ingestItem's transaction; this idempotent hook may reconfirm them after commit.
-    if (result.status !== "unchanged" || result.accessChanged) {
+    // Never for Google Drive: its context is derived solely from the surviving audience claims
+    // inside the ingest transaction, so the system-project routing here would widen it.
+    if ((result.status !== "unchanged" || result.accessChanged) && parsed.data.frontmatter?.source !== "gdrive") {
       const teamId = auth.teamId;
       const itemId = result.id;
       // Scheduling the post-response work must never fail the push — not the work (best-effort
@@ -191,7 +250,16 @@ export async function POST(req: NextRequest) {
     if (e instanceof TierViolationError) {
       return errorResponse("forbidden_tier", e.message, 403);
     }
-    return errorResponse("internal", e instanceof Error ? e.message : "ingest failed", 500);
+    if (e instanceof GdriveAuthorityError) {
+      return errorResponse(e.code, e.message, e.status);
+    }
+    // Fixed messages from here on: an exception's own text can carry SQL, lock and relation detail.
+    if (isRetryableIngestConflict(e)) {
+      return errorResponse("temporarily_unavailable", "ingest conflicted with a concurrent change; retry shortly", 503);
+    }
+    // Full detail stays in the server log; the caller gets the fixed message.
+    console.error("[items] push failed:", e instanceof Error ? e.message : e);
+    return errorResponse("internal", "ingest failed", 500);
   }
 }
 

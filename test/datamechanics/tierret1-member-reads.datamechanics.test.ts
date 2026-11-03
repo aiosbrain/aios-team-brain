@@ -25,6 +25,7 @@ import { formatAccessHealth } from "@/lib/admin/access-health-format";
 import { ingestItem } from "@/lib/ingest";
 import { TierViolationError } from "@/lib/api/schemas";
 import { settleTimelineRefreshes } from "@/lib/dashboard/timeline-cache";
+import { repairAttributionNow } from "@/lib/ingest/reconcile-attribution";
 
 /**
  * TIERRET-1 / AIO-1045 — membership is the ONLY member content read rule (accepted spec
@@ -210,6 +211,11 @@ async function buildFixture(): Promise<Fx> {
 
   const { key: externalKey } = await issueApiKey(db(), seed.teamId, m.id, "ext");
   const { key: teamPeerKey } = await issueApiKey(db(), seed.teamId, peer.id, "peer");
+  // The member insert/delete/status writes above open an identity-attribution repair; attributed
+  // reads (timeline) are fenced (503) until it completes. Complete it before the fixture is used.
+  await repairAttributionNow(db(), seed.teamId, seed.teamSlug, { maxBatches: 10, batchSize: 50 });
+  expect((await db().from("team_identity_authority").select("repair_status")
+    .eq("team_id", seed.teamId).maybeSingle()).data?.repair_status ?? "complete").toBe("complete");
   return {
     seed,
     srcId,
@@ -545,8 +551,14 @@ describe("TIERRET-1 AC-12 — timeline via the production cache path", () => {
     await plantBuiltin(F.seed, connector, "everyone");
     const grantlessAgent = await rawMember(F.seed, { kind: "agent", tier: "team" });
     await plantBuiltin(F.seed, grantlessAgent, "everyone");
-    for (const id of [connector, grantlessAgent]) {
-      const { key } = await issueApiKey(db(), F.seed.teamId, id, "k");
+    const apiKeys: string[] = [];
+    for (const id of [connector, grantlessAgent]) apiKeys.push((await issueApiKey(db(), F.seed.teamId, id, "k")).key);
+    // These member inserts come AFTER buildFixture's repair and reopen identity-attribution repair;
+    // attributed reads are fenced (503) until it completes. Complete it before the Timeline GETs.
+    await repairAttributionNow(db(), F.seed.teamId, F.seed.teamSlug, { maxBatches: 10, batchSize: 50 });
+    expect((await db().from("team_identity_authority").select("repair_status")
+      .eq("team_id", F.seed.teamId).maybeSingle()).data?.repair_status ?? "complete").toBe("complete");
+    for (const key of apiKeys) {
       expect((await timelineGET(req("/api/v1/timeline", key))).status).toBe(200);
     }
     const { data } = await db().from("work_timeline_cache").select("group_key").eq("team_id", F.seed.teamId);

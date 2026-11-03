@@ -16,6 +16,8 @@ import {
 } from "@/lib/chat/store";
 import { generateAndSetTitle } from "@/lib/chat/title";
 import { recordLlmUsage } from "@/lib/costs/llm-usage";
+import { GraphProvenanceUnavailableError } from "@/lib/graph/provenance-read";
+import { AttributionRepairPendingError } from "@/lib/access/authorization-epoch";
 
 export const runtime = "nodejs";
 export const maxDuration = 120;
@@ -104,20 +106,6 @@ export async function POST(req: NextRequest) {
     return errorResponse("invalid_payload", "delegated tokens are stateless — conversation_id is not supported", 422);
   }
 
-  // Persistent thread, owned by the key's member — same store as the dashboard chat, so a CLI /
-  // Telegram-via-Hermes turn continues the member's existing conversation; the assistant turn is
-  // persisted once streaming completes. Delegated tokens get NO thread: nothing is read or
-  // written to the member's conversations.
-  const owner = auth ? { teamId: auth.teamId, memberId: auth.memberId } : null;
-  let conversationId = owner && conversation_id && (await ownsConversation(db, owner, conversation_id)) ? conversation_id : null;
-  let createdNew = false;
-  if (owner && !conversationId) {
-    const created = await createConversation(db, owner, question);
-    conversationId = created?.id ?? null;
-    createdNew = true;
-  }
-  if (owner && conversationId) await appendMessage(db, owner, conversationId, "user", question);
-
   // Who the answer is FOR — anchors first-person resolution ("what did I ship?"). For a delegated
   // token that is the REPRESENTED member (on_behalf_of ?? launcher), resolved live.
   let caller: { displayName: string | null; email: string | null; handle: string };
@@ -182,12 +170,40 @@ export async function POST(req: NextRequest) {
   // current turn's answer is freshly retrieval-grounded and appended to the conversation.
   const historyTurns: import("@/lib/query/claude").ChatTurn[] = [];
 
+  // AIO-1167: retrieval completes BEFORE this turn leaves any trace. A graph context whose
+  // authorization cannot be proven right now is a retryable refusal — never empty context, never a
+  // raw error, and never a conversation, message or query_log row for a turn that did not happen
+  // (so it costs the minute throttle above, not the daily quota).
+  const started = Date.now();
+  let ctx: Awaited<ReturnType<typeof retrieve>>;
+  try {
+    ctx = await retrieve(db, teamId, memberTier, question, project, enforce);
+  } catch (e) {
+    if (e instanceof GraphProvenanceUnavailableError || e instanceof AttributionRepairPendingError) {
+      return errorResponse("temporarily_unavailable", "query context is temporarily unavailable; retry shortly", 503);
+    }
+    throw e;
+  }
+
+  // Persistent thread, owned by the key's member — same store as the dashboard chat, so a CLI /
+  // Telegram-via-Hermes turn continues the member's existing conversation; the assistant turn is
+  // persisted once streaming completes. Delegated tokens get NO thread: nothing is read or
+  // written to the member's conversations.
+  const owner = auth ? { teamId: auth.teamId, memberId: auth.memberId } : null;
+  let conversationId = owner && conversation_id && (await ownsConversation(db, owner, conversation_id)) ? conversation_id : null;
+  let createdNew = false;
+  if (owner && !conversationId) {
+    const created = await createConversation(db, owner, question);
+    conversationId = created?.id ?? null;
+    createdNew = true;
+  }
+  if (owner && conversationId) await appendMessage(db, owner, conversationId, "user", question);
+
   // Quota integrity (Codex B3 High): write the query_log row BEFORE streaming and UPDATE it on
   // `done` — the daily count and team budget read query_log, and a row written only in the done
   // branch made read-the-deltas-and-disconnect free and uncounted (10/min sustained, forever).
   // An attempt now consumes quota even when the stream errors or is canceled; token/cost fields
   // stay 0 for incomplete streams (the usage numbers only exist at `done`).
-  const started = Date.now();
   const { data: logRow, error: logErr } = await db
     .from("query_log")
     .insert({ team_id: teamId, member_id: launcherId, question })
@@ -198,7 +214,6 @@ export async function POST(req: NextRequest) {
     return errorResponse("internal", "query accounting failed", 500);
   }
   const queryLogId = (logRow as { id: string }).id;
-  const ctx = await retrieve(db, teamId, memberTier, question, project, enforce);
 
   // Per-team provider keys + models + the explicit answering-backend override (same resolver the
   // dashboard route uses, so both honor OpenRouter/OpenAI/local + `teams.answering_provider`).

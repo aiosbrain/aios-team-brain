@@ -7,8 +7,10 @@ import {
   upsertIntegration,
   setIntegrationSecret,
   setIntegrationStatus,
-  deleteIntegration,
+  removeIntegrationById,
   getEnabledIntegrationsWithSecrets,
+  getIntegrationWithSecret,
+  getIntegrationWithSecretById,
   saveProviderModel as saveProviderModel_,
 } from "@/lib/integrations/manage";
 import { selectLlmBackend, type AnsweringProvider } from "@/lib/query/llm-backend";
@@ -54,8 +56,104 @@ import {
 } from "@/lib/api/schemas";
 import { buildConfig, toList } from "@/lib/integrations/build-config";
 import { audit } from "@/lib/api/audit";
+import {
+  acquireGdriveAdminTestAuthority,
+  authorizeGdriveAdminTestCall,
+  provisionGdriveConnectorPrincipal,
+  publishGdriveVerifiedSelection,
+  publishGdriveVerifiedConfig,
+  refreshGdriveAdminAccess,
+  saveGdriveConnectionConfig,
+  GdriveAuthorityError,
+  validateGdriveAudienceProjects,
+  type GdriveAdminTestAuthority,
+} from "@/lib/integrations/gdrive-authority";
+import { gdriveRootKeys } from "@/lib/integrations/gdrive-credential-fields";
+import { getIntegrationType } from "@/lib/integrations/read";
 
 export type PrimaryPmProvider = "plane" | "linear" | null;
+
+async function verifyGdriveTargets(
+  authority: GdriveAdminTestAuthority,
+  targets: Array<{ kind: "file" | "folder" | "drive"; id: string }>,
+): Promise<{ denied: number }> {
+  // Held to the broker's grant policy before any Drive read (AIO-1167 R47 F6); refusals are sanitized.
+  const { accessToken } = await refreshGdriveAdminAccess(authority);
+  let denied = 0;
+  for (const target of targets) {
+    await authorizeGdriveAdminTestCall(authority);
+    const path = target.kind === "drive"
+      ? `https://www.googleapis.com/drive/v3/drives/${encodeURIComponent(target.id)}?fields=id,name`
+      : `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(target.id)}?supportsAllDrives=true&fields=id,mimeType,trashed`;
+    const response = await fetch(path, {
+      headers: { Authorization: `Bearer ${accessToken}` }, cache: "no-store",
+      signal: AbortSignal.timeout(10_000),
+    });
+    const metadata = response.ok
+      ? await response.json().catch(() => ({})) as { id?: string; mimeType?: string; trashed?: boolean }
+      : {};
+    const expectedMime = target.kind === "file"
+      ? "application/vnd.google-apps.document"
+      : target.kind === "folder" ? "application/vnd.google-apps.folder" : undefined;
+    if (!response.ok || metadata.id !== target.id || metadata.trashed
+        || (expectedMime && metadata.mimeType !== expectedMime)) denied += 1;
+  }
+  await authorizeGdriveAdminTestCall(authority);
+  return { denied };
+}
+
+/** Explicit, Admin-authorized one-time provisioning/rotation for the remote Drive sidecar key. */
+export async function provisionGoogleDriveConnector(
+  teamSlug: string,
+  integrationId: string,
+): Promise<{ ok: boolean; key?: string; rotated?: boolean; error?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  try {
+    const result = await provisionGdriveConnectorPrincipal({
+      teamId: ctx.teamId, integrationId, actorMemberId: ctx.memberId,
+    });
+    revalidatePath(`/t/${teamSlug}/admin/integrations`);
+    return { ok: true, key: result.key, rotated: result.rotated };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : "could not provision connector" };
+  }
+}
+
+/** Queue a durable manual/retry request. The sidecar consumes it through the same connection-bound
+ * coordinator as scheduled/watch work, so clicking twice or racing the scheduler never creates a
+ * second writer. */
+export async function runGoogleDriveNow(
+  teamSlug: string,
+  integrationId: string,
+  trigger: "manual" | "retry" = "manual",
+): Promise<{ ok: boolean; error?: string; message?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  const db = adminClient();
+  const integration = await getIntegrationWithSecretById(db, ctx.teamId, integrationId);
+  if (!integration || integration.type !== "gdrive") return { ok: false, error: "Google Drive connection was not found" };
+  if (integration.status !== "enabled") {
+    return { ok: false, error: "Resume Google Drive before running it" };
+  }
+  if (String(integration.config.authMode ?? "oauth") === "oauth" && !integration.secret) {
+    return { ok: false, error: "Reconnect Google Drive before running it" };
+  }
+  const { error } = await db.from("gdrive_run_requests").insert({
+    team_id: ctx.teamId, integration_id: integrationId, requested_by: ctx.memberId,
+    trigger, status: "pending",
+  });
+  if (error && !String(error.message).includes("gdrive_run_requests_one_active_idx")) {
+    return { ok: false, error: "Google Drive run could not be queued" };
+  }
+  await audit(db, {
+    team_id: ctx.teamId, actor_kind: "member", member_id: ctx.memberId,
+    action: trigger === "retry" ? "gdrive.run_retried" : "gdrive.run_requested",
+    target_type: "integration", target_id: integrationId, meta: {},
+  });
+  revalidatePath(`/t/${teamSlug}/admin/integrations`);
+  return { ok: true, message: error ? "A Google Drive run is already queued or running." : "Google Drive run queued." };
+}
 
 /**
  * The admin-facing error when a Slack save names a private channel, or null to let it through.
@@ -87,6 +185,10 @@ async function rejectPrivateSlackChannels(
   }
 }
 
+/** Why a pasted Drive credential is refused: OAuth credentials come only from the verified callback. */
+const GDRIVE_SECRET_REFUSAL =
+  "Google Drive credentials are not accepted here: use Connect or Reconnect with Google. Service-account keys stay with the local sidecar. Nothing was saved.";
+
 export async function saveIntegration(
   teamSlug: string,
   form: {
@@ -102,9 +204,66 @@ export async function saveIntegration(
   if (!ctx) return { ok: false, error: "admins only" };
   const name = form.name.trim();
   if (!name) return { ok: false, error: "name is required" };
+  // Refused before anything is read, verified or written (AIO-1167 R43 F1).
+  if (form.type === "gdrive" && form.secret) return { ok: false, error: GDRIVE_SECRET_REFUSAL };
   const auth = { teamId: ctx.teamId, memberId: ctx.memberId };
   try {
-    const config = buildConfig(form.type, form.selection, { inboundApply: form.inboundApply });
+    let config = buildConfig(form.type, form.selection, { inboundApply: form.inboundApply });
+    if (form.type === "gdrive") {
+      const existing = await getIntegrationWithSecret(adminClient(), ctx.teamId, "gdrive", name);
+      // A selection save keeps the connection's credential mode. The credential-owned fields (OAuth
+      // account/subject/scopes, service-account verification) are NOT taken from this unlocked read:
+      // the locked owners re-derive them from the row they hold (`gdrive-credential-fields`), so a
+      // reconnect committing after this read is never overwritten (AIO-1167 R42 F6).
+      config = { ...config, authMode: config.authMode ?? existing?.config.authMode ?? "oauth" };
+      const authMode = String(config.authMode ?? "oauth");
+      const audience = Array.isArray(config.audienceProjectIds)
+        ? [...new Set(config.audienceProjectIds.filter((id): id is string => typeof id === "string"))]
+        : [];
+      if (audience.length === 0) {
+        return { ok: false, error: "Google Drive requires at least one approved audience project" };
+      }
+      if (!await validateGdriveAudienceProjects(ctx.teamId, audience)) {
+        return { ok: false, error: "Every Google Drive audience must be an existing project with an access grant" };
+      }
+      const roots = [
+        ...((config.fileIds as string[] | undefined) ?? []).map((id) => ({ kind: "file" as const, id })),
+        ...((config.folderIds as string[] | undefined) ?? []).map((id) => ({ kind: "folder" as const, id })),
+        ...((config.sharedDriveIds as string[] | undefined) ?? []).map((id) => ({ kind: "drive" as const, id })),
+      ];
+      const addedTo = (prior: Record<string, unknown> | undefined) => {
+        const held = gdriveRootKeys(prior ?? {});
+        return roots.filter((root) => !held.has(`${root.kind}:${root.id}`));
+      };
+      const added = addedTo(existing?.config);
+      if (added.length > 0) {
+        if (authMode === "service_account") {
+          // Local credentials are deliberately not uploaded. Their first fenced provider read
+          // verifies these roots and publishes a non-secret account identity.
+        } else if (!existing || existing.config.authMode !== "oauth") {
+          return { ok: false, error: "Connect Google Drive before saving manual root IDs" };
+        } else {
+          const authority = await acquireGdriveAdminTestAuthority({
+            teamId: ctx.teamId, memberId: ctx.memberId, integrationName: name,
+          });
+          // Prove every root the LOCKED snapshot lacks, not just those the earlier read lacked: a
+          // root removed in between must be verified again before it returns. The publication
+          // refuses if the snapshot's generation has moved since.
+          const proof = await verifyGdriveTargets(authority, addedTo(authority.config));
+          if (proof.denied > 0) {
+            return { ok: false, error: `${proof.denied} pasted root ID(s) are not accessible to this Google connection; the saved selection was unchanged` };
+          }
+          await publishGdriveVerifiedConfig(authority, config, "gdrive.selection_manual_verified");
+          revalidatePath(`/t/${teamSlug}/admin/integrations`);
+          return { ok: true };
+        }
+      }
+      // Locked save: a narrowed audience is applied to every claimed document before this returns,
+      // and the connection keeps its paused/enabled status.
+      await saveGdriveConnectionConfig(adminClient(), auth, { name, config });
+      revalidatePath(`/t/${teamSlug}/admin/integrations`);
+      return { ok: true };
+    }
     // Only channels PUBLIC to the workspace may be ingested — refuse the save rather than accept a
     // private channel the ingester will silently skip forever (see `slack-validate`).
     if (form.type === "slack") {
@@ -151,6 +310,18 @@ export async function rotateSecret(
   if (!ctx) return { ok: false, error: "admins only" };
   if (!secret) return { ok: false, error: "secret is required" };
   try {
+    // Team-scoped type check BEFORE the write: a Drive credential is replaced only by the verified
+    // OAuth reconnect, never by a pasted secret (AIO-1167 R43 F1). Read through the admin-gated
+    // dashboard reader (`requireAdmin` above resolved this caller as an admin). A row's type never
+    // changes, so the read cannot go stale before the write. An id this team does not own rotates nothing.
+    let type: string | null;
+    try {
+      type = await getIntegrationType(adminClient(), ctx.teamId, id, { role: "admin" });
+    } catch {
+      return { ok: false, error: "could not rotate" };
+    }
+    if (!type) return { ok: false, error: "integration not found" };
+    if (type === "gdrive") return { ok: false, error: GDRIVE_SECRET_REFUSAL };
     await setIntegrationSecret(adminClient(), { teamId: ctx.teamId, memberId: ctx.memberId }, id, secret);
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "could not rotate" };
@@ -966,12 +1137,158 @@ export async function removeIntegration(
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
   try {
-    await deleteIntegration(adminClient(), { teamId: ctx.teamId, memberId: ctx.memberId }, id);
+    const db = adminClient();
+    await removeIntegrationById(db, { teamId: ctx.teamId, memberId: ctx.memberId }, id);
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "could not delete" };
   }
   revalidatePath(`/t/${teamSlug}/admin/integrations`);
   return { ok: true };
+}
+
+/**
+ * Admin-only OAuth connection test and selected-scope preview. Provider calls are limited to the
+ * exact saved file/folder/Shared Drive roots; this never lists unrelated Drive content and never
+ * returns the access token or encrypted credential to the browser.
+ */
+export async function testGoogleDriveConnection(
+  teamSlug: string,
+  name: string,
+  continuation = 0,
+): Promise<{ ok: boolean; error?: string; message?: string; checked?: number; total?: number; continuation?: number }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  try {
+    const stored = await getIntegrationWithSecret(adminClient(), ctx.teamId, "gdrive", name);
+    if (stored?.config.authMode === "service_account") {
+      const verified = stored.config.serviceAccountStatus === "verified";
+      return {
+        ok: verified,
+        ...(verified ? {} : { error: "Local service-account credentials have not completed a verified provider run" }),
+        message: verified
+          ? `Verified local service account ${String(stored.config.serviceAccountIdentity ?? "")}; credentials remain on the sidecar.`
+          : "Service-account mode is configured. Provision the connector principal and run the sidecar with local credentials to verify access.",
+        checked: 0,
+        total: [
+          ...((stored.config.fileIds as string[] | undefined) ?? []),
+          ...((stored.config.folderIds as string[] | undefined) ?? []),
+          ...((stored.config.sharedDriveIds as string[] | undefined) ?? []),
+        ].length,
+      };
+    }
+    const authority = await acquireGdriveAdminTestAuthority({
+      teamId: ctx.teamId, memberId: ctx.memberId, integrationName: name,
+    });
+    const { accessToken, scopes } = await refreshGdriveAdminAccess(authority);
+    const config = authority.config;
+    const targets = [
+      ...((config.fileIds as string[] | undefined) ?? []).map((id) => ({ kind: "file", id })),
+      ...((config.folderIds as string[] | undefined) ?? []).map((id) => ({ kind: "folder", id })),
+      ...((config.sharedDriveIds as string[] | undefined) ?? []).map((id) => ({ kind: "drive", id })),
+    ];
+    const start = Math.max(0, Math.min(continuation, targets.length));
+    const batch = targets.slice(start, start + 100);
+    let reachable = 0;
+    let denied = 0;
+    let checked = 0;
+    for (const target of batch) {
+      await authorizeGdriveAdminTestCall(authority);
+      const path = target.kind === "drive"
+        ? `https://www.googleapis.com/drive/v3/drives/${encodeURIComponent(target.id)}?fields=id,name`
+        : `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(target.id)}?supportsAllDrives=true&fields=id,name,mimeType,driveId`;
+      let response: Response;
+      try {
+        response = await fetch(path, {
+          headers: { Authorization: `Bearer ${accessToken}` }, cache: "no-store",
+          signal: AbortSignal.timeout(10_000),
+        });
+      } catch {
+        const resumeAt = start + checked;
+        return {
+          ok: false,
+          error: "Google Drive preview was interrupted; unchecked roots were not reported healthy",
+          message: `${resumeAt} of ${targets.length} selected roots checked; continue at ${resumeAt}.`,
+          checked: resumeAt, total: targets.length, continuation: resumeAt,
+        };
+      }
+      checked += 1;
+      if (response.ok) reachable += 1;
+      else denied += 1;
+    }
+    await authorizeGdriveAdminTestCall(authority);
+    const empty = config.selectionState === "empty";
+    const next = start + checked < targets.length ? start + checked : undefined;
+    return {
+      ok: denied === 0,
+      ...(denied ? { error: `${denied} of ${batch.length} checked roots are not accessible; the saved scope was not broadened` } : {}),
+      message: `${String(config.authenticatedAccount ?? "Google account")} authenticated with ${scopes.length} granted scope(s). ${empty ? "The saved selection is intentionally empty" : `${reachable} of ${checked} checked root(s) reachable`}; checked ${start + checked}/${targets.length}${next !== undefined ? ` (continue at ${next})` : ""}; recursive=${String(Boolean(config.recursive))}.`,
+      checked: start + checked,
+      total: targets.length,
+      continuation: next,
+    };
+  } catch (error) {
+    // Authority refusals carry sanitized, actionable text (reconnect, paused, temporarily unavailable).
+    if (error instanceof GdriveAuthorityError) return { ok: false, error: error.message };
+    return { ok: false, error: "Google Drive connection test failed without changing the saved selection" };
+  }
+}
+
+/** The most Picker documents one save verifies (one provider read each, under the Admin snapshot). */
+const GDRIVE_PICKER_MAX_DOCS = 100;
+
+/** Persist only Google Docs that Picker granted to this OAuth client and the server can verify.
+ * Picker's browser token is intentionally never sent here; the encrypted refresh credential owner
+ * performs the proof, and selection publication revalidates the same Admin/credential generation. */
+export async function saveGoogleDrivePickerSelection(
+  teamSlug: string,
+  name: string,
+  selectedIds: string[],
+): Promise<{ ok: boolean; error?: string; message?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  const ids = [...new Set(selectedIds.map((id) => id.trim()).filter(Boolean))];
+  if (ids.length === 0) return { ok: false, error: "No Google Docs were selected" };
+  // Refused whole, never truncated: the publication REPLACES the file list, so keeping only the
+  // first N would silently drop the rest while reporting success (AIO-1167 R42 F6).
+  if (ids.length > GDRIVE_PICKER_MAX_DOCS) {
+    return {
+      ok: false,
+      error: `${ids.length} Google Docs were selected; at most ${GDRIVE_PICKER_MAX_DOCS} can be saved at once. The saved selection was unchanged`,
+    };
+  }
+  try {
+    const authority = await acquireGdriveAdminTestAuthority({
+      teamId: ctx.teamId, memberId: ctx.memberId, integrationName: name,
+    });
+    const { accessToken } = await refreshGdriveAdminAccess(authority);
+    const verified: string[] = [];
+    const denied: string[] = [];
+    for (const id of ids) {
+      await authorizeGdriveAdminTestCall(authority);
+      const response = await fetch(
+        `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(id)}?supportsAllDrives=true&fields=id,mimeType,trashed`,
+        { headers: { Authorization: `Bearer ${accessToken}` }, cache: "no-store", signal: AbortSignal.timeout(10_000) },
+      );
+      const metadata = response.ok
+        ? await response.json().catch(() => ({})) as { id?: string; mimeType?: string; trashed?: boolean }
+        : {};
+      if (response.ok && metadata.id === id
+          && metadata.mimeType === "application/vnd.google-apps.document" && !metadata.trashed) {
+        verified.push(id);
+      } else {
+        denied.push(id);
+      }
+    }
+    await authorizeGdriveAdminTestCall(authority);
+    if (denied.length > 0 || verified.length !== ids.length) {
+      return { ok: false, error: `${denied.length} selected item(s) are inaccessible or are not Google Docs; the saved selection was unchanged` };
+    }
+    await publishGdriveVerifiedSelection(authority, verified);
+    revalidatePath(`/t/${teamSlug}/admin/integrations`);
+    return { ok: true, message: `Saved ${verified.length} Picker-authorized Google Doc(s).` };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : "Google Picker selection could not be verified" };
+  }
 }
 
 /**

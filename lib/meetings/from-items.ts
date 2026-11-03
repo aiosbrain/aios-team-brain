@@ -221,7 +221,7 @@ export async function backfillMeetingNotesFromItems(
   // than a transcript does. Built lazily: a batch with no calendar events pays nothing.
   let byEmail: Map<string, string> | null = null;
   const resolveEmails = async (emails: string[]): Promise<string[]> => {
-    if (!byEmail) byEmail = (await buildIdentityMap(admin, teamId)).byEmail;
+    if (!byEmail) byEmail = (await buildIdentityMap(admin, teamId, { strict: true })).byEmail;
     const seen = new Set<string>();
     const ids: string[] = [];
     for (const e of emails) {

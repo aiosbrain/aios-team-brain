@@ -47,6 +47,9 @@ export default defineConfig({
   test: {
     environment: "node",
     include: ["test/datamechanics/**/*.datamechanics.test.ts"],
+    // Once per invocation, in the main process, before any worker: mints this run's id and creates
+    // its run-safety state — which `setup.ts` refuses to truncate without.
+    globalSetup: ["test/datamechanics/global-setup.ts"],
     setupFiles: ["test/datamechanics/setup.ts"],
     fileParallelism: false, // shared DB → serialize files; truncate per test
     hookTimeout: 30_000,

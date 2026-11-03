@@ -1,0 +1,442 @@
+import "server-only";
+
+import type { DbClient } from "@/lib/db/types";
+import { runSql, withTransaction } from "@/lib/db/pg/pool";
+import {
+  providerIdentityState,
+  type IdentityMap,
+  type ProviderIdentityState,
+} from "@/lib/identity/resolve";
+import { googleEmailKey } from "@/lib/identity/google-email-authority";
+import { parseAuthorRefs, resolveItemAuthorMember } from "@/lib/attribution/resolve-authors";
+import { syncGdriveContributionEvidence } from "@/lib/ingest/gdrive-contribution-store";
+import { purgeTeamLearningCachesStrict } from "@/lib/ingest/reconcile-attribution";
+import { advanceAuthorizationEpoch } from "@/lib/access/authorization-epoch";
+import {
+  buildIdentityAuthoritySnapshot,
+  validateIdentityAuthorityRevision,
+} from "@/lib/identity/authority";
+import { lockItemAttribution } from "@/lib/ingest/item-attribution-lock";
+import {
+  DRIVE_OBLIGATION_PROVENANCE,
+  readDriveObligationProvenance,
+} from "@/lib/ingest/repair-eligibility";
+
+const DEFAULT_BATCH = 100;
+
+interface Obligation {
+  team_id: string;
+  provider: string;
+  external_id: string;
+  mapping_revision: string | number;
+  cursor_item_id: string | null;
+  items_scanned: string | number;
+  items_updated: string | number;
+  versions_updated: string | number;
+  contributions_updated: string | number;
+}
+
+function hasRetainedGdriveEvidence(frontmatter: Record<string, unknown>): boolean {
+  return frontmatter.source === "gdrive" && (
+    (Array.isArray(frontmatter.authors) && frontmatter.authors.length > 0) ||
+    (Array.isArray(frontmatter.contributions) && frontmatter.contributions.length > 0)
+  );
+}
+
+/**
+ * Whether an unresolved author is HELD by an ambiguous Google email history rather than decided
+ * (AIO-1167 PR743 R51): some ref's Google `author-email:` identity has several equivalent histories and
+ * no canonical decision, and no ref carries a definite unlink. That is the rule historical
+ * reattribution applies (`lib/ingest/reattribute.ts`): an ambiguity blocks new attribution but is not
+ * an unlink, so it never erases established credit. A definite unlink anywhere in the evidence still
+ * clears, and a remap resolves to its new owner before this is asked.
+ */
+function heldByGoogleEmailAmbiguity(map: IdentityMap, frontmatter: Record<string, unknown>): boolean {
+  let ambiguous = false;
+  for (const ref of parseAuthorRefs(frontmatter)) {
+    const states: (ProviderIdentityState | null)[] = [];
+    if (ref.provider && ref.externalId) states.push(providerIdentityState(map, ref.provider, ref.externalId));
+    const email = ref.email?.trim().toLowerCase();
+    if (email && ref.provider?.trim().toLowerCase() === "gdrive") {
+      states.push(providerIdentityState(map, "gdrive", `author-email:${email}`));
+    }
+    if (email) states.push(providerIdentityState(map, "email-alias", email));
+    if (states.includes("unlinked")) return false;
+    if (states.includes("ambiguous")) ambiguous = true;
+  }
+  return ambiguous;
+}
+
+/**
+ * The credit a row keeps when its evidence resolves to nobody. Drive evidence that names no member
+ * clears credit — the obligation exists because a mapping changed — except an established, non-connector
+ * owner held only by an ambiguous Google email history (above). Rows without retained Drive evidence
+ * keep what they have.
+ */
+function unresolvedCredit(
+  map: IdentityMap,
+  connectors: ReadonlySet<string>,
+  frontmatter: Record<string, unknown>,
+  current: string | null,
+): string | null {
+  if (!hasRetainedGdriveEvidence(frontmatter)) return current;
+  if (current && !connectors.has(current) && heldByGoogleEmailAmbiguity(map, frontmatter)) return current;
+  return null;
+}
+
+/**
+ * Whether a Drive document's retained evidence names one Google email identity (AIO-1167 PR743): an
+ * author/contribution whose external id is EQUIVALENT to the obligation's key under the one comparison
+ * contract (`google-email-authority` — prefix/address whitespace, prefix case and JavaScript case
+ * folding included), or whose optional email is that address. Evidence without an email is covered by
+ * its external id alone.
+ */
+function namesGoogleEmail(frontmatter: Record<string, unknown>, canonical: string): boolean {
+  const address = canonical.slice("author-email:".length);
+  const text = (value: unknown): string => typeof value === "string" ? value : "";
+  for (const list of [frontmatter.authors, frontmatter.contributions]) {
+    if (!Array.isArray(list)) continue;
+    for (const raw of list) {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+      const entry = raw as Record<string, unknown>;
+      const externalId = text(entry.external_id) || text(entry.externalId);
+      if (externalId && googleEmailKey("gdrive", externalId) === canonical) return true;
+      const email = text(entry.email).trim().toLowerCase();
+      if (email && email === address) return true;
+    }
+  }
+  return false;
+}
+
+async function currentObligation(obligation: Obligation): Promise<Obligation | null> {
+  const { rows } = await runSql<Obligation>(
+    `select team_id,provider,external_id,mapping_revision,cursor_item_id,
+            items_scanned,items_updated,versions_updated,contributions_updated
+       from identity_repair_obligations
+      where team_id=$1 and provider=$2 and external_id=$3 and mapping_revision=$4
+        and status in ('pending','running','retry')
+      for update`,
+    [obligation.team_id, obligation.provider, obligation.external_id, obligation.mapping_revision],
+  );
+  return rows[0] ?? null;
+}
+
+async function mappingStillCurrent(obligation: Obligation): Promise<boolean> {
+  const { rows } = await runSql<{ revision: string | number }>(
+    `select revision from member_identity_mapping_state
+      where team_id=$1 and provider=$2 and external_id=$3 for update`,
+    [obligation.team_id, obligation.provider, obligation.external_id],
+  );
+  return Number(rows[0]?.revision) === Number(obligation.mapping_revision);
+}
+
+export interface IdentityRepairHooks {
+  /** Test-only scheduling point: the snapshot is built and NOTHING is held. */
+  afterSnapshot?: () => Promise<void>;
+  /** Test-only scheduling point: the item is nominated, its attribution advisory not yet taken. */
+  beforeItemLock?: (itemId: string) => Promise<void>;
+  /** Test-only scheduling point: the item's attribution advisory is held, its row not yet read. */
+  afterItemLock?: (itemId: string) => Promise<void>;
+}
+
+async function repairOneItem(
+  db: DbClient,
+  teamId: string,
+  itemId: string,
+  map: IdentityMap,
+  connectors: ReadonlySet<string>,
+  authorityRevision: number,
+  hooks: IdentityRepairHooks,
+): Promise<{ item: number; versions: number; contributions: number }> {
+  await hooks.beforeItemLock?.(itemId);
+  await lockItemAttribution(teamId,itemId);
+  await hooks.afterItemLock?.(itemId);
+  const { rows } = await runSql<{
+    id: string;
+    member_id: string | null;
+    member_id_locked: boolean;
+    frontmatter: Record<string, unknown>;
+  }>(
+    `select id,member_id,member_id_locked,frontmatter from items
+      where team_id=$1 and id=$2 for update`,
+    [teamId, itemId],
+  );
+  const item = rows[0];
+  if (!item) return { item: 0, versions: 0, contributions: 0 };
+  // The candidate read nominated this item; it did not admit it. Provenance is decided here, by a
+  // statement of its own issued AFTER the attribution advisory and the row lock: the persisted
+  // same-team Drive mapping, and Drive source evidence on the row as it is now. A row that is not a
+  // Drive document — unmapped, mapped only in another team or from another source, or no longer
+  // Drive-sourced — is scanned past with nothing written. A read that fails or answers nothing
+  // throws: the batch rolls back, and the obligation's cursor with it.
+  if (!await readDriveObligationProvenance(teamId, itemId)) {
+    return { item: 0, versions: 0, contributions: 0 };
+  }
+  let itemUpdates = 0;
+  let versionUpdates = 0;
+  if (!item.member_id_locked) {
+    const resolved = resolveItemAuthorMember(map, item.frontmatter ?? {}, connectors);
+    const next = resolved ?? unresolvedCredit(map, connectors, item.frontmatter ?? {}, item.member_id);
+    if (next !== item.member_id) {
+      const result = await runSql(
+        `update items set member_id=$3,updated_at=now()
+          where team_id=$1 and id=$2 and member_id_locked=false`,
+        [teamId, itemId, next],
+      );
+      itemUpdates += result.rowCount;
+    }
+    const { rows: versions } = await runSql<{
+      id: string;
+      member_id: string | null;
+      frontmatter: Record<string, unknown>;
+    }>(
+      `select v.id,v.member_id,v.frontmatter from item_versions v
+        join items i on i.id=v.item_id
+       where i.team_id=$1 and i.id=$2 and i.member_id_locked=false
+       order by v.created_at,v.id for update of v`,
+      [teamId, itemId],
+    );
+    for (const version of versions) {
+      const resolvedVersion = resolveItemAuthorMember(map, version.frontmatter ?? {}, connectors);
+      const nextVersion = resolvedVersion
+        ?? unresolvedCredit(map, connectors, version.frontmatter ?? {}, version.member_id);
+      if (nextVersion === version.member_id) continue;
+      const result = await runSql(`update item_versions set member_id=$2 where id=$1`, [
+        version.id, nextVersion,
+      ]);
+      versionUpdates += result.rowCount;
+    }
+  }
+  const contribution = await syncGdriveContributionEvidence(
+    db, teamId, itemId, item.frontmatter ?? {}, map,
+    {
+      memberIdLocked:item.member_id_locked,memberId:item.member_id,
+      authorityRevision,
+    },
+  );
+  return { item: itemUpdates, versions: versionUpdates, contributions: contribution.observed };
+}
+
+/**
+ * Record a failed attempt for a retry — only while the obligation is still CURRENT work.
+ *
+ * Terminal states are final: a late failure from a worker that lost a race must not turn an
+ * `obsolete` (or `complete`) obligation back into scheduled work (AIO-1167 R41). So the transition
+ * is limited to the non-terminal states, and to the revision the identity mapping still has — an
+ * obligation for a superseded revision is left for the drain to retire as obsolete, never retried.
+ * One UPDATE: under the row lock the status is rechecked against the committed row, so a concurrent
+ * obsolete/complete write wins.
+ */
+async function markRetry(obligation: Obligation, error: unknown): Promise<void> {
+  const message = (error instanceof Error ? error.message : String(error)).slice(0, 1000);
+  await runSql(
+    `update identity_repair_obligations o set status='retry',attempts=attempts+1,last_error=$5,
+            next_attempt_at=now() + (least(3600, power(2,least(attempts,10)))::text || ' seconds')::interval,
+            updated_at=now()
+      where o.team_id=$1 and o.provider=$2 and o.external_id=$3 and o.mapping_revision=$4
+        and o.status in ('pending','running','retry')
+        and exists (
+          select 1 from member_identity_mapping_state s
+           where s.team_id=o.team_id and s.provider=o.provider and s.external_id=o.external_id
+             and s.revision=o.mapping_revision
+        )`,
+    [obligation.team_id, obligation.provider, obligation.external_id, obligation.mapping_revision, message],
+  );
+}
+
+/**
+ * Drain one revision-fenced repair in bounded item batches. Every batch serializes with the mapping
+ * writer, and every item rechecks its Drive provenance and its correction lock under the item lock
+ * before credit changes.
+ *
+ * This drain keeps its own cursor, on the obligation. It never moves the team-wide repair's cursor
+ * and never runs the team-wide per-item repair: that one admits by the common eligibility rule and
+ * records its progress on the team authority row, and neither belongs to an identity obligation.
+ * What the two share is the trust root — the persisted same-team Drive mapping
+ * (`lib/ingest/repair-eligibility`).
+ */
+export async function runIdentityRepairObligation(
+  db: DbClient,
+  obligation: Obligation,
+  opts: { batchSize?: number; hooks?: IdentityRepairHooks } = {},
+): Promise<{ status: "partial" | "complete" | "obsolete"; scanned: number }> {
+  const batchSize = Math.max(1, Math.min(500, opts.batchSize ?? DEFAULT_BATCH));
+  const hooks = opts.hooks ?? {};
+  try {
+    const snapshot = await buildIdentityAuthoritySnapshot(db, obligation.team_id);
+    const map = snapshot.map;
+    const connectors = snapshot.connectorIds;
+    await hooks.afterSnapshot?.();
+    const batch = await withTransaction(async () => {
+      // Team-wide snapshot lock/revision always precedes the exact-identity lock.
+      await validateIdentityAuthorityRevision(obligation.team_id, snapshot.revision);
+      await runSql(`select pg_advisory_xact_lock(hashtextextended($1, 0))`, [
+        `${obligation.team_id}:identity:${obligation.provider}:${obligation.external_id}`,
+      ]);
+      const current = await currentObligation(obligation);
+      if (!current) return { status: "obsolete" as const, scanned: 0, finished: false };
+      if (!await mappingStillCurrent(current)) {
+        await runSql(
+          `update identity_repair_obligations set status='obsolete',completed_at=now(),updated_at=now()
+            where team_id=$1 and provider=$2 and external_id=$3 and mapping_revision=$4`,
+          [current.team_id, current.provider, current.external_id, current.mapping_revision],
+        );
+        return { status: "obsolete" as const, scanned: 0, finished: false };
+      }
+      // A healthy batch is not an attempt: `attempts` counts failures (`markRetry`), the same rule as
+      // the team-wide repair (`beginIdentityRepairBatch`), so a long obligation that converges batch
+      // by batch does not inflate the backoff a later real failure gets (AIO-1167 R44 C13).
+      await runSql(
+        `update identity_repair_obligations set status='running',
+                last_error=null,next_attempt_at=null,updated_at=now()
+          where team_id=$1 and provider=$2 and external_id=$3 and mapping_revision=$4`,
+        [current.team_id, current.provider, current.external_id, current.mapping_revision],
+      );
+      // Nomination, bounded by the obligation's cursor: Drive documents by the provenance rule —
+      // the persisted same-team mapping and current Drive source evidence — that name this
+      // identity among their authors or contributions.
+      //
+      // A Google EMAIL identity is matched by the one JavaScript comparison contract, never by SQL
+      // folding (AIO-1167 PR743): the bounded scan selects every Drive document with retained author or
+      // contribution evidence — a guaranteed superset — and `namesGoogleEmail` decides. The cursor still
+      // advances over the whole scanned page, so the drain stays bounded and makes progress. Every
+      // other identity keeps its exact external-id match. The obligation tuple itself stays exact.
+      const emailKey = googleEmailKey(current.provider, current.external_id);
+      let scannedPage: { id: string }[];
+      let candidates: { id: string }[];
+      if (emailKey) {
+        const { rows } = await runSql<{ id: string; frontmatter: Record<string, unknown> }>(
+          `select i.id,i.frontmatter from items i
+            where i.team_id=$1 and ${DRIVE_OBLIGATION_PROVENANCE}
+              and ($2::uuid is null or i.id>$2::uuid)
+              and (jsonb_typeof(i.frontmatter->'authors')='array'
+                   or jsonb_typeof(i.frontmatter->'contributions')='array')
+            order by i.id limit $3`,
+          [current.team_id, current.cursor_item_id, batchSize],
+        );
+        scannedPage = rows;
+        candidates = rows.filter((row) => namesGoogleEmail(row.frontmatter ?? {}, emailKey));
+      } else {
+        const { rows } = await runSql<{ id: string }>(
+          `select i.id from items i
+            where i.team_id=$1 and ${DRIVE_OBLIGATION_PROVENANCE}
+              and ($3::uuid is null or i.id>$3::uuid)
+              and (
+                exists (select 1 from jsonb_array_elements(
+                  case when jsonb_typeof(i.frontmatter->'authors')='array'
+                       then i.frontmatter->'authors' else '[]'::jsonb end
+                ) a where a->>'external_id'=$2)
+                or exists (select 1 from jsonb_array_elements(
+                  case when jsonb_typeof(i.frontmatter->'contributions')='array'
+                       then i.frontmatter->'contributions' else '[]'::jsonb end
+                ) c where c->>'external_id'=$2)
+              )
+            order by i.id limit $4`,
+          [current.team_id, current.external_id, current.cursor_item_id, batchSize],
+        );
+        scannedPage = rows;
+        candidates = rows;
+      }
+      let itemUpdates = 0;
+      let versionUpdates = 0;
+      let contributionUpdates = 0;
+      for (const candidate of candidates) {
+        const result = await repairOneItem(
+          db,current.team_id,candidate.id,map,connectors,snapshot.revision,hooks,
+        );
+        itemUpdates += result.item;
+        versionUpdates += result.versions;
+        contributionUpdates += result.contributions;
+      }
+      // Progress counts the whole scanned page — the span the cursor advances over — not the
+      // candidates in it: an email-key page with no match still advanced (Fable R51 L2).
+      const last = scannedPage.at(-1)?.id ?? current.cursor_item_id;
+      await runSql(
+        `update identity_repair_obligations set cursor_item_id=$5,
+                items_scanned=items_scanned+$6,items_updated=items_updated+$7,
+                versions_updated=versions_updated+$8,contributions_updated=contributions_updated+$9,
+                updated_at=now()
+          where team_id=$1 and provider=$2 and external_id=$3 and mapping_revision=$4`,
+        [current.team_id, current.provider, current.external_id, current.mapping_revision,
+          last, scannedPage.length, itemUpdates, versionUpdates, contributionUpdates],
+      );
+      return {
+        status: "partial" as const,
+        scanned: scannedPage.length,
+        finished: scannedPage.length < batchSize,
+      };
+    });
+    if (batch.status === "obsolete") return batch;
+    if (!batch.finished) return { status: "partial", scanned: batch.scanned };
+
+    // A cache rebuild may have started after the mapping mutation's first epoch but before the last
+    // item/version repair committed. Fence that in-flight payload now that all durable effects exist;
+    // the strict purge below removes every persisted visibility variant before completion.
+    await withTransaction(async () => {
+      await validateIdentityAuthorityRevision(obligation.team_id, snapshot.revision);
+      await advanceAuthorizationEpoch(obligation.team_id);
+    });
+    // Derived payloads contain names/credit. Delete every visibility variant before completion so
+    // cached API/UI/summaries cannot serve the superseded mapping while rebuilding.
+    const { rows: teams } = await runSql<{ slug: string }>(
+      `select slug from teams where id=$1`, [obligation.team_id],
+    );
+    await purgeTeamLearningCachesStrict(db, obligation.team_id, teams[0]?.slug ?? "");
+    return withTransaction(async () => {
+      await validateIdentityAuthorityRevision(obligation.team_id, snapshot.revision);
+      await runSql(`select pg_advisory_xact_lock(hashtextextended($1, 0))`, [
+        `${obligation.team_id}:identity:${obligation.provider}:${obligation.external_id}`,
+      ]);
+      if (!await mappingStillCurrent(obligation)) {
+        await runSql(
+          `update identity_repair_obligations set status='obsolete',completed_at=now(),updated_at=now()
+            where team_id=$1 and provider=$2 and external_id=$3 and mapping_revision=$4`,
+          [obligation.team_id, obligation.provider, obligation.external_id, obligation.mapping_revision],
+        );
+        return { status: "obsolete" as const, scanned: batch.scanned };
+      }
+      await runSql(
+        `update identity_repair_obligations set status='complete',completed_at=now(),updated_at=now(),
+                last_error=null,next_attempt_at=null
+          where team_id=$1 and provider=$2 and external_id=$3 and mapping_revision=$4`,
+        [obligation.team_id, obligation.provider, obligation.external_id, obligation.mapping_revision],
+      );
+      return { status: "complete" as const, scanned: batch.scanned };
+    });
+  } catch (error) {
+    await markRetry(obligation, error).catch(() => {});
+    throw error;
+  }
+}
+
+/** Scheduler/manual drain. Fair by oldest update and bounded by obligations + items per invocation. */
+export async function drainIdentityRepairs(
+  db: DbClient,
+  opts: { maxObligations?: number; batchSize?: number; hooks?: IdentityRepairHooks } = {},
+): Promise<{ attempted: number; complete: number; partial: number; failed: number }> {
+  const max = Math.max(1, Math.min(100, opts.maxObligations ?? 20));
+  const { rows } = await runSql<Obligation>(
+    `select team_id,provider,external_id,mapping_revision,cursor_item_id,
+            items_scanned,items_updated,versions_updated,contributions_updated
+       from identity_repair_obligations
+      where status in ('pending','running','retry')
+        and (next_attempt_at is null or next_attempt_at<=now())
+      order by updated_at,team_id,provider,external_id,mapping_revision
+      limit $1`,
+    [max],
+  );
+  const summary = { attempted: 0, complete: 0, partial: 0, failed: 0 };
+  for (const obligation of rows) {
+    summary.attempted++;
+    try {
+      const result = await runIdentityRepairObligation(db, obligation, {
+        batchSize: opts.batchSize, hooks: opts.hooks,
+      });
+      if (result.status === "complete" || result.status === "obsolete") summary.complete++;
+      else summary.partial++;
+    } catch {
+      summary.failed++;
+    }
+  }
+  return summary;
+}

@@ -102,6 +102,7 @@ export class PgQuery<T = unknown> implements PromiseLike<PgResult<T>> {
   private headMode = false;
   private payload?: unknown;
   private conflictCols?: string;
+  private ignoreDuplicates = false;
   private textSearchSpec?: { col: string; query: string; config: string };
   private currentSql: string | undefined;
 
@@ -133,10 +134,11 @@ export class PgQuery<T = unknown> implements PromiseLike<PgResult<T>> {
     this.payload = values;
     return this;
   }
-  upsert(values: unknown, opts?: { onConflict?: string }): this {
+  upsert(values: unknown, opts?: { onConflict?: string; ignoreDuplicates?: boolean }): this {
     this.op = "upsert";
     this.payload = values;
     this.conflictCols = opts?.onConflict;
+    this.ignoreDuplicates = opts?.ignoreDuplicates === true;
     return this;
   }
   delete(): this {
@@ -438,7 +440,9 @@ export class PgQuery<T = unknown> implements PromiseLike<PgResult<T>> {
       const updates = columns
         .filter((c) => !this.conflictCols!.split(",").map((x) => x.trim()).includes(c))
         .map((c) => `${c} = EXCLUDED.${c}`);
-      conflict = updates.length
+      conflict = this.ignoreDuplicates
+        ? ` ON CONFLICT (${target}) DO NOTHING`
+        : updates.length
         ? ` ON CONFLICT (${target}) DO UPDATE SET ${updates.join(", ")}`
         : ` ON CONFLICT (${target}) DO NOTHING`;
     }

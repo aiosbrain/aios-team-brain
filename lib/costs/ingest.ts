@@ -15,7 +15,7 @@ export async function ingestUsageCost(
 ): Promise<{ cost_id: string; member_id: string }> {
   let memberId = auth.memberId;
   if (payload.member) {
-    const map = await buildIdentityMap(db, auth.teamId);
+    const map = await buildIdentityMap(db, auth.teamId, { strict: true });
     const resolved = resolveMember(map, { key: payload.member });
     if (!resolved) throw new IngestValidationError(`unknown member handle '${payload.member}'`);
     memberId = resolved;

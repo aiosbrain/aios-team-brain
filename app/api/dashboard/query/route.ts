@@ -21,6 +21,8 @@ import { runAnswerTurn } from "@/lib/query/stream-persist";
 import { createRun } from "@/lib/query/turn-runs";
 import { isSyncCommand, runManualSync } from "@/lib/ingest/manual-sync";
 import { audit } from "@/lib/api/audit";
+import { GraphProvenanceUnavailableError } from "@/lib/graph/provenance-read";
+import { AttributionRepairPendingError } from "@/lib/access/authorization-epoch";
 
 const SSE_HEADERS = {
   "Content-Type": "text/event-stream",
@@ -196,20 +198,6 @@ export async function POST(req: NextRequest) {
     return errorResponse("rate_limited", "team daily query budget reached — see admin/policy", 429);
   }
 
-  // Resolve the persistent thread: adopt the caller's conversation if they own it, else start one,
-  // then record the user message. The assistant message is persisted once the answer finishes
-  // streaming. (PRET-6: the prior-turn LLM memory load retired with the permissive arm — see the
-  // historyTurns note below.)
-  const owner = { teamId: team.id, memberId: me.id };
-  let conversationId = conversation_id && (await ownsConversation(db, owner, conversation_id)) ? conversation_id : null;
-  let createdNew = false;
-  if (!conversationId) {
-    const created = await createConversation(db, owner, question);
-    conversationId = created?.id ?? null;
-    createdNew = true;
-  }
-  if (conversationId) await appendMessage(db, owner, conversationId, "user", question);
-
   // Access enforcement (Phase B slice 2; TIERRET-1): same as the API query route — retrieval is
   // filtered by the admission resolver's arm for this session member, unconditionally.
   let enforce: import("@/lib/query/retrieve").RetrieveEnforce | null = null;
@@ -232,7 +220,32 @@ export async function POST(req: NextRequest) {
   // visibility-revalidated — a named backlog item, not an accident.
   const historyTurns: import("@/lib/query/claude").ChatTurn[] = [];
   const started = Date.now();
-  const ctx = await retrieve(db, team.id, memberTier, question, project, enforce);
+  // AIO-1167: retrieval completes BEFORE this turn leaves any trace. A graph context whose
+  // authorization cannot be proven right now is a retryable refusal — never empty context, never a
+  // raw error, and never a conversation, message or run row for a turn that did not happen.
+  let ctx: Awaited<ReturnType<typeof retrieve>>;
+  try {
+    ctx = await retrieve(db, team.id, memberTier, question, project, enforce);
+  } catch (e) {
+    if (e instanceof GraphProvenanceUnavailableError || e instanceof AttributionRepairPendingError) {
+      return errorResponse("temporarily_unavailable", "query context is temporarily unavailable; retry shortly", 503);
+    }
+    throw e;
+  }
+
+  // Resolve the persistent thread: adopt the caller's conversation if they own it, else start one,
+  // then record the user message. The assistant message is persisted once the answer finishes
+  // streaming. (PRET-6: the prior-turn LLM memory load retired with the permissive arm — see the
+  // historyTurns note above.)
+  const owner = { teamId: team.id, memberId: me.id };
+  let conversationId = conversation_id && (await ownsConversation(db, owner, conversation_id)) ? conversation_id : null;
+  let createdNew = false;
+  if (!conversationId) {
+    const created = await createConversation(db, owner, question);
+    conversationId = created?.id ?? null;
+    createdNew = true;
+  }
+  if (conversationId) await appendMessage(db, owner, conversationId, "user", question);
 
   // Per-team provider keys + models + the explicit answering-backend override (null fields → env
   // fallback in streamAnswer; `activeProvider` forces a backend, else selectLlmBackend precedence).

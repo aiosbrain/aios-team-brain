@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { buildIdentityMap } from "@/lib/identity/resolve";
+import { buildIdentityAuthoritySnapshot } from "@/lib/identity/authority";
 import { projectCommitsToItems, type ScanCommit } from "@/lib/codebases/commits-to-items";
 import { retrieve } from "@/lib/query/retrieve";
 import { db, seedTeam, memberRetrieveEnforce } from "./helpers";
@@ -30,13 +30,14 @@ describe("commits → searchable, attributed items (real Postgres)", () => {
       { sha: "b".repeat(40), author: "Nobody Known", message: "tweak readme", committed_at: "2026-06-21T10:00:00Z", ai: false, additions: 1, deletions: 1 },
     ];
 
-    const map = await buildIdentityMap(db(), seed.teamId);
+    const snapshot = await buildIdentityAuthoritySnapshot(db(), seed.teamId);
     const n = await projectCommitsToItems(
       db(),
       { teamId: seed.teamId, memberId: scannerId, apiKeyId: randomUUID() }, // ingesting actor = scanner B
       "aios-team-brain",
       commits,
-      map
+      snapshot.map,
+      snapshot.revision,
     );
     expect(n).toBe(2);
 
@@ -66,11 +67,11 @@ describe("commits → searchable, attributed items (real Postgres)", () => {
         prior_fix_parent_lines: 1,
       },
     }];
-    const map = await buildIdentityMap(db(), seed.teamId);
+    const snapshot = await buildIdentityAuthoritySnapshot(db(), seed.teamId);
     const auth = { teamId: seed.teamId, memberId: seed.memberId, apiKeyId: randomUUID() };
 
-    await projectCommitsToItems(db(), auth, "repo", commits, map);
-    await projectCommitsToItems(db(), auth, "repo", commits, map); // second run
+    await projectCommitsToItems(db(), auth, "repo", commits, snapshot.map, snapshot.revision);
+    await projectCommitsToItems(db(), auth, "repo", commits, snapshot.map, snapshot.revision); // second run
 
     const { data } = await db().from("items").select("id, frontmatter").eq("team_id", seed.teamId).eq("path", `commits/repo/${"c".repeat(40)}.md`);
     expect((data ?? []).length).toBe(1); // exactly one item, not duplicated

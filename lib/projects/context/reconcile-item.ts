@@ -20,6 +20,8 @@ export interface ReconcileItemResult {
   ok: boolean;
   error?: string;
   skipped?: boolean;
+  /** The skip was the Drive-ownership refusal: nothing was read past it and nothing was written. */
+  driveOwned?: boolean;
   unitId?: string;
   unitCreated?: boolean;
   membershipCreated?: boolean;
@@ -80,11 +82,52 @@ export async function validatedSystemProjectIds(
   return general && external ? hints : undefined;
 }
 
+/**
+ * DRIVE OWNERSHIP, decided on the item this transaction has LOCKED. A Google Drive document's
+ * context is derived solely from its connections' surviving audience claims; the generic routing
+ * below would place it in General / external-shared by tier (Drive documents are stored `external`)
+ * and close a claim-authorized placement in the opposite system project.
+ *
+ * Either signal alone is ownership, the same definition the ingest owner refuses on:
+ *   - the locked row's own stored provenance (`frontmatter.source = 'gdrive'`), or
+ *   - an exact same-team provider mapping for this item, read here, on this session, after the row
+ *     lock — because stored provenance can be missing or altered, which is precisely how such a row
+ *     slips past the frontmatter-only filters at the call sites.
+ * Nothing else is consulted, by design: a mapping's `connection_id` is NULL for every claimed
+ * document, and the connection may be disabled, disconnected, unleased or without a live claim —
+ * none of which hands the document to the generic owner.
+ *
+ * A mapping read that fails, or answers anything but one boolean, THROWS: it runs before any write,
+ * so the caller's transaction ends having written nothing.
+ */
+async function driveOwnsLockedItem(context: LockedItemContext): Promise<boolean> {
+  const frontmatter = context.item.frontmatter;
+  if (frontmatter && typeof frontmatter === "object" && !Array.isArray(frontmatter) && frontmatter.source === "gdrive") {
+    return true;
+  }
+  const result = await context.session.executeSql<{ drive_mapped: boolean | null }>(
+    `select exists(
+       select 1 from source_item_mappings m
+        where m.team_id = $1 and m.item_id = $2 and m.source = 'gdrive'
+     ) as drive_mapped`,
+    [context.teamId, context.itemId]
+  );
+  const answer = result.rows[0]?.drive_mapped;
+  if (result.rows.length !== 1 || typeof answer !== "boolean") {
+    throw new Error("Drive ownership could not be read for a locked item");
+  }
+  return answer;
+}
+
 /** Shared core: caller already owns the one item row lock and supplies validated topology. */
 export async function reconcileLockedItemContext(
   context: LockedItemContext,
   projects: SystemProjectIds
 ): Promise<ReconcileItemResult> {
+  // FIRST, before the unit mirror or any membership is touched: a Drive-owned item is not this
+  // owner's to place. The call sites filter on stored provenance; this is the authoritative check.
+  if (await driveOwnsLockedItem(context)) return { ok: true, skipped: true, driveOwned: true };
+
   const unit = await reconcileItemUnitLocked(context);
   if (!unit.ok || !unit.unitId || !unit.audience) {
     return { ok: false, error: `unit: ${unit.error ?? "missing unit result"}` };

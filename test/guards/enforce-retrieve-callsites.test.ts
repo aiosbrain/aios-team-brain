@@ -70,18 +70,23 @@ describe("dense-leg enforcement wired in lib/query/retrieve.ts (Codex B3 Medium)
 
 describe("arc enforcement wiring in app/api/brain/arcs/route.ts (Phase B slice 5, §5.8)", () => {
   const src = read("app/api/brain/arcs/route.ts");
-  it("resolves the member's visibility and serves the FILTERED tier arcs, not the raw getArcs output", () => {
+  it("resolves member visibility inside the epoch-bound fused owner, which performs the final filter", () => {
     expect(src).toMatch(/memberEnforcement\(\s*admin\s*,\s*\{\s*teamId:\s*team\.id\s*,\s*memberId\s*\}\s*\)/);
-    expect(src).toMatch(/const\s+arcs\s*=\s*filterArcsByVisibleItems\(\s*allArcs\s*,\s*enforce\?\.visibleItemIds\s*\?\?\s*null\s*\)/);
+    expect(src).toContain("getAuthorizationBoundFusedArcs(");
+    const owner = read("lib/graph/arc-fusion.ts");
+    expect(owner).toMatch(/filterArcsByVisibleItems\(panel\.arcs, authorization\.visibleItemIds\)/);
+    expect(owner).toMatch(/withLockedAuthorizationEpoch\(teamId/);
   });
-  it("fails closed on an enforcement-resolution error (500, never the unfiltered set)", () => {
-    expect(src).toMatch(/catch\s*\{\s*return errorResponse\("internal", "enforcement check failed", 500\)/);
+  it("fails closed on enforcement errors and returns retryable unavailable for authority churn", () => {
+    expect(src).toContain('errorResponse("temporarily_unavailable", "arc authorization changed; retry the request", 503)');
+    expect(src).toContain('errorResponse("internal", "enforcement check failed", 500)');
   });
-  it("the RECOMPUTE route filters too — it returns the tier arc set and is team-tier-gated, not admin-gated (Fable B5 High: an unfiltered bypass otherwise)", () => {
+  it("the RECOMPUTE route filters too, under the same locked epoch as response serving", () => {
     const rc = read("app/api/brain/arcs/recompute/route.ts");
     expect(rc).toMatch(/memberEnforcement\(\s*admin\s*,\s*\{\s*teamId:\s*team\.id\s*,\s*memberId\s*\}\s*\)/);
-    expect(rc).toMatch(/const\s+arcs\s*=\s*filterArcsByVisibleItems\(\s*allArcs\s*,\s*enforce\?\.visibleItemIds\s*\?\?\s*null\s*\)/);
-    expect(rc).toMatch(/catch\s*\{\s*return errorResponse\("internal", "enforcement check failed", 500\)/);
+    expect(rc).toMatch(/withLockedAuthorizationEpoch\(team\.id[\s\S]*arcs:\s*filterArcsByVisibleItems\(allArcs, enforce\.visibleItemIds\)/);
+    expect(rc).toContain('errorResponse("internal", "enforcement check failed", 500)');
+    expect(rc).toContain('errorResponse("temporarily_unavailable", "arc authorization changed; retry the request", 503)');
   });
   it("the recompute route gates the correction WRITE by visibility BEFORE recomputeArcs (Codex B5 High: arbitrary/invisible corrections poison the shared synthesis)", () => {
     const rc = read("app/api/brain/arcs/recompute/route.ts");
@@ -100,8 +105,8 @@ describe("arc enforcement wiring in app/api/brain/arcs/route.ts (Phase B slice 5
     // ABSENCE, not its gating.
     expect(read("app/api/brain/arcs/route.ts")).not.toMatch(/no_facts|model_failing|synthesis_empty/);
     // … and both routes return a neutral envelope on empty.
-    expect(read("app/api/brain/arcs/route.ts")).toMatch(/enforce != null && arcs\.length === 0/);
-    expect(read("app/api/brain/arcs/recompute/route.ts")).toMatch(/enforcingEmpty\s*=\s*enforce != null && arcs\.length === 0/);
+    expect(read("app/api/brain/arcs/route.ts")).toMatch(/if \(arcs\.length === 0\)/);
+    expect(read("app/api/brain/arcs/recompute/route.ts")).toMatch(/served\.arcs\.length === 0[\s\S]*freshnessWire\(computedNow\(\)\)/);
   });
 });
 
@@ -116,6 +121,12 @@ describe("timeline enforcement wiring (Phase B slice 4, §5.8)", () => {
     expect(src).toMatch(/getCachedWorkTimeline\(adminClient\(\),\s*team\.id,\s*tier,\s*memberId\s*\)/);
     // TIERRET-1: the fresh-build arm carries the READER too (the cached arm resolves it inside).
     expect(src).toMatch(/getWorkTimeline\([^;]*days,\s*await\s+contentTimelineEnforcement\(/);
+    // AIO-1167: the fresh-build arm is bound to the attribution gate — gated epoch before the build,
+    // locked publication check after it — and is the arm the route actually takes for days > 7.
+    expect(src).toMatch(
+      /async function freshWorkTimeline[\s\S]*?await authorizationEpoch\(adminClient\(\), teamId\)[\s\S]*?getWorkTimeline\([\s\S]*?withLockedAuthorizationEpoch\(teamId,/
+    );
+    expect(src).toMatch(/:\s*await freshWorkTimeline\(team\.id,\s*tier,\s*days,\s*memberId\)/);
   });
   it("the cache layer fails closed: no principal on an enforcing team throws", () => {
     expect(read("lib/dashboard/timeline-cache.ts")).toMatch(/timeline read without a principal/); // PRET-6: always throws

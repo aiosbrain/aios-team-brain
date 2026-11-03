@@ -28,6 +28,9 @@ import { slackParticipations, foldProviderId } from "@/lib/ingest/slack-particip
 import { canSeeMeetingNotes } from "@/lib/meetings/notes";
 import { rowVisibleByProvenanceCtx } from "@/lib/access/provenance";
 import { isCalendarEvent } from "@/lib/meetings/from-calendar";
+import { buildIdentityMap } from "@/lib/identity/resolve";
+import { googleDriveContributionEvidence } from "./gdrive-contributions";
+import { coalesceStoredGdriveEvidence, gdriveObservationIdentity } from "@/lib/ingest/gdrive-ledger";
 
 // Only ACTIVE tasks are considered work "in progress". Since brain-api v1.21 (AIO-950) a Linear
 // "In Review" state normalizes to its own `in_review` rather than collapsing into `in_progress`;
@@ -251,7 +254,7 @@ export async function getWorkTimeline(
   const todayISO = new Date().toISOString().slice(0, 10);
 
   const [memberRes, teamRes, slackIdRes] = await Promise.all([
-    db.from("members").select("id, display_name, actor_handle, avatar_url, email").eq("team_id", teamId).eq("status", "active"),
+    db.from("members").select("id, display_name, actor_handle, avatar_url, email, is_connector").eq("team_id", teamId).eq("status", "active"),
     db.from("teams").select("primary_pm_provider, slug").eq("id", teamId).maybeSingle(),
     // Slack user id → member, for per-participant Slack attribution. Best-effort ENRICHMENT (a missing
     // map just means no Slack rows), so — unlike the core ledger legs — a failure here isn't fatal.
@@ -273,7 +276,8 @@ export async function getWorkTimeline(
     actor_handle: string | null;
     avatar_url: string | null;
     email: string | null;
-  }[]).filter((m) => !(m.email ?? "").endsWith("@connector.local"));
+    is_connector?: boolean | null;
+  }[]).filter((m) => !m.is_connector && !(m.email ?? "").endsWith("@connector.local"));
   const members = new Map<string, TimelineMember>();
   const roster: RosterPerson[] = [];
   for (const m of humans) {
@@ -303,7 +307,7 @@ export async function getWorkTimeline(
   const teamSlug = str((teamRes.data as { slug: string | null } | null)?.slug);
   const pmSource = pmProvider ? normalizeSource(pmProvider) : "tasks";
 
-  const [gitRes, otherRes, taskRes, slackRes, decisionRes] = await Promise.all([
+  const [gitRes, taskRes, slackRes, decisionRes] = await Promise.all([
     // Git commits (title = commit subject → needs body; commit bodies are small).
     walledItems(
       withVis(
@@ -321,34 +325,15 @@ export async function getWorkTimeline(
       ),
       tier
     ),
-    // Everything else (no body; title from frontmatter/path). `kind='task'` items excluded — the
-    // tasks table is the authoritative per-assignee source. NOTE: we do NOT `.neq("frontmatter->>source",
-    // "git")` here — the builder compiles that to `source <> 'git'`, which is NULL-falsy and would drop
-    // items with no `source` key (a hand-pushed doc with a real work time). Git commits are excluded in
-    // the JS loop below instead.
-    walledItems(
-      withVis(
-        db
-          .from("items")
-          .select("id, kind, member_id, member_id_locked, frontmatter, path, work_at")
-          .eq("team_id", teamId)
-          .neq("kind", "task")
-          .not("member_id", "is", null)
-          .eq("work_at_from_source", true)
-          .gte("work_at", sinceIso)
-          .order("work_at", { ascending: false })
-          .order("id", { ascending: false })
-          .limit(ITEM_LIMIT)
-      ),
-      tier
-    ),
+    // Everything else is the GENERIC leg, read below with its own seek pagination: it must rank its
+    // window over the rows it can admit, which needs the credit oracle.
     // ACTIVE tasks only — filtered in SQL so a backlog-heavy team can't push active tasks past
     // TASK_LIMIT. NOT window-filtered (evidence may reference a task last touched >7d ago; we need its
     // title/row_key). Evidence-gated in the grouper. ENFB-2 §2.2: the provenance predicate is
     // IN-QUERY so invisible rows can't starve the TASK_LIMIT window; `taskVisible` stays in the
     // grouper as the defense-in-depth TS layer over the same contract.
     provenanceTaskWindow({ statuses: [...ACTIVE_STATUSES] }),
-    // SLACK threads — fetched SEPARATELY (no `member_id` filter, unlike gitRes/otherRes) so a thread
+    // SLACK threads — fetched SEPARATELY (no `member_id` filter, unlike gitRes) so a thread
     // whose ROOT author is unmapped or a connector is still processed for its MAPPED repliers: per-
     // participant attribution reads `frontmatter.participants[]`, not the item's single `member_id`.
     // Tier-gated through the same §5 choke-point. `participants`/`title` are backfilled onto existing
@@ -396,7 +381,6 @@ export async function getWorkTimeline(
   // be cached/served as complete. See the members-error note above. Slack is best-effort ENRICHMENT
   // (a failure just means no Slack rows), so it does NOT throw — never fail the whole ledger over it.
   if (gitRes.error) throw new Error(`work-timeline git: ${gitRes.error.message}`);
-  if (otherRes.error) throw new Error(`work-timeline items: ${otherRes.error.message}`);
   if (taskRes.error) throw new Error(`work-timeline tasks: ${taskRes.error.message}`);
 
   // The ACTIVE set. It is no longer the whole link-target set (any referenced task can head a group —
@@ -428,31 +412,142 @@ export async function getWorkTimeline(
   // (never cache an empty ledger as fresh — same contract as the leg queries above). At current scale
   // primary == owner for ~all items, so this is a near-no-op today but correct as handoffs grow. Slack is
   // EXEMPT — its per-participant `participants[]` ledger IS its evidence-gated credit (see its leg below).
-  const gitOtherRows = [...((gitRes.data ?? []) as ItemRow[]), ...((otherRes.data ?? []) as ItemRow[])];
   // Pass the already-fetched rows so the oracle skips a redundant `items` re-read; it still reads
   // item_versions + members. `frontmatter` is forwarded (already selected, so it costs nothing): a
   // CONVERSATION source keeps its work ledger there, and omitting it would silently hand the oracle
   // the root-stamped version authors instead — wrong credit with no signal.
-  const credit = await resolveItemCreditIds(db, teamId, gitOtherRows.map((r) => r.id), {
-    strict: true,
-    items: gitOtherRows.map((r) => ({
-      id: r.id,
-      member_id: r.member_id,
-      member_id_locked: r.member_id_locked ?? null,
-      frontmatter: r.frontmatter ?? null,
-    })),
-  });
+  const creditFor = (rows: readonly ItemRow[]) =>
+    resolveItemCreditIds(db, teamId, rows.map((r) => r.id), {
+      strict: true,
+      items: rows.map((r) => ({
+        id: r.id,
+        member_id: r.member_id,
+        member_id_locked: r.member_id_locked ?? null,
+        frontmatter: r.frontmatter ?? null,
+      })),
+    });
+  const gitRows = (gitRes.data ?? []) as ItemRow[];
+  const credit = await creditFor(gitRows);
   // Primary contributor for an item, falling back to the current owner when the oracle has no opinion
-  // (e.g. no human version history). Kept the `.not("member_id","is",null)` prefetch prefilter on the leg
-  // queries: an owner-null but version-authored item stays hidden (documented — matches prior behavior).
-  const primaryOf = (r: ItemRow): string | null => credit.get(r.id)?.primaryId ?? r.member_id;
+  // (e.g. no human version history). Drive is deliberately excluded here because its independent,
+  // paginated evidence ledger applies current mapping authority and correction locks below.
+  const primaryOf = (r: ItemRow, from = credit): string | null => from.get(r.id)?.primaryId ?? r.member_id;
+  // Google contribution observations resolve through the same shared registry as ingest and the
+  // member identity UI. STRICT: a failed alias/provider read must not become a cached partial ledger.
+  // Contribution history: a deactivated author's established Drive work stays theirs (R44 C4).
+  const googleIdentities = await buildIdentityMap(db, teamId, { strict: true, includeDeactivated: true });
+
+  type GdriveLedgerRow = {
+    item_id: string;
+    evidence_key: string;
+    external_id: string | null;
+    email: string | null;
+    display_name: string | null;
+    role: string;
+    source_at: string;
+    updated_at: string;
+    member_id: string | null;
+    member_id_locked: boolean;
+    frontmatter: Record<string, unknown> | null;
+    path: string | null;
+  };
+  // Drive evidence has its own retained ledger and seek pagination. It must not compete with the
+  // generic ITEM_LIMIT window: a burst of Notion/git rows or equal timestamps cannot silently evict
+  // older valid Drive contributions. Every page is required; a read failure aborts the build so no
+  // partial payload can be cached as complete.
+  const gdriveRows: GdriveLedgerRow[] = [];
+  let driveCursor: { at: string; itemId: string; key: string } | null = null;
+  for (;;) {
+    const p = newSqlParams();
+    const conditions = [
+      `e.team_id=${p.add(teamId)}`,
+      `e.source_at is not null`,
+      `e.source_at>=${p.add(sinceIso)}::timestamptz`,
+      `e.source_at<=${p.add(new Date(futureBoundMs).toISOString())}::timestamptz`,
+    ];
+    if (visArr) conditions.push(`e.item_id=any(${p.add(visArr)}::uuid[])`);
+    if (driveCursor) {
+      conditions.push(
+        `(e.source_at,e.item_id,e.evidence_key)<(` +
+        `${p.add(driveCursor.at)}::timestamptz,${p.add(driveCursor.itemId)}::uuid,${p.add(driveCursor.key)})`,
+      );
+    }
+    const page = await runSql<GdriveLedgerRow>(
+      `select e.item_id,e.evidence_key,e.external_id,e.email::text,e.display_name,e.role,
+              e.source_at::text,e.updated_at::text,i.member_id,i.member_id_locked,i.frontmatter,i.path
+         from gdrive_contribution_evidence e
+         join items i on i.team_id=e.team_id and i.id=e.item_id
+        where ${conditions.join(" and ")}
+        order by e.source_at desc,e.item_id desc,e.evidence_key desc
+        limit ${p.add(ITEM_LIMIT)}`,
+      p.values,
+    ).catch((error) => {
+      throw new Error(`work-timeline gdrive ledger: ${error instanceof Error ? error.message : String(error)}`);
+    });
+    gdriveRows.push(...page.rows);
+    if (page.rows.length < ITEM_LIMIT) break;
+    const last = page.rows.at(-1)!;
+    driveCursor = { at: last.source_at, itemId: last.item_id, key: last.evidence_key };
+  }
+  // One row per observation. The ledger converges on that itself — a stable provider id, role and
+  // instant are one row from the item's next write on — but until that write a row from before an
+  // e-mail or timestamp-spelling change can still be there. The most recently written row speaks
+  // for the observation: the older one must neither double the credit nor resolve it through an
+  // e-mail the person no longer has. Decided before anything is resolved, across every page.
+  // An email-only row the ONE stable-id row of that item, role and instant names (S4) is the same
+  // observation: a ledger written before coalescing — or adopted from one by the migration's evidence
+  // backfill — can hold both until the item's next write retires it.
+  const gdriveObservations = new Map<string, GdriveLedgerRow>();
+  for (const row of coalesceStoredGdriveEvidence(gdriveRows)) {
+    const { stableId, person, role, at } = gdriveObservationIdentity({
+      external_id: row.external_id, role: row.role, at: row.source_at,
+    });
+    const key = stableId
+      ? `${row.item_id}\0${person}\0${role}\0${at}`
+      : `${row.item_id}\0${row.evidence_key}`;
+    const seen = gdriveObservations.get(key);
+    if (!seen || Date.parse(row.updated_at) > Date.parse(seen.updated_at)) gdriveObservations.set(key, row);
+  }
 
   // In-window evidence items (commits + docs) with the text an issue key would appear in. A git
   // commit's key is in its BODY; other items' in the title/path (no large-body fetch — see the
-  // otherRes select). `kind='task'` items + granola meetings are excluded; Slack is its own leg below.
+  // generic leg's select). `kind='task'` items + granola meetings are excluded; Slack is its own leg below.
   // `sha` is set for git commits only — the join key to the PR that merged them (work_events.merged_sha).
-  type Ev = EvidenceItem & { memberId: string; text: string; sha?: string };
+  // `itemId` is set only where `id` is not the item's own id — a Drive observation's id names the
+  // person, role and instant too — and is the canonical item id `task_evidence` links by. Internal:
+  // never copied into the payload.
+  type Ev = EvidenceItem & { memberId: string; text: string; sha?: string; itemId?: string };
   const evItems: Ev[] = [];
+  for (const row of gdriveObservations.values()) {
+    const fm = row.frontmatter ?? {};
+    const title = str(fm.title) || (row.path ? basename(row.path) : "") || "Google document";
+    const contributions = [{
+      external_id: row.external_id,
+      email: row.email,
+      display_name: row.display_name,
+      role: row.role,
+      at: row.source_at,
+    }];
+    const evidence = googleDriveContributionEvidence(
+      { ...fm, source: "gdrive", contributions },
+      row.item_id,
+      googleIdentities,
+      { memberIdLocked: row.member_id_locked, memberId: row.member_id },
+    )[0];
+    if (!evidence || !members.has(evidence.memberId) || !inWindow(evidence.at)) continue;
+    evItems.push({
+      id: evidence.id,
+      itemId: evidence.itemId,
+      memberId: evidence.memberId,
+      source: "gdrive",
+      kind: "deliverable",
+      title,
+      url: evidence.sourceUrl ? httpUrl(evidence.sourceUrl) : undefined,
+      at: evidence.at,
+      contributionRole: evidence.role,
+      text: `${title}\n${row.path ?? ""}`,
+    });
+  }
   for (const r of (gitRes.data ?? []) as ItemRow[]) {
     const memberId = primaryOf(r);
     if (!memberId || !members.has(memberId)) continue;
@@ -462,10 +557,20 @@ export async function getWorkTimeline(
     const title = str(fm.title) || commitSubject(r.body ?? "") || "commit";
     evItems.push({ id: r.id, memberId, source: "github", kind: "commit", title, url: httpUrl(fm.source_url), at, text: `${title}\n${r.body ?? ""}`, sha: str(fm.sha) });
   }
-  for (const r of (otherRes.data ?? []) as ItemRow[]) {
+  // GENERIC evidence: everything else (no body; title from frontmatter/path). `kind='task'` items are
+  // excluded — the tasks table is the authoritative per-assignee source. Its ITEM_LIMIT window counts
+  // ADMITTED evidence, newest first: a row this lane skips — git and Drive (their own readers), the
+  // sources with their own legs, ticket documents, and a row nobody is credited for — must never take
+  // a slot from an older valid row. Git and Drive are excluded in SQL (NULL-safe: a hand-pushed doc
+  // with no `source` key and a real work time stays in); the remaining skips need source rules and the
+  // credit oracle, so they are applied page by page. The window is seek-paginated on (work_at, id) and
+  // is complete only when ITEM_LIMIT rows are admitted or the in-window rows are exhausted; every page
+  // and its credit read are required, so a failure aborts the build rather than caching a partial one.
+  const genericEvidence = (r: ItemRow, memberId: string | null): Ev | null => {
     const fm = r.frontmatter ?? {};
-    if (str(fm.source) === "git") continue; // handled by gitRes — no double-count
+    if (str(fm.source) === "git") return null; // handled by gitRes — no double-count
     const source = normalizeSource(str(fm.source));
+    if ((str(fm.source) ?? "").toLowerCase() === "gdrive") return null; // retained ledger above — no cap/double-count
     // Each of these has its OWN leg, so admitting the raw item here would count the same work twice.
     // CALENDAR is the newest and was the easy one to miss: unlike a granola transcript it arrives as a
     // plain `artifact` with `occurred_at` frontmatter, so it passes `work_at_from_source` and lands in
@@ -474,7 +579,7 @@ export async function getWorkTimeline(
     // NB `source` here is NORMALIZED, and `normalizeSource` collapses anything not in SOURCE_RULES to
     // "other" — so the calendar check must read the RAW frontmatter value. Checking the normalized one
     // silently never matched, and the pusher kept getting the event twice.
-    if (source === "slack" || source === "granola" || isCalendarEvent(str(fm.source)) || r.kind === "transcript") continue;
+    if (source === "slack" || source === "granola" || isCalendarEvent(str(fm.source)) || r.kind === "transcript") return null;
     // A PM issue's own description doc is the TICKET, not work done on it — and its path/title carry
     // the issue's own key, so admitting it as evidence would let every assigned ticket self-satisfy
     // the evidence gate and turn the timeline back into a backlog dump (the property "never the whole
@@ -482,13 +587,52 @@ export async function getWorkTimeline(
     // commits/docs that cite the key. WHICH sources those are is a FACT ABOUT THE SOURCE
     // (`emitsTicketDocuments`), not a list of tracker names here — the brain is self-hosted per org and
     // the next one's tracker must work without editing this file. Guarded.
-    if (str(fm.identifier) && sourceRules(source).emitsTicketDocuments) continue;
-    const memberId = primaryOf(r);
-    if (!memberId || !members.has(memberId)) continue;
+    if (str(fm.identifier) && sourceRules(source).emitsTicketDocuments) return null;
+    if (!memberId || !members.has(memberId)) return null;
     const at = isoOrNull(r.work_at);
-    if (!at || !inWindow(at)) continue;
+    if (!at || !inWindow(at)) return null;
     const title = str(fm.title) || (r.path ? basename(r.path) : "") || "(untitled)";
-    evItems.push({ id: r.id, memberId, source, kind: r.kind ?? "item", title, url: httpUrl(fm.source_url), at, text: `${title}\n${r.path ?? ""}` });
+    return { id: r.id, memberId, source, kind: r.kind ?? "item", title, url: httpUrl(fm.source_url), at, text: `${title}\n${r.path ?? ""}` };
+  };
+  let admitted = 0;
+  let genericCursor: { at: string; id: string } | null = null;
+  while (admitted < ITEM_LIMIT) {
+    const p = newSqlParams();
+    const conditions = [
+      `i.team_id=${p.add(teamId)}`,
+      `i.kind<>'task'`,
+      `i.work_at_from_source=true`,
+      `i.work_at>=${p.add(sinceIso)}::timestamptz`,
+      `coalesce(i.frontmatter->>'source','')<>'git'`,
+      `lower(coalesce(i.frontmatter->>'source',''))<>'gdrive'`,
+    ];
+    if (visArr) conditions.push(`i.id=any(${p.add(visArr)}::uuid[])`);
+    if (genericCursor) {
+      conditions.push(
+        `(i.work_at,i.id)<(${p.add(genericCursor.at)}::timestamptz,${p.add(genericCursor.id)}::uuid)`,
+      );
+    }
+    const page = await runSql<ItemRow & { work_at_cursor: string }>(
+      `select i.id,i.kind,i.member_id,i.member_id_locked,i.frontmatter,i.path,i.work_at,
+              i.work_at::text as work_at_cursor
+         from items i
+        where ${conditions.join(" and ")}
+        order by i.work_at desc,i.id desc
+        limit ${p.add(ITEM_LIMIT)}`,
+      p.values,
+    ).catch((error) => {
+      throw new Error(`work-timeline items: ${error instanceof Error ? error.message : String(error)}`);
+    });
+    const pageCredit = page.rows.length ? await creditFor(page.rows) : credit;
+    for (const r of page.rows) {
+      const evidence = genericEvidence(r, primaryOf(r, pageCredit));
+      if (!evidence) continue;
+      evItems.push(evidence);
+      if (++admitted >= ITEM_LIMIT) break;
+    }
+    if (page.rows.length < ITEM_LIMIT) break;
+    const last = page.rows.at(-1)!;
+    genericCursor = { at: last.work_at_cursor, id: last.id };
   }
 
   // SLACK — per PARTICIPANT (its own query so a thread whose ROOT is unmapped is still processed for its
@@ -629,7 +773,7 @@ export async function getWorkTimeline(
   // headers) — that gate, not a status filter, is what keeps the backlog off the timeline.
   const evidence: EvidenceWithMember[] = [];
   for (const e of evItems) {
-    const base: EvidenceItem & { memberId: string } = { id: e.id, memberId: e.memberId, source: e.source, kind: e.kind, title: e.title, url: e.url, at: e.at };
+    const base: EvidenceItem & { memberId: string } = { id: e.id, memberId: e.memberId, source: e.source, kind: e.kind, title: e.title, url: e.url, at: e.at, contributionRole: e.contributionRole };
     // Resolve against ALL referenced tasks (`allLinks`), not just the active ones, so a just-shipped
     // ticket heads its own group instead of its evidence falling to "Other" with a contradicting chip.
     const ownTaskIds = (allLinks.get(e.id) ?? []).filter((id) => taskInfo.has(id));
@@ -649,7 +793,8 @@ export async function getWorkTimeline(
     // Then, and only then, a model INFERENCE — least specific, so it never outranks a real citation.
     // Same tier mechanism as the two above: resolved solely against `taskInfo`, which was built from
     // `visibleTasks` reads, so an inferred id the viewer may not see links nothing, silently.
-    const inferredVisible = (inferredTaskIds.get(e.id) ?? []).filter((id) => taskInfo.has(id));
+    // Inferred links are keyed by the canonical item id: a Drive observation reads through `itemId`.
+    const inferredVisible = (inferredTaskIds.get(e.itemId ?? e.id) ?? []).filter((id) => taskInfo.has(id));
     if (inferredVisible.length) {
       for (const taskId of inferredVisible) evidence.push({ ...base, taskId, linkVia: "inferred" });
       continue;
@@ -707,7 +852,7 @@ export async function getWorkTimeline(
   // participants" — is solved by `meeting_note_attendees`, which resolves attendance to real member
   // FKs. Structurally the SLACK participant leg above: one item is many people's work.
   //
-  // Its OWN query, not the `otherRes` leg: that one filters `work_at_from_source = true`, and a
+  // Its OWN query, not the generic leg: that one filters `work_at_from_source = true`, and a
   // GUI-uploaded meeting is ingested with `frontmatter: { title }` only — no work-time key matches, so
   // it never leaves SQL. Relaxing the `continue` at the transcript filter would not have admitted it.
   //

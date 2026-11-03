@@ -5,10 +5,15 @@ import { spawnSync } from "node:child_process";
 import { parse as parseYaml } from "yaml";
 import {
   validateNeo4jTierWiring,
+  validateTierret1Neo4jWiring,
+  expectedScriptEnv,
   parseScript,
   parseHealthOptions,
   JOB_ID,
+  TIERRET1_JOB_ID,
+  TIERRET1_RUN_STEP,
 } from "@/scripts/neo4j-tier-wiring.mjs";
+import { neo4jTestTarget, queryServerEnv } from "../http/fake-providers";
 
 /**
  * NEO4JCI-1 — the Neo4j tier's WIRING, pinned. The tier (test/graph-neo4j-tier.test.ts) is the only
@@ -90,6 +95,69 @@ describe("Neo4j tier wiring — one mutation arm per invariant (non-vacuity)", (
       expect(violationsAfter(mut)).toEqual(want);
     });
   }
+});
+
+/**
+ * AIO-1167 — the TIERRET-1 query harness reads the graph through the production Neo4j path, so the HTTP
+ * job that runs it must carry the SAME isolated test Neo4j (compose's image, test auth, loopback bolt
+ * port and authenticated health probe), and the spawned server must receive only that loopback test
+ * service's compose-derived credentials — never an inherited NEO4J_*.
+ */
+describe("TIERRET-1 query harness — isolated test Neo4j wiring", () => {
+  type Job = Record<string, unknown> & {
+    services: { neo4j: { image: string; env: Record<string, string>; ports: string[]; options?: string } };
+    steps: Record<string, unknown>[];
+    env?: Record<string, string>;
+  };
+  const httpJob = (o: { ci: Record<string, never> }) => (o.ci as { jobs: Record<string, Job> }).jobs[TIERRET1_JOB_ID];
+  function tierretAfter(mut: (o: { ci: Record<string, never>; compose: Record<string, never> }) => void): string[] {
+    const o = { ci: structuredClone(ci()), compose: structuredClone(compose()) } as never;
+    mut(o);
+    const { ci: c, compose: k } = o as { ci: unknown; compose: unknown };
+    return validateTierret1Neo4jWiring(c, k);
+  }
+
+  it("the real ci.yml + compose.test.neo4j.yml agree: zero violations", () => {
+    expect(validateTierret1Neo4jWiring(ci(), compose())).toEqual([]);
+  });
+
+  const arms: [string, string[], (o: { ci: Record<string, never>; compose: Record<string, never> }) => void][] = [
+    ["job deleted", ["tierret1-job-missing"], (o) => { delete (o.ci as { jobs: Record<string, unknown> }).jobs[TIERRET1_JOB_ID]; }],
+    ["tierret1 step removed", ["tierret1-run-step-missing"], (o) => { const j = httpJob(o); j.steps = j.steps.filter((s) => s.run !== TIERRET1_RUN_STEP); }],
+    ["neo4j service removed", ["tierret1-service-missing"], (o) => { delete (httpJob(o).services as Record<string, unknown>).neo4j; }],
+    ["image drift", ["tierret1-image-drift"], (o) => { httpJob(o).services.neo4j.image = "neo4j:5.20.0"; }],
+    ["auth drift", ["tierret1-auth-drift"], (o) => { httpJob(o).services.neo4j.env.NEO4J_AUTH = "neo4j/other"; }],
+    ["bolt port drift (non-isolated 7687)", ["tierret1-port-drift"], (o) => { httpJob(o).services.neo4j.ports = ["7687:7687"]; }],
+    ["health probe made vacuous", ["tierret1-health-cmd-drift"], (o) => { const s = httpJob(o).services.neo4j; s.options = s.options!.replace(/--health-cmd "[^"]*"/, '--health-cmd "true"'); }],
+    ["health retries drift", ["tierret1-health-retries-drift"], (o) => { const s = httpJob(o).services.neo4j; s.options = s.options!.replace(/--health-retries \S+/, "--health-retries 2"); }],
+    ["job-level NEO4J_URL handed to every step", ["tierret1-neo4j-env-leak"], (o) => { const j = httpJob(o); j.env = { ...(j.env ?? {}), NEO4J_URL: "bolt://neo4j.railway.internal:7687" }; }],
+    ["step-level NEO4J_PASSWORD", ["tierret1-neo4j-env-leak"], (o) => { const st = httpJob(o).steps.find((s) => s.run === TIERRET1_RUN_STEP)!; st.env = { NEO4J_PASSWORD: "x" }; }],
+    ["compose service missing", ["tierret1-compose-service-missing"], (o) => { delete (o.compose as { services: Record<string, unknown> }).services.neo4j; }],
+  ];
+  for (const [label, want, mut] of arms) {
+    it(`${label} → exactly [${want.join(", ")}]`, () => {
+      expect(tierretAfter(mut)).toEqual(want);
+    });
+  }
+
+  it("the spawned server gets ONLY the compose-derived loopback test Neo4j, whatever the parent env holds", () => {
+    const env = queryServerEnv(
+      { PATH: "/usr/bin", NEO4J_URL: "bolt://neo4j.railway.internal:7687", NEO4J_USER: "prod", NEO4J_PASSWORD: "prod-secret" },
+      { llmUrl: "http://127.0.0.1:1", graphitiUrl: "http://127.0.0.1:2" },
+      "3999",
+    );
+    const want = expectedScriptEnv(compose()) as { NEO4J_URL: string; NEO4J_USER: string; NEO4J_PASSWORD: string };
+    expect(new URL(env.NEO4J_URL!).hostname).toBe("127.0.0.1");
+    expect(new URL(env.NEO4J_URL!).port).toBe(new URL(want.NEO4J_URL).port);
+    expect(env.NEO4J_USER).toBe(want.NEO4J_USER);
+    expect(env.NEO4J_PASSWORD).toBe(want.NEO4J_PASSWORD);
+    // The seeding worker is handed the same target, so the suite reads and writes one service.
+    expect(neo4jTestTarget()).toEqual({ url: env.NEO4J_URL, user: env.NEO4J_USER, password: env.NEO4J_PASSWORD });
+  });
+
+  it("still refuses a non-loopback endpoint for the server", () => {
+    expect(() => queryServerEnv({}, { llmUrl: "http://203.0.113.9:1", graphitiUrl: "http://127.0.0.1:2" }, "3999")).toThrow(/loopback/);
+  });
 });
 
 describe("parsers", () => {

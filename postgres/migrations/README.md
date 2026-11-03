@@ -13,14 +13,49 @@ Rules:
 - **Idempotent only.** Use `add column if not exists`, `create index if not exists`,
   guarded `do $$ … $$` blocks. Files are replayed on every rollout and in the
   migrate-from-zero test (`npm run db:test:up`), so a non-idempotent file will break CI.
-- **A re-added CHECK/constraint must allow the FULL current value set — not the set as of
+- **A shipped migration is immutable.** Once a file here has reached staging it is never edited
+  again — not to fix a comment, and not to widen a value list. The file a database was upgraded
+  with must stay the file in the repository. Change behaviour with a NEW migration.
+- **Every REPLAYED CHECK/constraint must allow the FULL current value set — not the set as of
   the file's write date.** Because every file replays in order on every deploy, an *older*
   `drop + re-add … check (x in (…))` that omits a value a *newer* migration added will, once
   prod holds a row with that newer value, reject it and abort the release — even though each
-  file is individually idempotent (the 2026-07-13 `integrations_type_check` incident). So when
-  you widen an enumerated CHECK, update `schema.sql` **and every earlier migration that re-adds
-  the same constraint** to the identical complete list. Where a guard enforces this
-  (e.g. `test/guards/integrations-type-check-replay.test.ts`), it fails the build on drift.
+  file is individually idempotent (the 2026-07-13 `integrations_type_check` incident).
+
+  The two rules meet in the **replay-supersession contract**, `scripts/migration-replay-plan.mjs`.
+  To widen an enumerated CHECK:
+  1. add ONE new migration that drops and re-adds the constraint with the complete set;
+  2. mirror the complete set into `schema.sql`;
+  3. for **every earlier migration that re-adds the same constraint**, add an entry to
+     `REPLAY_SUPERSESSIONS` naming that file, its git blob id
+     (`git rev-parse <rev>:postgres/migrations/<file>`), the exact obsolete statements, and the
+     new migration that owns the constraint. Do **not** edit the earlier file.
+
+  The effective replay plan then omits exactly those obsolete statements — never the whole file,
+  so a mixed-purpose migration still replays everything else — and the owning migration
+  re-establishes the constraint on the same pass. `pg-load-schema.mjs` (the deploy) and
+  `migrate-from-existing.mjs` (the upgrade lane) both execute that plan. It fails closed: a pinned
+  file that changed, obsolete text that is not present exactly once, or an owner that sorts earlier
+  or no longer defines the constraint aborts the load before a connection is even opened. (A
+  migration set that does not contain the owner at all is a historical release state — the upgrade
+  proofs replay those — and is run verbatim; the supersession is only in force alongside its owner.)
+  `test/guards/migration-replay-plan.test.ts`, `enum-check-replay.test.ts` and
+  `integrations-type-check-replay.test.ts` fail the build on an edited shipped file or on a
+  narrower definition left replaying.
+
+  Rolling BACK across a widening is not covered: a release from before the supersession replays the
+  old files verbatim and will refuse a database that already holds a row with the new value.
+- **A data statement must mean the same thing on every database it replays over — including a
+  sanitized staging restore.** Every file replays after `pg_restore` on a paired staging refresh,
+  over a database from which the export has deliberately removed whole tables (credentials,
+  operational queues, and their foreign-key dependents: `scripts/staging-ops/pg-sanitize.mjs`).
+  A cleanup phrased as "rows with no matching row in table X" selects *everything* there.
+  `20260922130000` deleted every Drive context unit "whose item has no active claim" and, on a
+  restore without the claim tables, removed the claim-authorized memberships of every copied Drive
+  document. The remedy is the same contract, second kind: `REPLAY_STEP_SUPERSESSIONS` pins the
+  file, omits exactly the unsafe statement, and names a later migration that owns the step — it
+  carries the line `-- [replay-step <name>]` — in a form that does not depend on the excluded
+  tables. Write new data steps that way from the start.
 - **Name as `YYYYMMDDHHMMSS_short_description.sql`.**
 - **Mirror the change into `postgres/schema.sql`** so a from-zero load still produces the
   same shape — the file here is only what an *existing* DB needs to catch up.
@@ -45,6 +80,18 @@ Scope, stated plainly: those scratch databases are **empty**, so this checks a m
 a row-dependent precondition never fires — `20260818210000_pret6_retire_access_enforcement.sql`
 aborts a real rollout against a populated database and is green in this lane every time. Seeding a
 fixture set that satisfies every migration's preconditions is real work and is not claimed.
+
+One data-dependent case IS claimed, because it is the incident class the supersession contract
+exists for: the **populated replay**. The lane deploys the current tree over the newest usable
+release (or `--populated-from <ref>` for an exact prior state, such as the staging commit a branch
+is based on), inserts a `gdrive` integration and a `gdrive_claim` context membership, replays the
+whole deploy twice more, and requires both rows and both complete constraints to survive. Its
+negative control then runs each superseded migration RAW and requires those rows to refuse it —
+so a fixture that stops exercising the constraints turns the lane red instead of vacuous. The same
+fixture holds the three Drive context shapes with no claim rows behind them (a claim-placed unit, a
+legacy generic unit, a retracted pending-cleanup unit): the replays must keep the first, suppress
+the second and leave the third retracted, and the superseded data statement, run RAW inside a
+rolled-back transaction, must destroy them.
 
 ```bash
 DATABASE_TEST_URL=postgres://app:app@localhost:5434/app_test npm run test:migrate-from-existing

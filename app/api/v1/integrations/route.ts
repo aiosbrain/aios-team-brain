@@ -4,7 +4,8 @@ import { authenticateApiKey } from "@/lib/api/auth";
 import { rateLimit } from "@/lib/api/rate-limit";
 import { errorResponse } from "@/lib/api/schemas";
 import { audit } from "@/lib/api/audit";
-import { listEnabledIntegrationSelections } from "@/lib/integrations/manage";
+import { listEnabledIntegrationSelections, listIntegrationSelections } from "@/lib/integrations/manage";
+import { gdriveConnectionsBoundTo, projectSelectionsFor } from "@/lib/integrations/gdrive-selection-projection";
 
 export const runtime = "nodejs";
 
@@ -15,6 +16,11 @@ export const runtime = "nodejs";
  * boundary, even to a valid key. The in-process ingestion runner reads decrypted secrets
  * directly (`lib/integrations/manage.getEnabledIntegrationsWithSecrets`), not over the API.
  * Admins manage integrations in the dashboard (Admin → Integrations). Every read is audited.
+ *
+ * A Drive row's account and selection metadata (account email/subject, scopes, selected ids,
+ * audience projects, service-account identity) is returned ONLY to that connection's live bound
+ * connector principal; every other key discovers the row with its Drive config reduced to
+ * `authMode` (AIO-1167 R42 F5, `lib/integrations/gdrive-selection-projection`).
  */
 export async function GET(req: NextRequest) {
   const auth = await authenticateApiKey(req);
@@ -26,14 +32,22 @@ export async function GET(req: NextRequest) {
   }
 
   try {
-    const integrations = await listEnabledIntegrationSelections(db, auth.teamId);
+    const includeDisabled = req.nextUrl.searchParams.get("include_disabled") === "1";
+    const selections = includeDisabled
+      ? await listIntegrationSelections(db, auth.teamId)
+      : await listEnabledIntegrationSelections(db, auth.teamId);
+    const bound = await gdriveConnectionsBoundTo(auth);
+    const integrations = projectSelectionsFor(selections, bound);
     await audit(db, {
       team_id: auth.teamId,
       actor_kind: "api_key",
       member_id: auth.memberId,
       api_key_id: auth.apiKeyId,
       action: "integrations.read",
-      meta: { count: integrations.length, types: integrations.map((i) => i.type) },
+      meta: {
+        count: integrations.length, types: integrations.map((i) => i.type), includeDisabled,
+        driveConfigDisclosed: integrations.filter((i) => i.type === "gdrive" && bound.has(i.id)).map((i) => i.id),
+      },
     });
     // Non-secret selections only — no token/secret/secret_ciphertext ever leaves here.
     return Response.json({ integrations });

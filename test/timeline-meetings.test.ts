@@ -118,12 +118,16 @@ describe("meetings on the person card (spec: meeting-participation-as-work-v1)",
   it("pins the payload version constants", () => {
     // The shape guard alone does NOT catch a revert: v11 is still pinned in SHAPE_BY_VERSION, so
     // dropping the bump back to 11 sails straight through it — which is the v8 incident class the
-    // guard's own comment records. MIN_SALVAGEABLE_VERSION must NOT follow the bump: raising it blanks
-    // every person-day summary, a regression reported twice as "we've lost the summaries".
-    // v16: TIERRET-1 member-admission cutover (meaning change, shape identical). 15 is reserved by the
+    // guard's own comment records. MIN_SALVAGEABLE_VERSION must NOT follow a bump by default: raising
+    // it blanks every person-day summary, a regression reported twice as "we've lost the summaries".
+    // v16: TIERRET-1 member-admission cutover (meaning change, shape identical). 15 was reserved by the
     // pending Slack-semantics PR #714 and deliberately skipped; isolation itself is the `adm:` namespace.
-    expect(PAYLOAD_VERSION).toBe(16);
-    expect(MIN_SALVAGEABLE_VERSION).toBe(11);
-    expect(MIN_SALVAGEABLE_VERSION).toBeLessThan(PAYLOAD_VERSION);
+    // v18 (AIO-1167): correction-aware source-time Drive contribution ledger. Authored as v15; 17 is
+    // the number #714's branch now claims, so this takes the next unclaimed one. It changes
+    // attribution MEANING — carrying older prose can name the wrong Google contributor — so this
+    // bump deliberately raises the salvage floor too.
+    expect(PAYLOAD_VERSION).toBe(18);
+    expect(MIN_SALVAGEABLE_VERSION).toBe(18);
+    expect(MIN_SALVAGEABLE_VERSION).toBe(PAYLOAD_VERSION);
   });
 });

@@ -11,7 +11,8 @@ import { SlackClient, fetchSlackChannel, privateChannelAction } from "./sources/
 import { normalizeThread, slackChannelPathPrefix } from "./sources/slack-normalize";
 import { syncSlackIdentities } from "./sources/slack-identity";
 import { syncProviderIdentities } from "@/lib/identity/provider-sync";
-import { buildIdentityMap, resolveByProviderId, resolveMember } from "@/lib/identity/resolve";
+import { resolveByProviderId, resolveMember } from "@/lib/identity/resolve";
+import { buildIdentityAuthoritySnapshot, withIdentityMutationBoundary } from "@/lib/identity/authority";
 import { fetchPlaneProject } from "./sources/plane";
 import { normalizePlaneProject, normalizePlaneDocs } from "./sources/plane-normalize";
 import type { PlaneConnection } from "@/lib/pm-sync/plane-client";
@@ -81,16 +82,17 @@ export async function resolveConnectorAuth(
   teamId: string,
   identity: ConnectorIdentity
 ): Promise<{ teamId: string; memberId: string; apiKeyId: string } | null> {
-  const { data: existing } = await db
-    .from("members")
-    .select("id")
-    .eq("team_id", teamId)
-    .eq("actor_handle", identity.handle)
-    .maybeSingle();
-
-  let memberId = (existing as { id: string } | null)?.id;
-  if (!memberId) {
-    const { data: created } = await db
+  const memberId = await withIdentityMutationBoundary(teamId, async () => {
+    const existing = await db
+      .from("members")
+      .select("id")
+      .eq("team_id", teamId)
+      .eq("actor_handle", identity.handle)
+      .maybeSingle();
+    if (existing.error) throw new Error(`connector member read failed: ${existing.error.message}`);
+    const found = (existing.data as { id: string } | null)?.id;
+    if (found) return found;
+    const created = await db
       .from("members")
       .upsert(
         {
@@ -107,8 +109,9 @@ export async function resolveConnectorAuth(
       )
       .select("id")
       .single();
-    memberId = (created as { id: string } | null)?.id;
-  }
+    if (created.error) throw new Error(`connector member write failed: ${created.error.message}`);
+    return (created.data as { id: string } | null)?.id;
+  });
   if (!memberId) return null;
 
   // PRET-4 (diff-review H1): connectors are minted HERE, not via createMember, so the
@@ -214,7 +217,8 @@ export async function runSlackIngestion(opts: { teamId?: string } = {}): Promise
         } catch (err) {
           summary.errors.push(`team ${teamId}: slack identity sync: ${err instanceof Error ? err.message : "failed"}`);
         }
-        const idMap = await buildIdentityMap(db, teamId);
+        const identitySnapshot = await buildIdentityAuthoritySnapshot(db,teamId);
+        const idMap = identitySnapshot.map;
         const users = Object.fromEntries(detailed.map((u) => [u.id, u.displayName]));
         let unverifiable = 0; // channels this token couldn't establish as public, per integration
         for (const channelId of channelIds) {
@@ -267,7 +271,9 @@ export async function runSlackIngestion(opts: { teamId?: string } = {}): Promise
               });
               // Attribute the item to the thread author's mapped member (else the ingesting actor).
               const authorMemberId = resolveByProviderId(idMap, "slack", thread.root.user ?? "");
-              const res = await ingestItem(db, auth, payload, "team", { authorMemberId });
+              const res = await ingestItem(db, auth, payload, "team", {
+                authorMemberId,mappingRevision:identitySnapshot.revision,
+              });
               if (res.status === "created") summary.created++;
               else if (res.status === "updated") summary.updated++;
               else summary.unchanged++;
@@ -421,7 +427,8 @@ export async function runPlaneIngestion(opts: { teamId?: string } = {}): Promise
           } catch (err) {
             summary.errors.push(`team ${teamId}: plane identity sync: ${err instanceof Error ? err.message : "failed"}`);
           }
-          const idMap = await buildIdentityMap(db, teamId);
+          const identitySnapshot = await buildIdentityAuthoritySnapshot(db,teamId);
+          const idMap = identitySnapshot.map;
           // Work-items → tasks (one kind=task item).
           const payload = normalizePlaneProject({ ...fetched, aiosSources });
           summary.items += payload.rows?.length ?? 0;
@@ -432,7 +439,9 @@ export async function runPlaneIngestion(opts: { teamId?: string } = {}): Promise
           // Work-item text → deliverable items (searchable), one per work-item; attributed to assignee.
           for (const doc of normalizePlaneDocs({ ...fetched, aiosSources })) {
             const authorMemberId = resolveByProviderId(idMap, "plane", String(doc.frontmatter?.assignee_id ?? ""));
-            const r = await ingestItem(db, auth, doc, "team", { authorMemberId });
+            const r = await ingestItem(db, auth, doc, "team", {
+              authorMemberId,mappingRevision:identitySnapshot.revision,
+            });
             if (r.status === "created") summary.created++;
             else if (r.status === "updated") summary.updated++;
             else summary.unchanged++;
@@ -535,7 +544,8 @@ export async function runLinearIngestion(opts: { teamId?: string } = {}): Promis
           } catch (err) {
             summary.errors.push(`team ${teamId}: linear identity sync: ${err instanceof Error ? err.message : "failed"}`);
           }
-          const idMap = await buildIdentityMap(db, teamId);
+          const identitySnapshot = await buildIdentityAuthoritySnapshot(db,teamId);
+          const idMap = identitySnapshot.map;
           // Issues → tasks (one kind=task item). Brain-owned issues are excluded (only Linear-authored import).
           const payload = normalizeLinearTeam({ ...fetched, ownedResourceIds });
           summary.items += payload.rows?.length ?? 0;
@@ -546,7 +556,9 @@ export async function runLinearIngestion(opts: { teamId?: string } = {}): Promis
           // Issue text → deliverable items (searchable), one per issue; attributed to assignee.
           for (const doc of normalizeLinearDocs({ ...fetched, ownedResourceIds })) {
             const authorMemberId = resolveByProviderId(idMap, "linear", String(doc.frontmatter?.assignee_id ?? ""));
-            const r = await ingestItem(db, auth, doc, "team", { authorMemberId });
+            const r = await ingestItem(db, auth, doc, "team", {
+              authorMemberId,mappingRevision:identitySnapshot.revision,
+            });
             if (r.status === "created") summary.created++;
             else if (r.status === "updated") summary.updated++;
             else summary.unchanged++;
@@ -633,7 +645,8 @@ export async function runGithubIngestion(opts: { teamId?: string; force?: boolea
           // only bypasses the SKIP decision. The hash covers the window's stored IDENTITY
           // (anchor + days), never a resolved instant — the default window's `now − 90d`
           // slides every tick and would make the cursor never match (the vacuity failure).
-          const idMap = await buildIdentityMap(db, auth.teamId);
+          const identitySnapshot = await buildIdentityAuthoritySnapshot(db,auth.teamId);
+          const idMap = identitySnapshot.map;
           const configHash = githubRepoConfigHash({
             fileGlobs,
             historySinceIso: history?.sinceIso ?? null,
@@ -688,7 +701,9 @@ export async function runGithubIngestion(opts: { teamId?: string; force?: boolea
                   email: typeof fm.author_email === "string" ? fm.author_email : undefined,
                   key: typeof fm.author_login === "string" ? fm.author_login : undefined,
                 });
-                const res = await ingestItem(db, auth, payload, "team", { authorMemberId });
+                const res = await ingestItem(db, auth, payload, "team", {
+                  authorMemberId,mappingRevision:identitySnapshot.revision,
+                });
                 if (res.status === "created") summary.created++;
                 else if (res.status === "updated") summary.updated++;
                 else summary.unchanged++;

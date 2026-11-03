@@ -1,15 +1,26 @@
-"""Local sync state (sqlite): per-connection cursors and webhook-channel records.
+"""Durable connector progress for the ingestion sidecar.
 
-The brain is the system of record for content; this store only remembers *where the
-connector left off* so polls are incremental and Drive watch-channels can be renewed.
-Kept local (not in the brain) so the sidecar stays loosely coupled — HTTP only.
+The brain is the system of record for content and execution authority; this store only remembers
+*where the connector left off* so polls are incremental and Drive watch-channels can be renewed.
+Kept local so the sidecar stays HTTP only. Every authoritative mutation is checked against the
+brain-issued generation/fence before this state may advance. Drive
+page tokens are opaque and are therefore stored verbatim, namespaced by team,
+connection id, credential identity, selected drive and scope generation.  The older
+``cursors``/single-channel tables remain readable for non-Drive connectors and for a
+safe upgrade from pre-AIO-1167 installations.
 """
 
 from __future__ import annotations
 
 import sqlite3
+import json
+import hashlib
+import hmac
+import secrets
 from contextlib import closing
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Collection, Iterable
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS cursors (
@@ -18,10 +29,230 @@ CREATE TABLE IF NOT EXISTS cursors (
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS webhook_channels (
-  connection TEXT PRIMARY KEY,
+  connection TEXT NOT NULL,
   channel_id TEXT NOT NULL,
   resource_id TEXT,
-  expires_at TEXT
+  expires_at TEXT,
+  namespace TEXT NOT NULL DEFAULT '',
+  verification_hash TEXT,
+  retired_at TEXT,
+  PRIMARY KEY (connection, channel_id)
+);
+CREATE TABLE IF NOT EXISTS stream_progress (
+  namespace TEXT PRIMARY KEY,
+  team TEXT NOT NULL,
+  connection_id TEXT NOT NULL,
+  credential_id TEXT NOT NULL,
+  drive_id TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  phase TEXT NOT NULL,
+  page_token TEXT,
+  baseline_start_token TEXT,
+  traversal_token TEXT,
+  listing_complete INTEGER NOT NULL DEFAULT 0,
+  last_attempt_at TEXT,
+  last_success_at TEXT,
+  last_error TEXT,
+  server_revision INTEGER NOT NULL DEFAULT 0,
+  retry_not_before TEXT,
+  active_snapshot INTEGER,
+  building_snapshot INTEGER,
+  recovery_required INTEGER NOT NULL DEFAULT 0,
+  checkpoint_id TEXT,
+  terminal_drain_token TEXT,
+  terminal_drain_checkpoint_id TEXT,
+  terminal_drain_acknowledged INTEGER NOT NULL DEFAULT 0,
+  drain_observation INTEGER NOT NULL DEFAULT 0,
+  terminal_drain_observation INTEGER,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS selection_snapshots (
+  namespace TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  snapshot_id INTEGER NOT NULL,
+  status TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  completed_at TEXT,
+  PRIMARY KEY (namespace, generation, snapshot_id)
+);
+CREATE TABLE IF NOT EXISTS selection_roots (
+  namespace TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  snapshot_id INTEGER NOT NULL DEFAULT 1,
+  root_id TEXT NOT NULL,
+  root_kind TEXT NOT NULL,
+  drive_id TEXT NOT NULL,
+  recursive INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (namespace, generation, snapshot_id, root_kind, root_id)
+);
+CREATE TABLE IF NOT EXISTS traversal_queue (
+  namespace TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  snapshot_id INTEGER NOT NULL DEFAULT 1,
+  root_id TEXT NOT NULL,
+  folder_id TEXT NOT NULL,
+  drive_id TEXT NOT NULL,
+  page_token TEXT NOT NULL DEFAULT '',
+  completed_at TEXT,
+  PRIMARY KEY (namespace, generation, snapshot_id, root_id, folder_id, page_token)
+);
+CREATE TABLE IF NOT EXISTS selected_membership (
+  namespace TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  snapshot_id INTEGER NOT NULL DEFAULT 1,
+  provider_id TEXT NOT NULL,
+  root_ids TEXT NOT NULL DEFAULT '[]',
+  drive_id TEXT NOT NULL,
+  seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (namespace, generation, snapshot_id, provider_id)
+);
+CREATE TABLE IF NOT EXISTS traversal_ancestry (
+  namespace TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  snapshot_id INTEGER NOT NULL,
+  root_id TEXT NOT NULL,
+  folder_id TEXT NOT NULL,
+  ancestor_id TEXT NOT NULL,
+  PRIMARY KEY (namespace,generation,snapshot_id,root_id,folder_id,ancestor_id)
+);
+CREATE TABLE IF NOT EXISTS membership_ancestry (
+  namespace TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  snapshot_id INTEGER NOT NULL,
+  provider_id TEXT NOT NULL,
+  root_id TEXT NOT NULL,
+  ancestor_id TEXT NOT NULL,
+  PRIMARY KEY (namespace,generation,snapshot_id,provider_id,root_id,ancestor_id)
+);
+CREATE TABLE IF NOT EXISTS materialized_pages (
+  namespace TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  page_id TEXT NOT NULL,
+  page_kind TEXT NOT NULL,
+  drain_observation INTEGER NOT NULL DEFAULT 0,
+  snapshot_id INTEGER,
+  input_token TEXT NOT NULL DEFAULT '',
+  next_token TEXT,
+  terminal_token TEXT,
+  materialized_at TEXT NOT NULL DEFAULT (datetime('now')),
+  committed_at TEXT,
+  rescan_snapshot_id INTEGER,
+  PRIMARY KEY (namespace, generation, page_id)
+);
+CREATE TABLE IF NOT EXISTS pending_work (
+  namespace TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  item_key TEXT NOT NULL,
+  action TEXT NOT NULL,
+  observation_revision INTEGER NOT NULL DEFAULT 0,
+  payload TEXT NOT NULL DEFAULT '{}',
+  page_id TEXT,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  failures INTEGER NOT NULL DEFAULT 0,
+  not_before TEXT,
+  last_error TEXT,
+  acknowledged_at TEXT,
+  superseded_at TEXT,
+  exhausted_at TEXT,
+  minimum_not_before TEXT,
+  deadline_tracked INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (namespace, generation, item_key, action)
+);
+CREATE TABLE IF NOT EXISTS stream_observation_revisions (
+  namespace TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  last_revision INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (namespace, generation)
+);
+CREATE TABLE IF NOT EXISTS item_observations (
+  namespace TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  item_key TEXT NOT NULL,
+  observation_revision INTEGER NOT NULL,
+  action TEXT NOT NULL,
+  payload TEXT NOT NULL DEFAULT '{}',
+  page_id TEXT,
+  observed_at TEXT NOT NULL,
+  PRIMARY KEY (namespace, generation, item_key)
+);
+CREATE TABLE IF NOT EXISTS page_obligation_outcomes (
+  namespace TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  page_id TEXT NOT NULL,
+  item_key TEXT NOT NULL,
+  observation_revision INTEGER NOT NULL,
+  action TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  superseded_by_snapshot INTEGER,
+  PRIMARY KEY (namespace, generation, page_id, item_key, observation_revision)
+);
+CREATE TABLE IF NOT EXISTS stream_leases (
+  namespace TEXT PRIMARY KEY,
+  owner TEXT NOT NULL,
+  fence INTEGER NOT NULL,
+  lease_until TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS connection_stream_schedule (
+  connection_id TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  next_drive_id TEXT,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (connection_id, generation)
+);
+CREATE TABLE IF NOT EXISTS selection_root_bindings (
+  connection_id TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  root_kind TEXT NOT NULL,
+  root_id TEXT NOT NULL,
+  drive_id TEXT NOT NULL,
+  bound_at TEXT NOT NULL DEFAULT (datetime('now')),
+  status TEXT NOT NULL DEFAULT 'bound',
+  pending_drive_id TEXT,
+  detail TEXT,
+  PRIMARY KEY (connection_id, generation, root_kind, root_id)
+);
+CREATE TABLE IF NOT EXISTS stream_hints (
+  team TEXT NOT NULL,
+  connection_id TEXT NOT NULL,
+  credential_id TEXT NOT NULL,
+  drive_id TEXT NOT NULL,
+  dirty_seq INTEGER NOT NULL DEFAULT 0,
+  acked_seq INTEGER NOT NULL DEFAULT 0,
+  last_hint_at TEXT,
+  PRIMARY KEY (team, connection_id, credential_id, drive_id)
+);
+CREATE TABLE IF NOT EXISTS removal_barriers (
+  namespace TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  item_key TEXT NOT NULL,
+  observation_revision INTEGER NOT NULL,
+  peer_drive_id TEXT NOT NULL,
+  barrier_seq INTEGER NOT NULL,
+  raised_at TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (namespace, generation, item_key, observation_revision, peer_drive_id)
+);
+CREATE TABLE IF NOT EXISTS connection_holds (
+  connection_id TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  credential_id TEXT NOT NULL,
+  not_before TEXT NOT NULL,
+  category TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (connection_id, generation, credential_id)
+);
+CREATE TABLE IF NOT EXISTS document_restrictions (
+  connection_id TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  credential_id TEXT NOT NULL,
+  provider_id TEXT NOT NULL,
+  not_before TEXT NOT NULL,
+  category TEXT NOT NULL,
+  unrepresentable INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (connection_id, generation, credential_id, provider_id)
 );
 """
 
@@ -32,13 +263,373 @@ class Channel:
     channel_id: str
     resource_id: str | None
     expires_at: str | None
+    namespace: str = ""
+    verification_hash: str | None = None
+    retired_at: str | None = None
+
+
+@dataclass(frozen=True)
+class StreamKey:
+    team: str
+    connection_id: str
+    credential_id: str
+    drive_id: str = "my-drive"
+
+    def namespace(self, generation: int) -> str:
+        material = "\0".join(
+            (self.team, self.connection_id, self.credential_id, self.drive_id, str(generation))
+        )
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class RootBinding:
+    drive_id: str
+    status: str = "bound"
+    pending_drive_id: str | None = None
+    detail: str | None = None
+
+
+# The states a selected-root obligation can be in (see ``StateStore.bind_root``).
+ROOT_STATES = frozenset({"unresolved", "bound", "uncertain", "relocating"})
+# The detail of an ``uncertain`` root its stream's enumeration DEFERRED (AIO-1167 R50 F4): read
+# withheld by a provider minimum or a non-quota deferral; membership retained, not verified.
+ROOT_DEFERRED_PREFIX = "selected root deferred"
+
+
+@dataclass(frozen=True)
+class StreamProgress:
+    namespace: str
+    key: StreamKey
+    generation: int
+    phase: str
+    page_token: str | None = None
+    baseline_start_token: str | None = None
+    traversal_token: str | None = None
+    listing_complete: bool = False
+    last_attempt_at: str | None = None
+    last_success_at: str | None = None
+    last_error: str | None = None
+    server_revision: int = 0
+    retry_not_before: str | None = None
+    active_snapshot: int | None = None
+    building_snapshot: int | None = None
+    recovery_required: bool = False
+    checkpoint_id: str | None = None
+    terminal_drain_token: str | None = None
+    terminal_drain_checkpoint_id: str | None = None
+    terminal_drain_acknowledged: bool = False
+    drain_observation: int = 0
+    terminal_drain_observation: int | None = None
+
+
+@dataclass(frozen=True)
+class PendingWork:
+    namespace: str
+    generation: int
+    item_key: str
+    action: str
+    observation_revision: int
+    payload: dict[str, Any]
+    attempts: int
+    not_before: str | None
+    last_error: str | None
+    page_id: str | None = None
+    acknowledged_at: str | None = None
+
+
+@dataclass(frozen=True)
+class MaterializedPage:
+    namespace: str
+    generation: int
+    page_id: str
+    page_kind: str
+    drain_observation: int
+    input_token: str
+    next_token: str | None
+    terminal_token: str | None
+    committed_at: str | None
+    snapshot_id: int | None = None
+    rescan_snapshot_id: int | None = None
 
 
 class StateStore:
     def __init__(self, db_path: str = "aios_ingest_state.sqlite"):
         self._db = sqlite3.connect(db_path)
+        self._db.row_factory = sqlite3.Row
         self._db.executescript(_SCHEMA)
+        columns = {r[1] for r in self._db.execute("PRAGMA table_info(stream_progress)")}
+        if "server_revision" not in columns:
+            self._db.execute("ALTER TABLE stream_progress ADD COLUMN server_revision INTEGER NOT NULL DEFAULT 0")
+        if "retry_not_before" not in columns:
+            self._db.execute("ALTER TABLE stream_progress ADD COLUMN retry_not_before TEXT")
+        if "active_snapshot" not in columns:
+            self._db.execute("ALTER TABLE stream_progress ADD COLUMN active_snapshot INTEGER")
+        if "building_snapshot" not in columns:
+            self._db.execute("ALTER TABLE stream_progress ADD COLUMN building_snapshot INTEGER")
+        if "recovery_required" not in columns:
+            self._db.execute("ALTER TABLE stream_progress ADD COLUMN recovery_required INTEGER NOT NULL DEFAULT 0")
+        if "checkpoint_id" not in columns:
+            self._db.execute("ALTER TABLE stream_progress ADD COLUMN checkpoint_id TEXT")
+        if "terminal_drain_token" not in columns:
+            self._db.execute("ALTER TABLE stream_progress ADD COLUMN terminal_drain_token TEXT")
+        if "terminal_drain_checkpoint_id" not in columns:
+            self._db.execute("ALTER TABLE stream_progress ADD COLUMN terminal_drain_checkpoint_id TEXT")
+        if "terminal_drain_acknowledged" not in columns:
+            self._db.execute(
+                "ALTER TABLE stream_progress ADD COLUMN terminal_drain_acknowledged INTEGER NOT NULL DEFAULT 0"
+            )
+        if "drain_observation" not in columns:
+            self._db.execute(
+                "ALTER TABLE stream_progress ADD COLUMN drain_observation INTEGER NOT NULL DEFAULT 0"
+            )
+        if "terminal_drain_observation" not in columns:
+            self._db.execute("ALTER TABLE stream_progress ADD COLUMN terminal_drain_observation INTEGER")
+        self._upgrade_selection_schema()
+        self._upgrade_legacy_shared_drive_roots()
+        page_columns = {r[1] for r in self._db.execute("PRAGMA table_info(materialized_pages)")}
+        if "snapshot_id" not in page_columns:
+            self._db.execute("ALTER TABLE materialized_pages ADD COLUMN snapshot_id INTEGER")
+        if "rescan_snapshot_id" not in page_columns:
+            self._db.execute("ALTER TABLE materialized_pages ADD COLUMN rescan_snapshot_id INTEGER")
+        if "drain_observation" not in page_columns:
+            self._db.execute(
+                "ALTER TABLE materialized_pages ADD COLUMN drain_observation INTEGER NOT NULL DEFAULT 0"
+            )
+        work_columns = {r[1] for r in self._db.execute("PRAGMA table_info(pending_work)")}
+        if "page_id" not in work_columns:
+            self._db.execute("ALTER TABLE pending_work ADD COLUMN page_id TEXT")
+        if "acknowledged_at" not in work_columns:
+            self._db.execute("ALTER TABLE pending_work ADD COLUMN acknowledged_at TEXT")
+        if "observation_revision" not in work_columns:
+            self._db.execute(
+                "ALTER TABLE pending_work ADD COLUMN observation_revision INTEGER NOT NULL DEFAULT 0"
+            )
+        if "superseded_at" not in work_columns:
+            self._db.execute("ALTER TABLE pending_work ADD COLUMN superseded_at TEXT")
+        if "exhausted_at" not in work_columns:
+            # AIO-1167 R44 C7: automatic retries ran out; the obligation stays owed (and keeps the
+            # run partial) until an explicit Admin run or a new observation re-arms it.
+            self._db.execute("ALTER TABLE pending_work ADD COLUMN exhausted_at TEXT")
+        if "failures" not in work_columns:
+            # AIO-1167 R44 C7: the retry policy's own count — real failures only. `attempts` also
+            # counts a document merely WITHHELD (waiting on another stream's drain), which orders it
+            # behind fresher work but is not a failure. Existing rows start at zero: their old
+            # `attempts` cannot tell the two apart, and over-counting would exhaust work that never failed.
+            self._db.execute("ALTER TABLE pending_work ADD COLUMN failures INTEGER NOT NULL DEFAULT 0")
+        if "minimum_not_before" not in work_columns:
+            # AIO-1167 R50: the EXTERNAL minimum (provider- or brain-named) folded into
+            # `not_before`, kept apart from the local exponential backoff so an explicit rearm can
+            # drop the backoff without waiving the minimum.
+            self._db.execute("ALTER TABLE pending_work ADD COLUMN minimum_not_before TEXT")
+        if "deadline_tracked" not in work_columns:
+            # 1 once `not_before` was written with its provenance recorded. Existing rows start at 0:
+            # their combined deadline cannot be assumed to be local backoff only, so rearm keeps it.
+            self._db.execute("ALTER TABLE pending_work ADD COLUMN deadline_tracked INTEGER NOT NULL DEFAULT 0")
+        outcome_columns = {r[1] for r in self._db.execute("PRAGMA table_info(page_obligation_outcomes)")}
+        if "superseded_by_snapshot" not in outcome_columns:
+            self._db.execute(
+                "ALTER TABLE page_obligation_outcomes ADD COLUMN superseded_by_snapshot INTEGER"
+            )
+        binding_columns = {r[1] for r in self._db.execute("PRAGMA table_info(selection_root_bindings)")}
+        if "status" not in binding_columns:
+            self._db.execute(
+                "ALTER TABLE selection_root_bindings ADD COLUMN status TEXT NOT NULL DEFAULT 'bound'"
+            )
+        if "pending_drive_id" not in binding_columns:
+            self._db.execute("ALTER TABLE selection_root_bindings ADD COLUMN pending_drive_id TEXT")
+        if "detail" not in binding_columns:
+            self._db.execute("ALTER TABLE selection_root_bindings ADD COLUMN detail TEXT")
+        self._upgrade_observation_revisions()
+        self._upgrade_legacy_channels()
+        self._upgrade_watch_columns()
         self._db.commit()
+
+    def _upgrade_observation_revisions(self) -> None:
+        """Conservatively adopt pre-revision obligations and resolve old action conflicts."""
+        rows = self._db.execute(
+            "SELECT rowid,* FROM pending_work WHERE observation_revision=0 "
+            "ORDER BY namespace,generation,item_key,updated_at,rowid"
+        ).fetchall()
+        latest: dict[tuple[str, int, str], sqlite3.Row] = {}
+        for row in rows:
+            latest[(row["namespace"], row["generation"], row["item_key"])] = row
+        now = _now_iso()
+        for (namespace, generation, item_key), row in latest.items():
+            self._db.execute(
+                "UPDATE pending_work SET superseded_at=coalesce(superseded_at,?),"
+                "acknowledged_at=coalesce(acknowledged_at,?) "
+                "WHERE namespace=? AND generation=? AND item_key=? AND rowid<>?",
+                (now, now, namespace, generation, item_key, row["rowid"]),
+            )
+            revision = max(1, int(row["observation_revision"] or 0))
+            self._db.execute(
+                "UPDATE pending_work SET observation_revision=? WHERE rowid=?",
+                (revision, row["rowid"]),
+            )
+            self._db.execute(
+                "INSERT INTO item_observations(namespace,generation,item_key,observation_revision,action,payload,page_id,observed_at) "
+                "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(namespace,generation,item_key) DO UPDATE SET "
+                "observation_revision=excluded.observation_revision,action=excluded.action,payload=excluded.payload,"
+                "page_id=excluded.page_id,observed_at=excluded.observed_at",
+                (namespace, generation, item_key, revision, row["action"], row["payload"],
+                 row["page_id"], now),
+            )
+            self._db.execute(
+                "INSERT INTO stream_observation_revisions(namespace,generation,last_revision) VALUES(?,?,?) "
+                "ON CONFLICT(namespace,generation) DO UPDATE SET "
+                "last_revision=max(last_revision,excluded.last_revision)",
+                (namespace, generation, revision),
+            )
+
+    def _upgrade_selection_schema(self) -> None:
+        """Add snapshot incarnation to pre-Batch-3 local state without discarding progress."""
+        for table, definition, columns in (
+            (
+                "selection_roots",
+                """CREATE TABLE selection_roots (
+                  namespace TEXT NOT NULL, generation INTEGER NOT NULL, snapshot_id INTEGER NOT NULL DEFAULT 1,
+                  root_id TEXT NOT NULL, root_kind TEXT NOT NULL, drive_id TEXT NOT NULL,
+                  recursive INTEGER NOT NULL DEFAULT 0,
+                  PRIMARY KEY(namespace,generation,snapshot_id,root_kind,root_id))""",
+                "namespace,generation,snapshot_id,root_id,root_kind,drive_id,recursive",
+            ),
+            (
+                "traversal_queue",
+                """CREATE TABLE traversal_queue (
+                  namespace TEXT NOT NULL, generation INTEGER NOT NULL, snapshot_id INTEGER NOT NULL DEFAULT 1,
+                  root_id TEXT NOT NULL, folder_id TEXT NOT NULL, drive_id TEXT NOT NULL,
+                  page_token TEXT NOT NULL DEFAULT '', completed_at TEXT,
+                  PRIMARY KEY(namespace,generation,snapshot_id,root_id,folder_id,page_token))""",
+                "namespace,generation,snapshot_id,root_id,folder_id,drive_id,page_token,completed_at",
+            ),
+            (
+                "selected_membership",
+                """CREATE TABLE selected_membership (
+                  namespace TEXT NOT NULL, generation INTEGER NOT NULL, snapshot_id INTEGER NOT NULL DEFAULT 1,
+                  provider_id TEXT NOT NULL, root_ids TEXT NOT NULL DEFAULT '[]', drive_id TEXT NOT NULL,
+                  seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+                  PRIMARY KEY(namespace,generation,snapshot_id,provider_id))""",
+                "namespace,generation,snapshot_id,provider_id,root_ids,drive_id,seen_at",
+            ),
+        ):
+            present = {r[1] for r in self._db.execute(f"PRAGMA table_info({table})")}
+            if "snapshot_id" in present:
+                continue
+            legacy = f"{table}_pre_snapshot"
+            self._db.execute(f"ALTER TABLE {table} RENAME TO {legacy}")
+            self._db.execute(definition)
+            select_columns = columns.replace("snapshot_id", "1")
+            self._db.execute(
+                f"INSERT INTO {table}({columns}) SELECT {select_columns} FROM {legacy}"
+            )
+            self._db.execute(f"DROP TABLE {legacy}")
+        self._db.execute(
+            "INSERT OR IGNORE INTO selection_snapshots(namespace,generation,snapshot_id,status,completed_at) "
+            "SELECT namespace,generation,1,'active',? FROM ("
+            "SELECT namespace,generation FROM selection_roots "
+            "UNION SELECT namespace,generation FROM traversal_queue "
+            "UNION SELECT namespace,generation FROM selected_membership"
+            ")",
+            (_now_iso(),),
+        )
+        self._db.execute(
+            "UPDATE stream_progress SET active_snapshot=1 WHERE active_snapshot IS NULL AND namespace IN "
+            "(SELECT namespace FROM selection_snapshots WHERE status='active')"
+        )
+
+    def _upgrade_legacy_shared_drive_roots(self) -> None:
+        """Repair the old synthetic ``root`` traversal key only when its Drive is provable.
+
+        Shared Drive file parents contain the actual drive ID, never the literal string ``root``.
+        Exact root/drive matches can therefore be migrated losslessly. Ambiguous legacy rows force
+        controlled recovery and cannot become evidence that an existing member moved out of scope.
+        """
+        validated = self._db.execute(
+            "SELECT tq.* FROM traversal_queue tq JOIN selection_roots sr ON "
+            "sr.namespace=tq.namespace AND sr.generation=tq.generation "
+            "AND sr.snapshot_id=tq.snapshot_id AND sr.root_id=tq.root_id "
+            "WHERE tq.folder_id='root' AND sr.root_kind='drive' "
+            "AND sr.root_id=sr.drive_id AND tq.drive_id=sr.drive_id"
+        ).fetchall()
+        for row in validated:
+            self._db.execute(
+                "INSERT OR IGNORE INTO traversal_queue(namespace,generation,snapshot_id,root_id,folder_id,drive_id,page_token,completed_at) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (row["namespace"], row["generation"], row["snapshot_id"], row["root_id"],
+                 row["drive_id"], row["drive_id"], row["page_token"], row["completed_at"]),
+            )
+            self._db.execute(
+                "DELETE FROM traversal_queue WHERE namespace=? AND generation=? AND snapshot_id=? "
+                "AND root_id=? AND folder_id='root' AND drive_id=? AND page_token=?",
+                (row["namespace"], row["generation"], row["snapshot_id"], row["root_id"],
+                 row["drive_id"], row["page_token"]),
+            )
+        self._db.execute(
+            "UPDATE stream_progress SET recovery_required=1,listing_complete=0,phase='baselining',"
+            "last_error='ambiguous legacy Shared Drive root; controlled rescan required' "
+            "WHERE namespace IN (SELECT DISTINCT tq.namespace FROM traversal_queue tq "
+            "LEFT JOIN selection_roots sr ON sr.namespace=tq.namespace "
+            "AND sr.generation=tq.generation AND sr.snapshot_id=tq.snapshot_id "
+            "AND sr.root_id=tq.root_id AND sr.root_kind='drive' "
+            "WHERE tq.folder_id='root' AND (sr.root_id IS NULL OR sr.root_id<>sr.drive_id "
+            "OR tq.drive_id<>sr.drive_id))"
+        )
+
+    def _upgrade_legacy_channels(self) -> None:
+        """SQLite cannot add a composite PK in-place; rebuild only the legacy shape.
+
+        The check is deliberately structural so replaying this startup migration is a no-op.
+        """
+        columns = {r[1] for r in self._db.execute("PRAGMA table_info(webhook_channels)")}
+        if {"namespace", "verification_hash", "retired_at"}.issubset(columns):
+            return
+        self._db.executescript(
+            """
+            ALTER TABLE webhook_channels RENAME TO webhook_channels_legacy;
+            CREATE TABLE webhook_channels (
+              connection TEXT NOT NULL,
+              channel_id TEXT NOT NULL,
+              resource_id TEXT,
+              expires_at TEXT,
+              namespace TEXT NOT NULL DEFAULT '',
+              verification_hash TEXT,
+              retired_at TEXT,
+              PRIMARY KEY (connection, channel_id)
+            );
+            INSERT INTO webhook_channels(connection, channel_id, resource_id, expires_at)
+              SELECT connection, channel_id, resource_id, expires_at FROM webhook_channels_legacy;
+            DROP TABLE webhook_channels_legacy;
+            """
+        )
+
+    # Watch lifecycle projection (AIO-1167 R41). A legacy channel row is an active channel; a row
+    # written by the lifecycle carries its state. ``observed_*`` is webhook/late-response EVIDENCE
+    # about a pending attempt, never state: only the renewal owner turns it into a transition.
+    _WATCH_COLUMNS = (
+        ("state", "TEXT NOT NULL DEFAULT 'active'"),
+        ("integration_id", "TEXT"),
+        ("account_id", "TEXT"),
+        ("drive_id", "TEXT"),
+        ("generation", "INTEGER"),
+        ("predecessor", "TEXT"),
+        ("requested_expiry", "TEXT"),
+        ("detail", "TEXT"),
+        ("updated_at", "TEXT"),
+        ("stop_attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("observed_resource_id", "TEXT"),
+        ("observed_at", "TEXT"),
+    )
+
+    def _upgrade_watch_columns(self) -> None:
+        columns = {r[1] for r in self._db.execute("PRAGMA table_info(webhook_channels)")}
+        for name, ddl in self._WATCH_COLUMNS:
+            if name not in columns:
+                self._db.execute(f"ALTER TABLE webhook_channels ADD COLUMN {name} {ddl}")
+        # A row retired before the lifecycle existed is not active.
+        self._db.execute(
+            "UPDATE webhook_channels SET state='retired' WHERE retired_at IS NOT NULL AND state='active'"
+        )
 
     def close(self) -> None:
         self._db.close()
@@ -58,21 +649,2231 @@ class StateStore:
         self._db.commit()
 
     # -- webhook channels ---------------------------------------------------
+    # Only ``state='active'`` rows are channels for notifications, renewal decisions and listing; a
+    # pending lifecycle attempt (prepared/dispatched/uncertain) or a cleanup is never one.
     def save_channel(self, ch: Channel) -> None:
         self._db.execute(
-            "INSERT INTO webhook_channels(connection, channel_id, resource_id, expires_at) "
-            "VALUES(?,?,?,?) ON CONFLICT(connection) DO UPDATE SET "
-            "channel_id=excluded.channel_id, resource_id=excluded.resource_id, expires_at=excluded.expires_at",
-            (ch.connection, ch.channel_id, ch.resource_id, ch.expires_at),
+            "INSERT INTO webhook_channels(connection, channel_id, resource_id, expires_at, namespace, verification_hash, retired_at, state) "
+            "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(connection,channel_id) DO UPDATE SET "
+            "resource_id=excluded.resource_id, expires_at=excluded.expires_at, namespace=excluded.namespace, "
+            "verification_hash=excluded.verification_hash, retired_at=excluded.retired_at, state=excluded.state",
+            (ch.connection, ch.channel_id, ch.resource_id, ch.expires_at, ch.namespace,
+             ch.verification_hash, ch.retired_at, "active" if ch.retired_at is None else "retired"),
         )
         self._db.commit()
 
     def get_channel(self, connection: str) -> Channel | None:
         with closing(
             self._db.execute(
-                "SELECT connection, channel_id, resource_id, expires_at FROM webhook_channels WHERE connection=?",
+                "SELECT connection, channel_id, resource_id, expires_at, namespace, verification_hash, retired_at "
+                "FROM webhook_channels WHERE connection=? AND retired_at IS NULL AND state='active' "
+                "ORDER BY expires_at DESC LIMIT 1",
                 (connection,),
             )
         ) as c:
             row = c.fetchone()
         return Channel(*row) if row else None
+
+    def save_watch_record(self, record: Any) -> None:
+        """Project one lifecycle record (``watch_lifecycle.WatchRecord``) into the local table.
+
+        Webhook evidence already observed for the attempt is kept. Terminal records are retired
+        locally too, so no reader can mistake them for live channels.
+        """
+        terminal = record.state in ("retired", "expired")
+        self._db.execute(
+            "INSERT INTO webhook_channels(connection, channel_id, resource_id, expires_at, namespace, "
+            "verification_hash, retired_at, state, integration_id, account_id, drive_id, generation, "
+            "predecessor, requested_expiry, detail, updated_at, stop_attempts) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(connection,channel_id) DO UPDATE SET "
+            "resource_id=excluded.resource_id, expires_at=excluded.expires_at, namespace=excluded.namespace, "
+            "verification_hash=excluded.verification_hash, "
+            "retired_at=CASE WHEN excluded.retired_at IS NULL THEN NULL "
+            "ELSE coalesce(webhook_channels.retired_at, excluded.retired_at) END, "
+            "state=excluded.state, integration_id=excluded.integration_id, account_id=excluded.account_id, "
+            "drive_id=excluded.drive_id, generation=excluded.generation, predecessor=excluded.predecessor, "
+            "requested_expiry=excluded.requested_expiry, detail=excluded.detail, "
+            "updated_at=excluded.updated_at, stop_attempts=excluded.stop_attempts",
+            (record.connection, record.attempt_id, record.resource_id,
+             record.expires_at if record.state == "active" else (record.expires_at or record.requested_expiry),
+             record.namespace, record.verification_hash, _now_iso() if terminal else None,
+             record.state, record.integration_id, record.account_id, record.drive_id,
+             int(record.generation), record.predecessor, record.requested_expiry, record.detail,
+             record.updated_at, int(record.stop_attempts)),
+        )
+        self._db.commit()
+
+    def watch_evidence(self, connection: str, attempt_id: str) -> str | None:
+        """A resource id observed for a pending attempt (early notification or late response)."""
+        row = self._db.execute(
+            "SELECT observed_resource_id FROM webhook_channels WHERE connection=? AND channel_id=?",
+            (connection, attempt_id),
+        ).fetchone()
+        return str(row["observed_resource_id"]) if row and row["observed_resource_id"] else None
+
+    def record_watch_evidence(self, connection: str, attempt_id: str, resource_id: str) -> bool:
+        """Remember that the provider named ``resource_id`` for a NON-active attempt.
+
+        Evidence lets a channel that may exist be stopped; it never activates one, and an active
+        or terminal row is not touched.
+        """
+        if not resource_id:
+            return False
+        cur = self._db.execute(
+            "UPDATE webhook_channels SET observed_resource_id=?, observed_at=? WHERE connection=? "
+            "AND channel_id=? AND state IN ('prepared','dispatched','uncertain','cleanup_pending')",
+            (resource_id, _now_iso(), connection, attempt_id),
+        )
+        self._db.commit()
+        return cur.rowcount == 1
+
+    def observe_pending_notification(
+        self, *, channel_id: str, resource_id: str | None, verification_token: str | None,
+    ) -> bool:
+        """Record a notification for an attempt that is not active yet — Google may send the
+        ``sync`` message before the watch response arrives.
+
+        Accepted as evidence only when the persisted verification hash matches; it schedules no
+        read and activates nothing. Returns whether it was recorded.
+        """
+        if not resource_id:
+            return False
+        row = self._db.execute(
+            "SELECT connection, verification_hash FROM webhook_channels WHERE channel_id=? "
+            "AND state IN ('prepared','dispatched','uncertain')",
+            (channel_id,),
+        ).fetchone()
+        if not row or not row["verification_hash"]:
+            return False
+        if not hmac.compare_digest(_token_hash(verification_token or ""), str(row["verification_hash"])):
+            return False
+        return self.record_watch_evidence(str(row["connection"]), channel_id, resource_id)
+
+    def list_channels(self, connection: str | None = None, *, active_only: bool = True) -> list[Channel]:
+        where: list[str] = []
+        args: list[str] = []
+        if connection is not None:
+            where.append("connection=?")
+            args.append(connection)
+        if active_only:
+            where.append("retired_at IS NULL")
+            where.append("state='active'")
+        sql = (
+            "SELECT connection, channel_id, resource_id, expires_at, namespace, verification_hash, retired_at "
+            "FROM webhook_channels"
+        )
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY expires_at DESC"
+        return [Channel(*r) for r in self._db.execute(sql, args).fetchall()]
+
+    def retire_channel(self, connection: str, channel_id: str, *, at: str | None = None) -> None:
+        self._db.execute(
+            "UPDATE webhook_channels SET retired_at=?, state=CASE WHEN state='active' THEN 'retired' "
+            "ELSE state END WHERE connection=? AND channel_id=?",
+            (at or _now_iso(), connection, channel_id),
+        )
+        self._db.commit()
+
+    def validate_notification(
+        self, *, channel_id: str, resource_id: str | None, verification_token: str | None
+    ) -> Channel | None:
+        row = self._db.execute(
+            "SELECT connection, channel_id, resource_id, expires_at, namespace, verification_hash, retired_at "
+            "FROM webhook_channels WHERE channel_id=? AND retired_at IS NULL AND state='active'",
+            (channel_id,),
+        ).fetchone()
+        if not row:
+            return None
+        channel = Channel(*row)
+        # Admission needs every piece of the channel's identity to be KNOWN and to match (AIO-1167
+        # R44 C12): a row with no stored resource id or verification hash (a legacy migration can
+        # leave either empty) proves nothing about the caller, and an expired channel is no longer
+        # Google's. Each missing piece refuses — it is never skipped as "nothing to compare".
+        if not channel.resource_id or not resource_id or not hmac.compare_digest(
+            str(channel.resource_id), str(resource_id)
+        ):
+            return None
+        if not channel.verification_hash or not hmac.compare_digest(
+            _token_hash(verification_token or ""), str(channel.verification_hash)
+        ):
+            return None
+        if not _unexpired(channel.expires_at):
+            return None
+        return channel
+
+    # -- notification hints --------------------------------------------------
+    # One row per stream, however many notifications arrive and whichever scope generation the
+    # notifying channel was created under. A hint is a pair of counters, never a work item: it
+    # cannot fill the document backlog or spend a run's work budget.
+    def record_stream_hint(self, key: StreamKey) -> int:
+        """Mark a stream dirty and return the sequence this notification was given."""
+        self._db.execute(
+            "INSERT INTO stream_hints(team,connection_id,credential_id,drive_id,dirty_seq,last_hint_at) "
+            "VALUES(?,?,?,?,1,?) ON CONFLICT(team,connection_id,credential_id,drive_id) DO UPDATE SET "
+            "dirty_seq=dirty_seq+1,last_hint_at=excluded.last_hint_at",
+            (key.team, key.connection_id, key.credential_id, key.drive_id, _now_iso()),
+        )
+        self._db.commit()
+        row = self._db.execute(
+            "SELECT dirty_seq FROM stream_hints WHERE team=? AND connection_id=? AND credential_id=? "
+            "AND drive_id=?",
+            (key.team, key.connection_id, key.credential_id, key.drive_id),
+        ).fetchone()
+        return int(row["dirty_seq"])
+
+    def pending_stream_hint(self, key: StreamKey) -> int | None:
+        """The newest unacknowledged notification sequence, or None when the stream is clean."""
+        row = self._db.execute(
+            "SELECT dirty_seq,acked_seq FROM stream_hints WHERE team=? AND connection_id=? "
+            "AND credential_id=? AND drive_id=?",
+            (key.team, key.connection_id, key.credential_id, key.drive_id),
+        ).fetchone()
+        if not row or int(row["dirty_seq"]) <= int(row["acked_seq"]):
+            return None
+        return int(row["dirty_seq"])
+
+    def pending_hint_connections(self, team: str) -> dict[str, int]:
+        """Connections of ``team`` with any unacknowledged stream hint, each with a marker that grows
+        with every notification on any of its streams (the sum of their dirty sequences).
+
+        The scheduler's coalesced wake-up reads this: one entry per connection however many streams
+        or notifications are dirty, so a burst of notifications is one triggered run, and a marker
+        it has already acted on does not trigger another.
+        """
+        rows = self._db.execute(
+            "SELECT connection_id, SUM(dirty_seq) AS seq FROM stream_hints "
+            "WHERE team=? GROUP BY connection_id "
+            "HAVING SUM(CASE WHEN dirty_seq>acked_seq THEN 1 ELSE 0 END) > 0 "
+            "ORDER BY connection_id",
+            (team,),
+        ).fetchall()
+        return {str(row["connection_id"]): int(row["seq"]) for row in rows}
+
+    def ack_stream_hint(self, key: StreamKey, observed_seq: int) -> None:
+        """Acknowledge exactly what a drain observed before it began reading.
+
+        A notification that arrived during the drain has a later sequence and stays pending, so a
+        change it announces is never acknowledged by a read that may have missed it.
+        """
+        self._db.execute(
+            "UPDATE stream_hints SET acked_seq=? WHERE team=? AND connection_id=? AND credential_id=? "
+            "AND drive_id=? AND acked_seq<? AND dirty_seq>=?",
+            (observed_seq, key.team, key.connection_id, key.credential_id, key.drive_id,
+             observed_seq, observed_seq),
+        )
+        self._db.commit()
+
+    # -- cross-stream removal barriers ----------------------------------------
+    # A removal one stream observed is the connection's only once every other stream has finished a
+    # drain that began after the removal was observed. A barrier is that requirement for one peer,
+    # durably: the peer's dirty sequence at the moment the barrier was raised. A missing row is
+    # missing evidence, never a passed barrier — a peer that became known only after the removal
+    # was first withheld is given its own, and nothing is concluded about it until then.
+    def raise_removal_barrier(
+        self, work: PendingWork, peer: StreamKey, *, renew: bool = False,
+    ) -> bool:
+        """Mark one peer dirty for one removal and record the sequence it has to drain past.
+
+        Atomic and idempotent: a barrier is raised once per removal observation and peer, so a
+        restart can neither lose it nor move it past a drain the peer has already finished.
+        ``renew`` raises it again at a new sequence — for a peer whose earlier drain is no longer
+        evidence, because the local state that drain was read into is gone.
+        """
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            raised = self._db.execute(
+                "SELECT 1 FROM removal_barriers WHERE namespace=? AND generation=? AND item_key=? "
+                "AND observation_revision=? AND peer_drive_id=?",
+                (work.namespace, work.generation, work.item_key, work.observation_revision,
+                 peer.drive_id),
+            ).fetchone()
+            if raised is not None and not renew:
+                self._db.rollback()
+                return False
+            self._db.execute(
+                "INSERT INTO stream_hints(team,connection_id,credential_id,drive_id,dirty_seq,last_hint_at) "
+                "VALUES(?,?,?,?,1,?) ON CONFLICT(team,connection_id,credential_id,drive_id) DO UPDATE SET "
+                "dirty_seq=dirty_seq+1,last_hint_at=excluded.last_hint_at",
+                (peer.team, peer.connection_id, peer.credential_id, peer.drive_id, _now_iso()),
+            )
+            sequence = int(self._db.execute(
+                "SELECT dirty_seq FROM stream_hints WHERE team=? AND connection_id=? "
+                "AND credential_id=? AND drive_id=?",
+                (peer.team, peer.connection_id, peer.credential_id, peer.drive_id),
+            ).fetchone()["dirty_seq"])
+            self._db.execute(
+                "INSERT INTO removal_barriers(namespace,generation,item_key,observation_revision,"
+                "peer_drive_id,barrier_seq,raised_at) VALUES(?,?,?,?,?,?,?) "
+                "ON CONFLICT(namespace,generation,item_key,observation_revision,peer_drive_id) "
+                "DO UPDATE SET barrier_seq=excluded.barrier_seq,raised_at=excluded.raised_at",
+                (work.namespace, work.generation, work.item_key, work.observation_revision,
+                 peer.drive_id, sequence, _now_iso()),
+            )
+            self._db.commit()
+            return True
+        except Exception:
+            self._db.rollback()
+            raise
+
+    def removal_barrier(self, work: PendingWork, peer: StreamKey) -> str:
+        """``missing``, ``standing`` or ``passed`` for one removal observation and one peer.
+
+        ``passed`` is the peer's acknowledgment of a drain that began at or after the barrier.
+        """
+        barrier = self._db.execute(
+            "SELECT barrier_seq FROM removal_barriers WHERE namespace=? AND generation=? "
+            "AND item_key=? AND observation_revision=? AND peer_drive_id=?",
+            (work.namespace, work.generation, work.item_key, work.observation_revision,
+             peer.drive_id),
+        ).fetchone()
+        if barrier is None:
+            return "missing"
+        hint = self._db.execute(
+            "SELECT acked_seq FROM stream_hints WHERE team=? AND connection_id=? "
+            "AND credential_id=? AND drive_id=?",
+            (peer.team, peer.connection_id, peer.credential_id, peer.drive_id),
+        ).fetchone()
+        if hint is not None and int(hint["acked_seq"]) >= int(barrier["barrier_seq"]):
+            return "passed"
+        return "standing"
+
+    # -- selected-root drive bindings ----------------------------------------
+    # Every selected file/folder root of a generation is an OBLIGATION with one row here, keyed by
+    # connection, generation, root kind and exact provider id. Four states, all durable:
+    #
+    #   · ``unresolved`` — its initial binding never succeeded: the drive that contains it has never
+    #     been read, so it has NO drive (``drive_id`` is the empty string, never a guess) and no stream
+    #     enumerates it. It is retried on every run and only resolution — or a new selection
+    #     generation — ends it.
+    #   · ``bound`` — known to live in ``drive_id``, whose stream enumerates it.
+    #   · ``uncertain`` — it WAS bound, and where it is now could not be read.
+    #   · ``relocating`` — it was read in ``pending_drive_id``, whose stream has not taken it over.
+    #
+    # Every state but ``bound`` leaves the connection incomplete and is never absence evidence; a
+    # selected root with no row at all is unknown, never resolved.
+    def bind_root(
+        self, connection_id: str, generation: int, root_kind: str, root_id: str, drive_id: str,
+    ) -> None:
+        """Record the drive that contains one selected root.
+
+        The first binding stands; an ``unresolved`` obligation is the one row this resolves, so a
+        retried binding lands on the obligation it was waiting on. ``drive_id`` must be a real drive.
+        """
+        if not drive_id:
+            raise ValueError("a root binding needs the drive that was read for it")
+        self._db.execute(
+            "INSERT INTO selection_root_bindings(connection_id,generation,root_kind,root_id,drive_id) "
+            "VALUES(?,?,?,?,?) ON CONFLICT(connection_id,generation,root_kind,root_id) DO UPDATE SET "
+            "drive_id=excluded.drive_id,status='bound',pending_drive_id=NULL,detail=NULL,bound_at=? "
+            "WHERE selection_root_bindings.status='unresolved'",
+            (connection_id, generation, root_kind, root_id, drive_id, _now_iso()),
+        )
+        self._db.commit()
+
+    def mark_root_unresolved(
+        self, connection_id: str, generation: int, root_kind: str, root_id: str, *, detail: str,
+    ) -> None:
+        """Record that a selected root's INITIAL binding failed. It gets no drive.
+
+        A root already bound (in any state) is never downgraded: what was read about it stands.
+        """
+        self._db.execute(
+            "INSERT INTO selection_root_bindings(connection_id,generation,root_kind,root_id,drive_id,status,detail) "
+            "VALUES(?,?,?,?,'','unresolved',?) ON CONFLICT(connection_id,generation,root_kind,root_id) DO UPDATE SET "
+            "detail=excluded.detail WHERE selection_root_bindings.status='unresolved'",
+            (connection_id, generation, root_kind, root_id, detail),
+        )
+        self._db.commit()
+
+    def root_bindings(self, connection_id: str, generation: int) -> dict[tuple[str, str], str]:
+        """The drive of every selected root whose drive is KNOWN. An unresolved root has none."""
+        rows = self._db.execute(
+            "SELECT root_kind,root_id,drive_id FROM selection_root_bindings "
+            "WHERE connection_id=? AND generation=? AND status<>'unresolved'",
+            (connection_id, generation),
+        ).fetchall()
+        return {(str(r["root_kind"]), str(r["root_id"])): str(r["drive_id"]) for r in rows}
+
+    def root_obligations(
+        self, connection_id: str, generation: int,
+    ) -> dict[tuple[str, str], RootBinding]:
+        """Every selected-root obligation of a generation, in every state."""
+        rows = self._db.execute(
+            "SELECT root_kind,root_id,drive_id,status,pending_drive_id,detail FROM selection_root_bindings "
+            "WHERE connection_id=? AND generation=? ORDER BY root_kind,root_id",
+            (connection_id, generation),
+        ).fetchall()
+        return {
+            (str(r["root_kind"]), str(r["root_id"])): RootBinding(
+                str(r["drive_id"]), str(r["status"]), r["pending_drive_id"], r["detail"],
+            )
+            for r in rows
+        }
+
+    def restore_root_obligation(
+        self, connection_id: str, generation: int, root_kind: str, root_id: str,
+        binding: RootBinding,
+    ) -> bool:
+        """Adopt one obligation the brain acknowledged, when this state holds none for that root.
+
+        Local evidence, where present, stands: this only fills in what a lost or older local state
+        lacks. An obligation whose state is unknown, or a bound one with no drive, is not adopted.
+        """
+        if binding.status not in ROOT_STATES:
+            return False
+        if binding.status != "unresolved" and not binding.drive_id:
+            return False
+        if binding.status == "relocating" and not binding.pending_drive_id:
+            return False
+        cur = self._db.execute(
+            "INSERT OR IGNORE INTO selection_root_bindings"
+            "(connection_id,generation,root_kind,root_id,drive_id,status,pending_drive_id,detail) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (connection_id, generation, root_kind, root_id,
+             "" if binding.status == "unresolved" else binding.drive_id, binding.status,
+             binding.pending_drive_id if binding.status == "relocating" else None, binding.detail),
+        )
+        self._db.commit()
+        return cur.rowcount == 1
+
+    def unknown_root_count(self, connection_id: str, generation: int) -> int:
+        """Selected roots whose drive is unknown or unreadable now: either may hide a stream."""
+        row = self._db.execute(
+            "SELECT count(*) AS n FROM selection_root_bindings WHERE connection_id=? AND generation=? "
+            "AND status IN ('unresolved','uncertain')",
+            (connection_id, generation),
+        ).fetchone()
+        return int(row["n"])
+
+    # A binding is ``bound`` while its root is known to live in ``drive_id``. The other states are
+    # durable and all mean the connection is not complete: ``unresolved`` (above), ``uncertain`` —
+    # where the root is now could not be read, so nothing is concluded about it — and ``relocating``
+    # — it was read in ``pending_drive_id``, whose stream has not taken it over yet. None of them is
+    # absence evidence.
+    def unsettled_roots(
+        self, connection_id: str, generation: int,
+    ) -> dict[tuple[str, str], RootBinding]:
+        """Every selected root that is unresolved, uncertain or on its way to another drive."""
+        rows = self._db.execute(
+            "SELECT root_kind,root_id,drive_id,status,pending_drive_id,detail FROM selection_root_bindings "
+            "WHERE connection_id=? AND generation=? AND status<>'bound' ORDER BY root_kind,root_id",
+            (connection_id, generation),
+        ).fetchall()
+        return {
+            (str(r["root_kind"]), str(r["root_id"])): RootBinding(
+                str(r["drive_id"]), str(r["status"]), r["pending_drive_id"], r["detail"],
+            )
+            for r in rows
+        }
+
+    def mark_root_uncertain(
+        self, connection_id: str, generation: int, root_kind: str, root_id: str, drive_id: str,
+        *, detail: str,
+    ) -> None:
+        """Record that a root's location is unverified. A root already relocating stays that, and an
+        unresolved one — never bound, so it has no drive to be uncertain about — stays unresolved.
+
+        A DEFERRED root keeps its ``ROOT_DEFERRED_PREFIX`` detail (AIO-1167 R51 F1): ordinary
+        uncertainty is not a listing, so it must not erase the enumeration debt that only a listing,
+        a relocation/rebind or a verified not-found may discharge."""
+        self._write_root_uncertain(connection_id, generation, root_kind, root_id, drive_id, detail=detail)
+        self._db.commit()
+
+    def _write_root_uncertain(
+        self, connection_id: str, generation: int, root_kind: str, root_id: str, drive_id: str,
+        *, detail: str,
+    ) -> None:
+        """``mark_root_uncertain``'s statement, without committing (for a caller's transaction)."""
+        deferred = f"{ROOT_DEFERRED_PREFIX}%"
+        self._db.execute(
+            "INSERT INTO selection_root_bindings(connection_id,generation,root_kind,root_id,drive_id,status,detail) "
+            "VALUES(?,?,?,?,?,'uncertain',?) ON CONFLICT(connection_id,generation,root_kind,root_id) DO UPDATE SET "
+            "status='uncertain',detail=CASE WHEN selection_root_bindings.status='uncertain' "
+            "AND coalesce(selection_root_bindings.detail,'') LIKE ? "
+            "AND coalesce(excluded.detail,'') NOT LIKE ? "
+            "THEN selection_root_bindings.detail ELSE excluded.detail END "
+            "WHERE selection_root_bindings.status NOT IN ('relocating','unresolved')",
+            (connection_id, generation, root_kind, root_id, drive_id, detail, deferred, deferred),
+        )
+
+    def mark_root_relocating(
+        self, connection_id: str, generation: int, root_kind: str, root_id: str, drive_id: str,
+        *, destination: str,
+    ) -> None:
+        """Record the drive a root was read in. It stays bound to ``drive_id`` until rebound.
+
+        Only a root that was bound can relocate: an unresolved obligation is resolved by
+        ``bind_root``, never by inventing the drive it supposedly left."""
+        self._db.execute(
+            "INSERT INTO selection_root_bindings(connection_id,generation,root_kind,root_id,drive_id,status,pending_drive_id,detail) "
+            "VALUES(?,?,?,?,?,'relocating',?,?) ON CONFLICT(connection_id,generation,root_kind,root_id) DO UPDATE SET "
+            "status='relocating',pending_drive_id=excluded.pending_drive_id,detail=excluded.detail "
+            "WHERE selection_root_bindings.status<>'unresolved'",
+            (connection_id, generation, root_kind, root_id, drive_id, destination,
+             f"observed in drive {destination}"),
+        )
+        self._db.commit()
+
+    def settle_root(
+        self, connection_id: str, generation: int, root_kind: str, root_id: str,
+        *, enumerated: bool = False,
+    ) -> None:
+        """A root read where it is bound is no longer uncertain — nor unavailable (R48 D1): read
+        again, it is restored. A relocation is never settled here.
+
+        A DEFERRED root (``ROOT_DEFERRED_PREFIX``, AIO-1167 R50 F4) is different: its stream's
+        snapshot holds only retained membership for it, so reading its metadata proves where it is,
+        not what is under it. Only the enumeration that lists it again (``enumerated``) settles it."""
+        self._db.execute(
+            "UPDATE selection_root_bindings SET status='bound',detail=NULL WHERE connection_id=? "
+            "AND generation=? AND root_kind=? AND root_id=? "
+            "AND (status='uncertain' OR (status='bound' AND detail IS NOT NULL)) "
+            "AND (? OR NOT (status='uncertain' AND coalesce(detail,'') LIKE ?))",
+            (connection_id, generation, root_kind, root_id, 1 if enumerated else 0,
+             f"{ROOT_DEFERRED_PREFIX}%"),
+        )
+        self._db.commit()
+
+    def mark_root_deferred(
+        self, connection_id: str, generation: int, root_kind: str, root_id: str, drive_id: str,
+        *, detail: str,
+    ) -> None:
+        """Record that a bound root could not be read by its stream's enumeration now (R50 F4): a
+        provider minimum or a non-quota deferral. It becomes ``uncertain`` with a
+        ``ROOT_DEFERRED_PREFIX`` detail — a durable unresolved obligation that keeps the connection
+        partial and withholds absence — until an enumeration lists it again."""
+        self.mark_root_uncertain(
+            connection_id, generation, root_kind, root_id, drive_id,
+            detail=f"{ROOT_DEFERRED_PREFIX}: {detail}",
+        )
+
+    def defer_root_in_build(
+        self, connection_id: str, generation: int, root_kind: str, root_id: str, drive_id: str,
+        *, detail: str, namespace: str, snapshot_id: int,
+    ) -> bool:
+        """Defer a root (as ``mark_root_deferred``) and, in the SAME transaction, end what this building
+        snapshot can still say about it (AIO-1167 final review R51 F1, High).
+
+        If the BUILDING snapshot already finished any traversal entry of the root — it listed part of
+        it, or closed part of it unlisted after a loss — then this snapshot can no longer establish the
+        root's complete membership: what it withdrew or never listed is not coming back by finishing
+        the old remainder (a materialized page never reapplies membership). So every remaining entry of
+        the root is closed now, atomically with the deferral, and nothing of it is left to "resume". The
+        deferred root then keeps the connection partial, and only the controlled rescan
+        (`_deferred_root_admissible`) lists it in full, under a fresh snapshot and fresh page identities.
+        A crash cannot separate the two writes, so no restart can see a deferred root with an old
+        remainder still open.
+
+        An untouched root (nothing of it finished in this snapshot) keeps its open seed: listing it from
+        there IS a full enumeration. Only an actual deferral (a relocating or unresolved root is not
+        deferred) closes anything. Returns whether the remaining traversal was closed."""
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            self._write_root_uncertain(
+                connection_id, generation, root_kind, root_id, drive_id,
+                detail=f"{ROOT_DEFERRED_PREFIX}: {detail}",
+            )
+            binding = self._db.execute(
+                "SELECT status,detail FROM selection_root_bindings WHERE connection_id=? AND generation=? "
+                "AND root_kind=? AND root_id=?",
+                (connection_id, generation, root_kind, root_id),
+            ).fetchone()
+            deferred = bool(
+                binding is not None and binding["status"] == "uncertain"
+                and str(binding["detail"] or "").startswith(ROOT_DEFERRED_PREFIX)
+            )
+            snapshot = self._db.execute(
+                "SELECT status FROM selection_snapshots WHERE namespace=? AND generation=? AND snapshot_id=?",
+                (namespace, generation, snapshot_id),
+            ).fetchone()
+            closed = False
+            if deferred and snapshot is not None and snapshot["status"] == "building" and self._root_traversal_touched(
+                namespace, generation, root_id, snapshot_id,
+            ):
+                cur = self._db.execute(
+                    "UPDATE traversal_queue SET completed_at=? WHERE namespace=? AND generation=? "
+                    "AND snapshot_id=? AND root_id=? AND completed_at IS NULL",
+                    (_now_iso(), namespace, generation, snapshot_id, root_id),
+                )
+                closed = cur.rowcount > 0
+            self._db.commit()
+            return closed
+        except Exception:
+            self._db.rollback()
+            raise
+
+    def _root_traversal_touched(
+        self, namespace: str, generation: int, root_id: str, snapshot_id: int,
+    ) -> bool:
+        return self._db.execute(
+            "SELECT 1 FROM traversal_queue WHERE namespace=? AND generation=? AND snapshot_id=? "
+            "AND root_id=? AND completed_at IS NOT NULL LIMIT 1",
+            (namespace, generation, snapshot_id, root_id),
+        ).fetchone() is not None
+
+    def root_traversal_touched(
+        self, namespace: str, generation: int, root_id: str, *, snapshot_id: int,
+    ) -> bool:
+        """Whether this snapshot already finished any traversal entry of ``root_id`` — listed part of
+        it, or closed part of it unlisted (R51 F1). An untouched root can still be listed in full."""
+        return self._root_traversal_touched(namespace, generation, root_id, snapshot_id)
+
+    def deferred_roots(
+        self, connection_id: str, generation: int, drive_id: str,
+    ) -> list[tuple[str, str]]:
+        """``(kind, id)`` of every root of this drive's stream deferred by its enumeration."""
+        return [
+            (str(row["root_kind"]), str(row["root_id"]))
+            for row in self._db.execute(
+                "SELECT root_kind,root_id FROM selection_root_bindings WHERE connection_id=? "
+                "AND generation=? AND drive_id=? AND status='uncertain' AND coalesce(detail,'') LIKE ? "
+                "ORDER BY root_kind,root_id",
+                (connection_id, generation, drive_id, f"{ROOT_DEFERRED_PREFIX}%"),
+            ).fetchall()
+        ]
+
+    def record_root_unavailable(
+        self, connection_id: str, generation: int, root_kind: str, root_id: str, *, detail: str,
+    ) -> bool:
+        """Record a previously BOUND root's own verified not-found (AIO-1167 R48 D1).
+
+        The root stays bound to its drive — its location was known and its outcome is now known:
+        it supports nothing — with the diagnostic as its detail, which travels with the fenced
+        root evidence. Only a bound (or uncertain) root qualifies: a never-bound root stays
+        unresolved and a relocating one stays relocating; neither is evidence of loss. Returns
+        whether the root was recorded."""
+        cur = self._db.execute(
+            "UPDATE selection_root_bindings SET status='bound',detail=? WHERE connection_id=? "
+            "AND generation=? AND root_kind=? AND root_id=? AND status IN ('bound','uncertain') "
+            "AND drive_id IS NOT NULL AND drive_id<>''",
+            (detail, connection_id, generation, root_kind, root_id),
+        )
+        self._db.commit()
+        return cur.rowcount == 1
+
+    def rebind_root(
+        self, connection_id: str, generation: int, root_kind: str, root_id: str, destination: str,
+    ) -> bool:
+        """Hand a relocating root to the stream of the drive it was read in, atomically."""
+        cur = self._db.execute(
+            "UPDATE selection_root_bindings SET drive_id=pending_drive_id,status='bound',"
+            "pending_drive_id=NULL,detail=NULL,bound_at=? WHERE connection_id=? AND generation=? "
+            "AND root_kind=? AND root_id=? AND status='relocating' AND pending_drive_id=?",
+            (_now_iso(), connection_id, generation, root_kind, root_id, destination),
+        )
+        self._db.commit()
+        return cur.rowcount == 1
+
+    def cancel_relocation(
+        self, connection_id: str, generation: int, root_kind: str, root_id: str,
+    ) -> bool:
+        """A relocating root read back in the drive it is bound to never left that stream."""
+        cur = self._db.execute(
+            "UPDATE selection_root_bindings SET status='bound',pending_drive_id=NULL,detail=NULL "
+            "WHERE connection_id=? AND generation=? AND root_kind=? AND root_id=? AND status='relocating'",
+            (connection_id, generation, root_kind, root_id),
+        )
+        self._db.commit()
+        return cur.rowcount == 1
+
+    # -- namespaced Drive progress -----------------------------------------
+    def begin_generation(
+        self, key: StreamKey, generation: int, *, start_token: str, phase: str = "baselining"
+    ) -> StreamProgress:
+        namespace = key.namespace(generation)
+        self._db.execute(
+            "INSERT INTO stream_progress(namespace, team, connection_id, credential_id, drive_id, generation, phase, baseline_start_token, last_attempt_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(namespace) DO NOTHING",
+            (namespace, key.team, key.connection_id, key.credential_id, key.drive_id, generation,
+             phase, start_token, _now_iso()),
+        )
+        self._db.commit()
+        progress = self.get_progress(namespace)
+        if progress is None:  # pragma: no cover - defensive SQLite failure guard
+            raise RuntimeError("failed to create stream progress")
+        return progress
+
+    def get_progress(self, namespace: str) -> StreamProgress | None:
+        row = self._db.execute("SELECT * FROM stream_progress WHERE namespace=?", (namespace,)).fetchone()
+        if not row:
+            return None
+        return StreamProgress(
+            namespace=row["namespace"],
+            key=StreamKey(row["team"], row["connection_id"], row["credential_id"], row["drive_id"]),
+            generation=row["generation"], phase=row["phase"], page_token=row["page_token"],
+            baseline_start_token=row["baseline_start_token"], traversal_token=row["traversal_token"],
+            listing_complete=bool(row["listing_complete"]), last_attempt_at=row["last_attempt_at"],
+            last_success_at=row["last_success_at"], last_error=row["last_error"],
+            server_revision=int(row["server_revision"] or 0),
+            retry_not_before=row["retry_not_before"],
+            active_snapshot=row["active_snapshot"],
+            building_snapshot=row["building_snapshot"],
+            recovery_required=bool(row["recovery_required"]),
+            checkpoint_id=row["checkpoint_id"],
+            terminal_drain_token=row["terminal_drain_token"],
+            terminal_drain_checkpoint_id=row["terminal_drain_checkpoint_id"],
+            terminal_drain_acknowledged=bool(row["terminal_drain_acknowledged"]),
+            drain_observation=int(row["drain_observation"] or 0),
+            terminal_drain_observation=(
+                int(row["terminal_drain_observation"])
+                if row["terminal_drain_observation"] is not None else None
+            ),
+        )
+
+    def list_progress(self, connection_id: str, generation: int) -> list[StreamProgress]:
+        rows = self._db.execute(
+            "SELECT namespace FROM stream_progress WHERE connection_id=? AND generation=? ORDER BY drive_id",
+            (connection_id, generation),
+        ).fetchall()
+        return [p for row in rows if (p := self.get_progress(row["namespace"])) is not None]
+
+    def forget_unstarted_stream(self, namespace: str) -> bool:
+        """Drop a stream that never had a start token: it holds no cursor, snapshot or work."""
+        cur = self._db.execute(
+            "DELETE FROM stream_progress WHERE namespace=? AND coalesce(baseline_start_token,'')='' "
+            "AND active_snapshot IS NULL AND building_snapshot IS NULL",
+            (namespace,),
+        )
+        self._db.commit()
+        return cur.rowcount == 1
+
+    def latest_progress_for_connection(self, connection_id: str) -> StreamProgress | None:
+        row = self._db.execute(
+            "SELECT namespace FROM stream_progress WHERE connection_id=? ORDER BY updated_at DESC LIMIT 1",
+            (connection_id,),
+        ).fetchone()
+        return self.get_progress(row["namespace"]) if row else None
+
+    def rotate_streams(
+        self, connection_id: str, generation: int, drive_ids: list[str],
+    ) -> list[str]:
+        """Return this run's fair stream order and durably rotate the next run's head."""
+        ordered = list(dict.fromkeys(drive_ids))
+        if not ordered:
+            return []
+        row = self._db.execute(
+            "SELECT next_drive_id FROM connection_stream_schedule "
+            "WHERE connection_id=? AND generation=?",
+            (connection_id, generation),
+        ).fetchone()
+        start = ordered.index(row["next_drive_id"]) if row and row["next_drive_id"] in ordered else 0
+        rotated = ordered[start:] + ordered[:start]
+        next_drive = ordered[(start + 1) % len(ordered)]
+        self._db.execute(
+            "INSERT INTO connection_stream_schedule(connection_id,generation,next_drive_id,updated_at) "
+            "VALUES(?,?,?,?) ON CONFLICT(connection_id,generation) DO UPDATE SET "
+            "next_drive_id=excluded.next_drive_id,updated_at=excluded.updated_at",
+            (connection_id, generation, next_drive, _now_iso()),
+        )
+        self._db.commit()
+        return rotated
+
+    # Provider minimums (account holds and resource restrictions) are bound to the verified
+    # connection/account and the stable provider resource — never to a selection generation
+    # (AIO-1167 R50). ``generation`` is still recorded with each row as observation context, but every
+    # read below spans all generations of the account and every write is monotonic against that, so a
+    # scope edit, an empty selection, a reselection or a same-account reconnect cannot lower, expire
+    # or waive a standing minimum. Another account's evidence is never read for this one.
+    def hold_connection(
+        self, connection_id: str, generation: int, credential_id: str, not_before: str, category: str,
+    ) -> tuple[str, str]:
+        """Record a provider hold on one verified account of one connection (AIO-1167 R47 F5).
+
+        Independent of streams: a rate limit read while binding roots or capturing start tokens is
+        held before any stream exists. Monotonic across generations — a later, shorter wait never
+        shortens a standing one — and returns the hold now in force."""
+        held = self.connection_hold(connection_id, generation, credential_id)
+        if held is not None and _instant(held[0]) >= _instant(not_before):
+            return held
+        self._db.execute(
+            "INSERT INTO connection_holds(connection_id,generation,credential_id,not_before,category,updated_at) "
+            "VALUES(?,?,?,?,?,?) ON CONFLICT(connection_id,generation,credential_id) DO UPDATE SET "
+            "not_before=excluded.not_before,category=excluded.category,updated_at=excluded.updated_at",
+            (connection_id, generation, credential_id, not_before, category, _now_iso()),
+        )
+        self._db.commit()
+        return not_before, category
+
+    def connection_hold(
+        self, connection_id: str, generation: int, credential_id: str,
+    ) -> tuple[str, str] | None:
+        """The strongest hold ``(not_before, category)`` recorded for this account in ANY
+        generation, expired or not (``generation`` is accepted for call-site symmetry only)."""
+        strongest: tuple[str, str] | None = None
+        for row in self._db.execute(
+            "SELECT not_before, category FROM connection_holds WHERE connection_id=? AND credential_id=?",
+            (connection_id, credential_id),
+        ).fetchall():
+            if strongest is None or _instant(row["not_before"]) > _instant(strongest[0]):
+                strongest = (str(row["not_before"]), str(row["category"]))
+        return strongest
+
+    def restriction_credentials(self, connection_id: str) -> set[str]:
+        """Every verified account of this connection with recorded provider-minimum evidence."""
+        rows = self._db.execute(
+            "SELECT credential_id FROM connection_holds WHERE connection_id=? "
+            "UNION SELECT credential_id FROM document_restrictions WHERE connection_id=?",
+            (connection_id, connection_id),
+        ).fetchall()
+        return {str(row[0]) for row in rows if row[0]}
+
+    def restrict_document(
+        self, connection_id: str, generation: int, credential_id: str, provider_id: str,
+        not_before: str, category: str, *, unrepresentable: bool = False,
+    ) -> tuple[str, str, bool]:
+        """Record a provider-named minimum for ONE provider resource (AIO-1167 R49 F1, R50).
+
+        The provider restriction is the resource's, not one observation's: it is keyed by the
+        verified connection/account and stable provider id (the generation is context only), and
+        neither attempts, exhaustion, rearm, a newer observation, a rescan nor a new selection
+        generation touches it. Monotonic across generations — a later, shorter minimum never
+        shortens a standing one — and an unrepresentable restriction stays unrepresentable: it is
+        fail-closed, never an ordinary instant that expires. Returns the restriction now in force.
+
+        Resources are documents and roots (by provider id) and the operation keys of
+        ``gdrive_sync`` for a stream's start token or the service-account identity prerequisite."""
+        held = self.document_restrictions(connection_id, generation, credential_id).get(provider_id)
+        if held is not None and (
+            held[2] or (not unrepresentable and _instant(held[0]) >= _instant(not_before))
+        ):
+            return held
+        self._db.execute(
+            "INSERT INTO document_restrictions(connection_id,generation,credential_id,provider_id,"
+            "not_before,category,unrepresentable,updated_at) VALUES(?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(connection_id,generation,credential_id,provider_id) DO UPDATE SET "
+            "not_before=excluded.not_before,category=excluded.category,"
+            "unrepresentable=excluded.unrepresentable,updated_at=excluded.updated_at",
+            (connection_id, generation, credential_id, provider_id, not_before, category,
+             1 if unrepresentable else 0, _now_iso()),
+        )
+        self._db.commit()
+        return not_before, category, bool(unrepresentable)
+
+    def document_restrictions(
+        self, connection_id: str, generation: int, credential_id: str,
+    ) -> dict[str, tuple[str, str, bool]]:
+        """Every recorded restriction of this account in ANY generation, expired or not, merged per
+        resource (unrepresentable wins, then the later instant):
+        ``provider_id -> (not_before, category, unrepresentable)``. ``generation`` is accepted for
+        call-site symmetry only."""
+        merged: dict[str, tuple[str, str, bool]] = {}
+        for r in self._db.execute(
+            "SELECT provider_id, not_before, category, unrepresentable FROM document_restrictions "
+            "WHERE connection_id=? AND credential_id=? ORDER BY provider_id, generation",
+            (connection_id, credential_id),
+        ).fetchall():
+            candidate = (str(r["not_before"]), str(r["category"]), bool(r["unrepresentable"]))
+            held = merged.get(str(r["provider_id"]))
+            if held is None or (not held[2] and (
+                candidate[2] or _instant(candidate[0]) > _instant(held[0])
+            )):
+                merged[str(r["provider_id"])] = candidate
+        return dict(sorted(merged.items()))
+
+    def update_progress(self, namespace: str, **changes: Any) -> None:
+        allowed = {
+            "phase", "page_token", "baseline_start_token", "traversal_token", "listing_complete",
+            "last_attempt_at", "last_success_at", "last_error",
+            "server_revision",
+            "retry_not_before",
+            "active_snapshot", "building_snapshot", "recovery_required", "checkpoint_id",
+            "terminal_drain_token", "terminal_drain_checkpoint_id",
+            "terminal_drain_acknowledged",
+            "drain_observation", "terminal_drain_observation",
+        }
+        bad = set(changes) - allowed
+        if bad:
+            raise ValueError(f"unsupported progress fields: {sorted(bad)}")
+        if not changes:
+            return
+        changes["updated_at"] = _now_iso()
+        assignments = ", ".join(f"{k}=?" for k in changes)
+        values = [int(v) if isinstance(v, bool) else v for v in changes.values()]
+        cur = self._db.execute(
+            f"UPDATE stream_progress SET {assignments} WHERE namespace=?", (*values, namespace)
+        )
+        if cur.rowcount != 1:
+            raise KeyError(f"unknown stream namespace {namespace}")
+        self._db.commit()
+
+    # Progress may advance only after the page's obligations are durable. Callers materialize every
+    # item first, retain acknowledgments through the server cursor checkpoint, then purge the page.
+    def _next_observation_revision(self, namespace: str, generation: int) -> int:
+        self._db.execute(
+            "INSERT OR IGNORE INTO stream_observation_revisions(namespace,generation,last_revision) "
+            "VALUES(?,?,0)",
+            (namespace, generation),
+        )
+        self._db.execute(
+            "UPDATE stream_observation_revisions SET last_revision=last_revision+1 "
+            "WHERE namespace=? AND generation=?",
+            (namespace, generation),
+        )
+        return int(self._db.execute(
+            "SELECT last_revision FROM stream_observation_revisions WHERE namespace=? AND generation=?",
+            (namespace, generation),
+        ).fetchone()[0])
+
+    def _observe_work(
+        self, namespace: str, generation: int, item_key: str, action: str,
+        payload: dict[str, Any], *, page_id: str | None,
+    ) -> int:
+        """Record one ordered provider observation inside the caller's transaction."""
+        revision = self._next_observation_revision(namespace, generation)
+        now = _now_iso()
+        serialized = json.dumps(payload, separators=(",", ":"))
+        self._db.execute(
+            "UPDATE pending_work SET superseded_at=coalesce(superseded_at,?),"
+            "acknowledged_at=coalesce(acknowledged_at,?) "
+            "WHERE namespace=? AND generation=? AND item_key=? AND superseded_at IS NULL",
+            (now, now, namespace, generation, item_key),
+        )
+        self._db.execute(
+            "UPDATE page_obligation_outcomes SET status='superseded',updated_at=? "
+            "WHERE namespace=? AND generation=? AND item_key=? AND status='pending'",
+            (now, namespace, generation, item_key),
+        )
+        # A barrier belongs to the observation it was raised for; a newer one starts with none.
+        self._db.execute(
+            "DELETE FROM removal_barriers WHERE namespace=? AND generation=? AND item_key=?",
+            (namespace, generation, item_key),
+        )
+        self._db.execute(
+            "INSERT INTO pending_work(namespace,generation,item_key,action,observation_revision,payload,page_id,"
+            "deadline_tracked,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,1,?,?) ON CONFLICT(namespace,generation,item_key,action) DO UPDATE SET "
+            "observation_revision=excluded.observation_revision,payload=excluded.payload,page_id=excluded.page_id,"
+            "attempts=0,failures=0,not_before=NULL,minimum_not_before=NULL,deadline_tracked=1,"
+            "last_error=NULL,acknowledged_at=NULL,superseded_at=NULL,"
+            "exhausted_at=NULL,updated_at=datetime('now')",
+            (namespace, generation, item_key, action, revision, serialized, page_id, now, now),
+        )
+        self._db.execute(
+            "INSERT INTO item_observations(namespace,generation,item_key,observation_revision,action,payload,page_id,observed_at) "
+            "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(namespace,generation,item_key) DO UPDATE SET "
+            "observation_revision=excluded.observation_revision,action=excluded.action,payload=excluded.payload,"
+            "page_id=excluded.page_id,observed_at=excluded.observed_at",
+            (namespace, generation, item_key, revision, action, serialized, page_id, now),
+        )
+        if page_id is not None:
+            self._db.execute(
+                "INSERT OR IGNORE INTO page_obligation_outcomes(namespace,generation,page_id,item_key,observation_revision,action) "
+                "VALUES(?,?,?,?,?,?)",
+                (namespace, generation, page_id, item_key, revision, action),
+            )
+        return revision
+
+    def enqueue_work(
+        self, namespace: str, generation: int, item_key: str, action: str,
+        payload: dict[str, Any] | None = None, *, page_id: str | None = None,
+    ) -> None:
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            self._observe_work(
+                namespace, generation, item_key, action, payload or {}, page_id=page_id,
+            )
+            self._db.commit()
+        except Exception:
+            self._db.rollback()
+            raise
+
+    def list_pending(
+        self, namespace: str, generation: int, *, limit: int = 100,
+        work_class: str | None = None, restricted: Iterable[str] = (),
+    ) -> list[PendingWork]:
+        """Owed work eligible now. ``restricted`` names documents under a standing provider
+        restriction (R49 F1): their reads, upserts and restorations are not selected, so they spend
+        no slot of the batch and independent documents keep progressing. A verified ``remove`` is
+        still selected (R51 blind-final 1): it needs no early read to reach the claim-aware removal
+        owner, and the caller withholds any removal that would need a probe of the document."""
+        if work_class not in {None, "fresh", "retry"}:
+            raise ValueError("work_class must be fresh, retry, or None")
+        class_clause = (
+            " AND attempts=0" if work_class == "fresh"
+            else " AND attempts>0" if work_class == "retry"
+            else ""
+        )
+        rows = self._db.execute(
+            "SELECT * FROM pending_work WHERE namespace=? AND generation=? "
+            "AND acknowledged_at IS NULL AND superseded_at IS NULL AND exhausted_at IS NULL "
+            "AND (not_before IS NULL OR not_before<=?) " + class_clause + " "
+            "AND (action='remove' OR item_key NOT IN (SELECT value FROM json_each(?))) "
+            "ORDER BY attempts ASC,created_at,item_key LIMIT ?",
+            (namespace, generation, _now_iso(), json.dumps(sorted(set(restricted))), max(1, limit)),
+        ).fetchall()
+        return [PendingWork(r["namespace"], r["generation"], r["item_key"], r["action"],
+                            r["observation_revision"], json.loads(r["payload"]),
+                            r["attempts"], r["not_before"], r["last_error"],
+                            r["page_id"], r["acknowledged_at"])
+                for r in rows]
+
+    def work_is_current(self, work: PendingWork) -> bool:
+        owed = self._db.execute(
+            "SELECT superseded_at FROM pending_work WHERE namespace=? AND generation=? "
+            "AND item_key=? AND action=? AND observation_revision=?",
+            (work.namespace, work.generation, work.item_key, work.action,
+             work.observation_revision),
+        ).fetchone()
+        if owed is not None and owed["superseded_at"] is not None:
+            # Retired with no newer observation to say so: the snapshot that replaced the one this
+            # was owed under was published without the document. A work object read before that
+            # publication is not current after it.
+            return False
+        row = self._db.execute(
+            "SELECT observation_revision,action FROM item_observations "
+            "WHERE namespace=? AND generation=? AND item_key=?",
+            (work.namespace, work.generation, work.item_key),
+        ).fetchone()
+        return bool(
+            row
+            and int(row["observation_revision"]) == work.observation_revision
+            and row["action"] == work.action
+        )
+
+    def work_membership_current(self, work: PendingWork) -> bool:
+        if work.action != "upsert":
+            return self.work_is_current(work)
+        snapshot_id = self.work_snapshot_id(work)
+        if snapshot_id is None:
+            if self._work_origin(work)[1]:
+                # Owed under a snapshot that was replaced, with no authoritative one to answer for
+                # it: history authorizes nothing.
+                return False
+            # Compatibility for pre-page local obligations. Upgraded Drive enumeration always
+            # binds an upsert to a materialized page/snapshot before it can reach this path.
+            return self.work_is_current(work)
+        return self.work_is_current(work) and self.has_membership(
+            work.namespace, work.generation, work.item_key,
+            snapshot_id=snapshot_id, building=False,
+        )
+
+    def _work_origin(self, work: PendingWork) -> tuple[int | None, bool]:
+        """The snapshot of the page that observed one obligation, and whether it was replaced."""
+        if not work.page_id:
+            return None, False
+        page = self.get_page(work.namespace, work.generation, work.page_id)
+        if page is None or page.snapshot_id is None:
+            return None, False
+        status = self._db.execute(
+            "SELECT status FROM selection_snapshots WHERE namespace=? AND generation=? AND snapshot_id=?",
+            (work.namespace, work.generation, int(page.snapshot_id)),
+        ).fetchone()
+        return int(page.snapshot_id), bool(status and status["status"] == "retired")
+
+    def work_snapshot_id(self, work: PendingWork) -> int | None:
+        """The snapshot whose membership and traversal answer for one obligation now.
+
+        That is the snapshot of the page that observed it — a build before it is published, the
+        authoritative snapshot once it is — for as long as that snapshot is not retired. A build a
+        restart superseded still answers for what it listed until its replacement is published.
+        A retired snapshot is history: its replacement was published, so what it listed and
+        traversed authorizes nothing, and work it still owes is weighed against the authoritative
+        snapshot alone.
+        """
+        origin, retired = self._work_origin(work)
+        if origin is not None and not retired:
+            return origin
+        progress = self.get_progress(work.namespace)
+        return progress.active_snapshot if progress else None
+
+    def ack_work(self, work: PendingWork) -> None:
+        parent_committed = bool(
+            work.page_id
+            and self._db.execute(
+                "SELECT committed_at FROM materialized_pages "
+                "WHERE namespace=? AND generation=? AND page_id=?",
+                (work.namespace, work.generation, work.page_id),
+            ).fetchone()
+            and self.page_committed(work.namespace, work.generation, work.page_id)
+        )
+        if work.page_id is None or parent_committed:
+            self._db.execute(
+                "DELETE FROM pending_work WHERE namespace=? AND generation=? AND item_key=? AND action=? "
+                "AND observation_revision=?",
+                (work.namespace, work.generation, work.item_key, work.action,
+                 work.observation_revision),
+            )
+        else:
+            self._db.execute(
+                "UPDATE pending_work SET acknowledged_at=coalesce(acknowledged_at,?),updated_at=datetime('now') "
+                "WHERE namespace=? AND generation=? AND item_key=? AND action=? AND observation_revision=?",
+                (_now_iso(), work.namespace, work.generation, work.item_key, work.action,
+                 work.observation_revision),
+            )
+        if work.page_id:
+            self._db.execute(
+                "UPDATE page_obligation_outcomes SET status='acknowledged',updated_at=? "
+                "WHERE namespace=? AND generation=? AND page_id=? AND item_key=? AND observation_revision=? "
+                "AND status='pending'",
+                (_now_iso(), work.namespace, work.generation, work.page_id, work.item_key,
+                 work.observation_revision),
+            )
+        if work.action == "remove":
+            self._db.execute(
+                "DELETE FROM removal_barriers WHERE namespace=? AND generation=? AND item_key=? "
+                "AND observation_revision=?",
+                (work.namespace, work.generation, work.item_key, work.observation_revision),
+            )
+        self._db.commit()
+
+    def purge_committed_page_work(self, namespace: str, generation: int, page_id: str) -> None:
+        self._db.execute(
+            "DELETE FROM pending_work WHERE namespace=? AND generation=? AND page_id=? AND acknowledged_at IS NOT NULL",
+            (namespace, generation, page_id),
+        )
+        self._db.commit()
+
+    def forget_acknowledged_unpaged(self, work: PendingWork) -> None:
+        self._db.execute(
+            "DELETE FROM pending_work WHERE namespace=? AND generation=? AND item_key=? AND action=? "
+            "AND page_id IS NULL AND acknowledged_at IS NOT NULL",
+            (work.namespace, work.generation, work.item_key, work.action),
+        )
+        self._db.commit()
+
+    def fail_work(
+        self, work: PendingWork, error: str, *, not_before: str | None = None, exhaust: bool = False,
+        failure: bool = True, minimum: str | None = None,
+    ) -> None:
+        """Record one attempt that did not complete. The obligation stays owed either way; with
+        ``exhaust`` it is no longer picked automatically (``list_pending``) but still counts as pending
+        work. ``failure=False`` records a document WITHHELD for a reason that is not its own failure
+        (it waits on another stream): it still moves behind fresher work, but spends none of the retry
+        budget (``failures``) that backoff and exhaustion are computed from (AIO-1167 R44 C7).
+
+        ``not_before`` is the combined eligibility instant; ``minimum`` is the EXTERNAL part of it — a
+        provider- or brain-named minimum (AIO-1167 R50). It is recorded apart from the local backoff,
+        merged monotonically with any earlier one for this observation, so an explicit rearm can drop
+        the backoff (``rearm_exhausted``) and never the minimum."""
+        row = self._db.execute(
+            "SELECT minimum_not_before FROM pending_work WHERE namespace=? AND generation=? "
+            "AND item_key=? AND action=? AND observation_revision=? AND superseded_at IS NULL",
+            (work.namespace, work.generation, work.item_key, work.action, work.observation_revision),
+        ).fetchone()
+        recorded = row["minimum_not_before"] if row is not None else None
+        merged = recorded
+        if minimum and (merged is None or _instant(minimum) > _instant(merged)):
+            merged = minimum
+        self._db.execute(
+            "UPDATE pending_work SET attempts=attempts+1,failures=failures+?,last_error=?,not_before=?,"
+            "minimum_not_before=?,deadline_tracked=1,"
+            "exhausted_at=CASE WHEN ? THEN datetime('now') ELSE exhausted_at END,updated_at=datetime('now') "
+            "WHERE namespace=? AND generation=? AND item_key=? AND action=? AND observation_revision=? "
+            "AND superseded_at IS NULL",
+            (1 if failure else 0, error[:1000], not_before, merged, 1 if exhaust else 0, work.namespace,
+             work.generation, work.item_key, work.action, work.observation_revision),
+        )
+        self._db.commit()
+
+    def work_failures(self, work: PendingWork) -> int:
+        """The PERSISTED count of real failures of this observation's obligation (0 if none is owed)."""
+        row = self._db.execute(
+            "SELECT failures FROM pending_work WHERE namespace=? AND generation=? AND item_key=? "
+            "AND action=? AND observation_revision=? AND superseded_at IS NULL",
+            (work.namespace, work.generation, work.item_key, work.action, work.observation_revision),
+        ).fetchone()
+        return int(row["failures"]) if row else 0
+
+    def has_owed_work(
+        self, namespace: str, generation: int, item_key: str, *, exclude_action: str | None = None,
+    ) -> bool:
+        """Whether this stream still owes an outcome for ``item_key`` (acknowledged/superseded: no),
+        optionally ignoring obligations of ``exclude_action``."""
+        return self._db.execute(
+            "SELECT 1 FROM pending_work WHERE namespace=? AND generation=? AND item_key=? "
+            "AND acknowledged_at IS NULL AND superseded_at IS NULL AND action<>? LIMIT 1",
+            (namespace, generation, item_key, exclude_action or ""),
+        ).fetchone() is not None
+
+    def exhausted_count(self, namespace: str, generation: int) -> int:
+        """Owed obligations whose automatic retries ran out (AIO-1167 R44 C7)."""
+        return int(self._db.execute(
+            "SELECT count(*) FROM pending_work WHERE namespace=? AND generation=? "
+            "AND acknowledged_at IS NULL AND superseded_at IS NULL AND exhausted_at IS NOT NULL",
+            (namespace, generation),
+        ).fetchone()[0])
+
+    def rearm_exhausted(self, namespace: str, generation: int) -> int:
+        """An explicit Admin run: exhausted obligations become retryable again, from attempt zero.
+        Their evidence (last error) is kept until the next attempt replaces it.
+
+        Rearm owns the attempt budget and the LOCAL exponential backoff (AIO-1167 R50): where the
+        deadline's provenance is recorded (``deadline_tracked``), ``not_before`` falls back to the
+        external minimum alone — so unrestricted work is eligible at once, while a provider- or
+        brain-named minimum still holds. A legacy row whose combined deadline has no recorded
+        provenance keeps it: it cannot be assumed to be local backoff only. Resource restrictions
+        (``document_restrictions``) are a separate owner and are never touched here."""
+        cur = self._db.execute(
+            "UPDATE pending_work SET exhausted_at=NULL,attempts=0,failures=0,"
+            "not_before=CASE WHEN deadline_tracked=1 THEN minimum_not_before ELSE not_before END,"
+            "updated_at=datetime('now') "
+            "WHERE namespace=? AND generation=? AND acknowledged_at IS NULL AND superseded_at IS NULL "
+            "AND exhausted_at IS NOT NULL",
+            (namespace, generation),
+        )
+        self._db.commit()
+        return int(cur.rowcount or 0)
+
+    def pending_count(self, namespace: str, generation: int) -> int:
+        return int(self._db.execute(
+            "SELECT count(*) FROM pending_work WHERE namespace=? AND generation=? "
+            "AND acknowledged_at IS NULL AND superseded_at IS NULL",
+            (namespace, generation),
+        ).fetchone()[0])
+
+    def projected_pending_count(
+        self, namespace: str, generation: int, item_keys: list[str],
+    ) -> int:
+        """Return backlog size after observations atomically supersede the same items."""
+        distinct = sorted(set(item_keys))
+        current = self.pending_count(namespace, generation)
+        if not distinct:
+            return current
+        placeholders = ",".join("?" for _ in distinct)
+        replaced = int(self._db.execute(
+            "SELECT count(DISTINCT item_key) FROM pending_work WHERE namespace=? AND generation=? "
+            "AND acknowledged_at IS NULL AND superseded_at IS NULL "
+            f"AND item_key IN ({placeholders})",
+            (namespace, generation, *distinct),
+        ).fetchone()[0])
+        return current - replaced + len(distinct)
+
+    def page_pending_count(self, namespace: str, generation: int, page_id: str) -> int:
+        return int(self._db.execute(
+            "SELECT count(*) FROM pending_work WHERE namespace=? AND generation=? AND page_id=? "
+            "AND acknowledged_at IS NULL AND superseded_at IS NULL",
+            (namespace, generation, page_id),
+        ).fetchone()[0])
+
+    # -- durable selection traversal / provider pages ----------------------
+    def begin_selection_snapshot(
+        self, namespace: str, generation: int, roots: list[tuple[str, str, str, bool]],
+    ) -> int:
+        """Atomically create a replacement incarnation with roots and traversal seeds.
+
+        The prior active incarnation remains readable until :meth:`publish_selection_snapshot`.
+        Repeated calls while a build exists return that build and repair any missing seeds: the
+        build is resumed under the start token it was begun with. A token captured since is not
+        that token — see :meth:`restart_selection_snapshot`.
+        """
+        return self._open_selection_snapshot(namespace, generation, roots)
+
+    def restart_selection_snapshot(
+        self, namespace: str, generation: int, roots: list[tuple[str, str, str, bool]],
+        *, start_token: str,
+    ) -> int:
+        """Atomically begin a new incarnation under a start token captured just now.
+
+        What an unfinished build listed is no evidence for this token: a document that entered a
+        folder after that folder was listed and before the token was captured is in neither the
+        listing nor the changes after the token. So nothing is resumed. In one transaction the
+        build is superseded — never enumerated or published again — a new incarnation is seeded
+        with every root unlisted, each page still uncommitted is retired without moving the
+        cursor, and the stream's cursor becomes this token in a new drain observation with no
+        terminal evidence. The published membership stays authoritative, the superseded build
+        still claims what it listed, and every document obligation stays owed, until the
+        replacement is published — :meth:`publish_selection_snapshot` then ends the upserts owed
+        for documents the replacement does not hold.
+        """
+        if not start_token:
+            raise ValueError("a restarted snapshot needs the start token it is enumerated under")
+        return self._open_selection_snapshot(namespace, generation, roots, start_token=start_token)
+
+    def _open_selection_snapshot(
+        self, namespace: str, generation: int, roots: list[tuple[str, str, str, bool]],
+        *, start_token: str | None = None,
+    ) -> int:
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            progress = self._db.execute(
+                "SELECT building_snapshot FROM stream_progress WHERE namespace=?",
+                (namespace,),
+            ).fetchone()
+            if start_token is not None:
+                if progress is None:
+                    raise KeyError(f"unknown stream namespace {namespace}")
+                self._db.execute(
+                    "UPDATE selection_snapshots SET status='superseded' "
+                    "WHERE namespace=? AND generation=? AND status='building'",
+                    (namespace, generation),
+                )
+                # A page read before this token is settled by the baseline that follows it, not by
+                # its own continuation: retired here, it can neither advance the cursor nor wait on
+                # a rescan that will never publish. The work it still owes is not touched.
+                self._db.execute(
+                    "DELETE FROM pending_work WHERE namespace=? AND generation=? "
+                    "AND acknowledged_at IS NOT NULL AND page_id IN ("
+                    "SELECT page_id FROM materialized_pages WHERE namespace=? AND generation=? "
+                    "AND committed_at IS NULL)",
+                    (namespace, generation, namespace, generation),
+                )
+                self._db.execute(
+                    "UPDATE materialized_pages SET committed_at=? "
+                    "WHERE namespace=? AND generation=? AND committed_at IS NULL",
+                    (_now_iso(), namespace, generation),
+                )
+            resumed = progress[0] if progress and start_token is None else None
+            snapshot_id = int(resumed) if resumed is not None else int(
+                self._db.execute(
+                    "SELECT coalesce(max(snapshot_id),0)+1 FROM ("
+                    "SELECT snapshot_id FROM selection_snapshots WHERE namespace=? AND generation=? "
+                    "UNION ALL SELECT snapshot_id FROM selected_membership WHERE namespace=? AND generation=? "
+                    "UNION ALL SELECT snapshot_id FROM selection_roots WHERE namespace=? AND generation=? "
+                    "UNION ALL SELECT snapshot_id FROM traversal_queue WHERE namespace=? AND generation=?"
+                    ")",
+                    (namespace, generation, namespace, generation, namespace, generation,
+                     namespace, generation),
+                ).fetchone()[0]
+            )
+            self._db.execute(
+                "INSERT OR IGNORE INTO selection_snapshots(namespace,generation,snapshot_id,status) "
+                "VALUES(?,?,?,'building')",
+                (namespace, generation, snapshot_id),
+            )
+            for root_id, kind, drive_id, recursive in roots:
+                self._db.execute(
+                    "INSERT OR IGNORE INTO selection_roots(namespace,generation,snapshot_id,root_id,root_kind,drive_id,recursive) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (namespace, generation, snapshot_id, root_id, kind, drive_id, int(recursive)),
+                )
+                if kind in {"folder", "drive"}:
+                    self._db.execute(
+                        "INSERT OR IGNORE INTO traversal_queue(namespace,generation,snapshot_id,root_id,folder_id,drive_id,page_token) "
+                        "VALUES(?,?,?,?,?,?,?)",
+                        (namespace, generation, snapshot_id, root_id,
+                         drive_id if kind == "drive" else root_id, drive_id, ""),
+                    )
+                    seed_folder = drive_id if kind == "drive" else root_id
+                    self._db.execute(
+                        "INSERT OR IGNORE INTO traversal_ancestry(namespace,generation,snapshot_id,root_id,folder_id,ancestor_id) "
+                        "VALUES(?,?,?,?,?,?)",
+                        (namespace, generation, snapshot_id, root_id, seed_folder, seed_folder),
+                    )
+            self._db.execute(
+                "UPDATE stream_progress SET building_snapshot=?,listing_complete=0,phase='baselining',"
+                "terminal_drain_token=NULL,terminal_drain_checkpoint_id=NULL,"
+                "terminal_drain_acknowledged=0,terminal_drain_observation=NULL,updated_at=? "
+                "WHERE namespace=?",
+                (snapshot_id, _now_iso(), namespace),
+            )
+            if start_token is not None:
+                # The new observation keeps every change page read from this token distinct from
+                # any page read before it, even one read from an equal token.
+                self._db.execute(
+                    "UPDATE stream_progress SET baseline_start_token=?,page_token=NULL,"
+                    "drain_observation=drain_observation+1 WHERE namespace=?",
+                    (start_token, namespace),
+                )
+            self._db.commit()
+            return snapshot_id
+        except Exception:
+            self._db.rollback()
+            raise
+
+    def replace_roots(self, namespace: str, generation: int,
+                      roots: list[tuple[str, str, str, bool]]) -> None:
+        self.begin_selection_snapshot(namespace, generation, roots)
+
+    def snapshot_id(self, namespace: str, *, building: bool = True) -> int | None:
+        row = self._db.execute(
+            "SELECT active_snapshot,building_snapshot FROM stream_progress WHERE namespace=?",
+            (namespace,),
+        ).fetchone()
+        if not row:
+            return None
+        selected = row["building_snapshot"] if building and row["building_snapshot"] is not None else row["active_snapshot"]
+        # Compatibility for callers/tests that predate explicit snapshot initialization. The
+        # coordinator always calls begin_selection_snapshot before provider enumeration.
+        return int(selected) if selected is not None else 1
+
+    def list_roots(self, namespace: str, generation: int,
+                   *, snapshot_id: int | None = None) -> list[sqlite3.Row]:
+        selected = snapshot_id if snapshot_id is not None else self.snapshot_id(namespace)
+        if selected is None:
+            return []
+        return self._db.execute(
+            "SELECT * FROM selection_roots WHERE namespace=? AND generation=? AND snapshot_id=? "
+            "ORDER BY root_kind,root_id",
+            (namespace, generation, selected),
+        ).fetchall()
+
+    def enqueue_traversal(
+        self, namespace: str, generation: int, root_id: str, folder_id: str,
+        drive_id: str, page_token: str | None = None, *, snapshot_id: int | None = None,
+    ) -> None:
+        selected = snapshot_id if snapshot_id is not None else self.snapshot_id(namespace)
+        if selected is None:
+            raise RuntimeError("selection snapshot is not initialized")
+        self._db.execute(
+            "INSERT OR IGNORE INTO traversal_queue(namespace,generation,snapshot_id,root_id,folder_id,drive_id,page_token) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (namespace, generation, selected, root_id, folder_id, drive_id, page_token or ""),
+        )
+        self._db.commit()
+
+    def next_traversal(self, namespace: str, generation: int,
+                       *, snapshot_id: int | None = None,
+                       exclude_folders: Collection[str] = ()) -> sqlite3.Row | None:
+        """The oldest unfinished traversal entry. ``exclude_folders`` skips entries of folders whose
+        listing may not be dispatched now (a standing provider minimum, AIO-1167 final review A3):
+        they stay unfinished, and the other folders' entries are not held behind them."""
+        selected = snapshot_id if snapshot_id is not None else self.snapshot_id(namespace)
+        if selected is None:
+            return None
+        excluded = sorted(set(exclude_folders))
+        clause = f"AND folder_id NOT IN ({','.join('?' for _ in excluded)}) " if excluded else ""
+        return self._db.execute(
+            "SELECT * FROM traversal_queue WHERE namespace=? AND generation=? AND snapshot_id=? "
+            f"AND completed_at IS NULL {clause}"
+            "ORDER BY rowid LIMIT 1",
+            (namespace, generation, selected, *excluded),
+        ).fetchone()
+
+    def open_traversal_folders(
+        self, namespace: str, generation: int, folders: Collection[str],
+        *, snapshot_id: int | None = None,
+    ) -> set[str]:
+        """Which of ``folders`` still have an unfinished traversal entry in this snapshot (a listing
+        held behind a standing provider minimum, AIO-1167 Fable R51 L4)."""
+        selected = snapshot_id if snapshot_id is not None else self.snapshot_id(namespace)
+        wanted = sorted(set(folders))
+        if selected is None or not wanted:
+            return set()
+        rows = self._db.execute(
+            "SELECT DISTINCT folder_id FROM traversal_queue WHERE namespace=? AND generation=? "
+            f"AND snapshot_id=? AND completed_at IS NULL AND folder_id IN ({','.join('?' for _ in wanted)})",
+            (namespace, generation, selected, *wanted),
+        ).fetchall()
+        return {str(row[0]) for row in rows}
+
+    def root_traversal_open(
+        self, namespace: str, generation: int, root_id: str, *, snapshot_id: int | None = None,
+    ) -> bool:
+        """Whether ``root_id`` still has an unfinished traversal entry in this snapshot — the folder,
+        a descendant or a further page is still to be listed (AIO-1167 R51 final 1). A root with no
+        entry at all, or whose every entry is finished, is not open."""
+        selected = snapshot_id if snapshot_id is not None else self.snapshot_id(namespace)
+        if selected is None:
+            return False
+        return self._db.execute(
+            "SELECT 1 FROM traversal_queue WHERE namespace=? AND generation=? AND snapshot_id=? "
+            "AND root_id=? AND completed_at IS NULL LIMIT 1",
+            (namespace, generation, selected, root_id),
+        ).fetchone() is not None
+
+    def complete_traversal(self, namespace: str, generation: int, root_id: str,
+                           folder_id: str, page_token: str | None,
+                           *, snapshot_id: int | None = None) -> None:
+        selected = snapshot_id if snapshot_id is not None else self.snapshot_id(namespace)
+        self._db.execute(
+            "UPDATE traversal_queue SET completed_at=? WHERE namespace=? AND generation=? AND root_id=? "
+            "AND snapshot_id=? AND folder_id=? AND page_token=?",
+            (_now_iso(), namespace, generation, root_id, selected, folder_id, page_token or ""),
+        )
+        self._db.commit()
+
+    def record_membership(self, namespace: str, generation: int, provider_id: str,
+                          root_id: str, drive_id: str, *, snapshot_id: int | None = None) -> None:
+        selected = snapshot_id if snapshot_id is not None else self.snapshot_id(namespace)
+        if selected is None:
+            raise RuntimeError("selection snapshot is not initialized")
+        self._db.execute(
+            "INSERT OR IGNORE INTO selection_snapshots(namespace,generation,snapshot_id,status,completed_at) "
+            "VALUES(?,?,?,'active',?)",
+            (namespace, generation, selected, _now_iso()),
+        )
+        self._db.execute(
+            "UPDATE stream_progress SET active_snapshot=coalesce(active_snapshot,?) WHERE namespace=?",
+            (selected, namespace),
+        )
+        row = self._db.execute(
+            "SELECT root_ids FROM selected_membership WHERE namespace=? AND generation=? AND snapshot_id=? AND provider_id=?",
+            (namespace, generation, selected, provider_id),
+        ).fetchone()
+        roots = set(json.loads(row["root_ids"])) if row else set()
+        roots.add(root_id)
+        self._db.execute(
+            "INSERT INTO selected_membership(namespace,generation,snapshot_id,provider_id,root_ids,drive_id,seen_at) "
+            "VALUES(?,?,?,?,?,?,?) ON CONFLICT(namespace,generation,snapshot_id,provider_id) DO UPDATE SET "
+            "root_ids=excluded.root_ids,drive_id=excluded.drive_id,seen_at=excluded.seen_at",
+            (namespace, generation, selected, provider_id, json.dumps(sorted(roots)), drive_id, _now_iso()),
+        )
+        self._db.commit()
+
+    def membership_ids(self, namespace: str, generation: int,
+                       *, snapshot_id: int | None = None, building: bool = False) -> list[str]:
+        selected = snapshot_id
+        if selected is None:
+            selected = self.snapshot_id(namespace, building=building)
+        if selected is None:
+            return []
+        return [r[0] for r in self._db.execute(
+            "SELECT provider_id FROM selected_membership WHERE namespace=? AND generation=? AND snapshot_id=? "
+            "ORDER BY provider_id",
+            (namespace, generation, selected),
+        ).fetchall()]
+
+    def membership_roots(self, namespace: str, generation: int, provider_id: str,
+                         *, snapshot_id: int | None = None) -> list[str]:
+        """The selected roots one member is claimed through in the authoritative snapshot."""
+        selected = snapshot_id if snapshot_id is not None else self.snapshot_id(namespace, building=False)
+        if selected is None:
+            return []
+        row = self._db.execute(
+            "SELECT root_ids FROM selected_membership WHERE namespace=? AND generation=? "
+            "AND snapshot_id=? AND provider_id=?",
+            (namespace, generation, selected, provider_id),
+        ).fetchone()
+        return sorted(json.loads(row["root_ids"])) if row else []
+
+    def membership_impacts_for_root(
+        self, namespace: str, generation: int, root_id: str,
+        *, snapshot_id: int | None = None,
+    ) -> tuple[list[str], list[str]]:
+        """Return (all descendants, descendants losing their final selected-root claim).
+
+        ``root_ids`` is retained subtree provenance, not display metadata. Using it means a
+        confirmed selected-folder/Shared-Drive tombstone can suppress only that connection's
+        affected claims while preserving a doc selected directly or through an overlapping root.
+        """
+        selected = snapshot_id if snapshot_id is not None else self.snapshot_id(namespace, building=False)
+        if selected is None:
+            return [], []
+        affected: list[str] = []
+        final: list[str] = []
+        for row in self._db.execute(
+            "SELECT provider_id,root_ids FROM selected_membership "
+            "WHERE namespace=? AND generation=? AND snapshot_id=? ORDER BY provider_id",
+            (namespace, generation, selected),
+        ).fetchall():
+            roots = set(json.loads(row["root_ids"]))
+            if root_id not in roots:
+                continue
+            affected.append(str(row["provider_id"]))
+            if roots == {root_id}:
+                final.append(str(row["provider_id"]))
+        return affected, final
+
+    def retained_root_membership(
+        self, namespace: str, generation: int, root_id: str,
+    ) -> list[tuple[str, str, str]]:
+        """``(provider_id, root_id, drive_id)`` for each member the stream's PUBLISHED snapshot
+        claims through ``root_id`` (AIO-1167 R50 F4).
+
+        Retained evidence for a root that cannot be read now, never a current observation. A stream
+        with no published snapshot — fresh local state — has none: membership is never invented
+        from a root binding or a snapshot id."""
+        progress = self._db.execute(
+            "SELECT active_snapshot FROM stream_progress WHERE namespace=?", (namespace,),
+        ).fetchone()
+        if progress is None or progress["active_snapshot"] is None:
+            return []
+        active = int(progress["active_snapshot"])
+        status = self._db.execute(
+            "SELECT status FROM selection_snapshots WHERE namespace=? AND generation=? AND snapshot_id=?",
+            (namespace, generation, active),
+        ).fetchone()
+        if status is None or status["status"] != "active":
+            return []
+        return [
+            (str(row["provider_id"]), root_id, str(row["drive_id"]))
+            for row in self._db.execute(
+                "SELECT provider_id,root_ids,drive_id FROM selected_membership "
+                "WHERE namespace=? AND generation=? AND snapshot_id=? ORDER BY provider_id",
+                (namespace, generation, active),
+            ).fetchall()
+            if root_id in set(json.loads(row["root_ids"]))
+        ]
+
+    def membership_impacts_for_ancestor(
+        self, namespace: str, generation: int, ancestor_id: str,
+        *, snapshot_id: int | None = None,
+    ) -> tuple[list[tuple[str, str]], list[str]]:
+        """Resolve a nested-folder tombstone through persisted transitive traversal provenance."""
+        selected = snapshot_id if snapshot_id is not None else self.snapshot_id(namespace, building=False)
+        if selected is None:
+            return [], []
+        rows = self._db.execute(
+            "SELECT provider_id,root_id FROM membership_ancestry WHERE namespace=? AND generation=? "
+            "AND snapshot_id=? AND ancestor_id=? ORDER BY provider_id,root_id",
+            (namespace, generation, selected, ancestor_id),
+        ).fetchall()
+        pairs = [(str(row["provider_id"]), str(row["root_id"])) for row in rows]
+        affected_by_item: dict[str, set[str]] = {}
+        for provider_id, root_id in pairs:
+            affected_by_item.setdefault(provider_id, set()).add(root_id)
+        final: list[str] = []
+        for provider_id, affected_roots in affected_by_item.items():
+            row = self._db.execute(
+                "SELECT root_ids FROM selected_membership WHERE namespace=? AND generation=? "
+                "AND snapshot_id=? AND provider_id=?",
+                (namespace, generation, selected, provider_id),
+            ).fetchone()
+            roots = set(json.loads(row["root_ids"])) if row else set()
+            if roots and not (roots - affected_roots):
+                final.append(provider_id)
+        return pairs, sorted(final)
+
+    def has_membership(self, namespace: str, generation: int, provider_id: str,
+                       *, snapshot_id: int | None = None, building: bool = True) -> bool:
+        selected = snapshot_id if snapshot_id is not None else self.snapshot_id(namespace, building=building)
+        if selected is None:
+            return False
+        return self._db.execute(
+            "SELECT 1 FROM selected_membership WHERE namespace=? AND generation=? AND snapshot_id=? AND provider_id=?",
+            (namespace, generation, selected, provider_id),
+        ).fetchone() is not None
+
+    def claimed_elsewhere(
+        self, connection_id: str, generation: int, namespace: str, provider_id: str,
+    ) -> bool:
+        """Whether another stream of the same connection claims one document.
+
+        A claim is membership in that stream's authoritative snapshot or in one it is building, or
+        an upsert it still owes. A removal one drive's change log reports says nothing about any of
+        them: the document may simply have moved between two selected roots. A build that a
+        restart under a fresh token superseded still claims what it listed, until its replacement
+        is published: the restart is no evidence that the document left. That publication is: an
+        upsert it supersedes, for a document the replacement does not hold, is owed no longer and
+        is no claim.
+        """
+        return bool(self.streams_claiming(connection_id, generation, namespace, provider_id))
+
+    def streams_claiming(
+        self, connection_id: str, generation: int, namespace: str, provider_id: str,
+    ) -> list[str]:
+        """The namespaces of the other streams that claim one document (see ``claimed_elsewhere``).
+
+        Which streams matter as well as whether: a claim held by a stream that cannot read its own
+        change log is retained evidence, not a current observation.
+        """
+        claimants: list[str] = []
+        for row in self._db.execute(
+            "SELECT namespace,active_snapshot,building_snapshot FROM stream_progress "
+            "WHERE connection_id=? AND generation=? AND namespace<>?",
+            (connection_id, generation, namespace),
+        ).fetchall():
+            superseded = [found[0] for found in self._db.execute(
+                "SELECT snapshot_id FROM selection_snapshots "
+                "WHERE namespace=? AND generation=? AND status='superseded'",
+                (row["namespace"], generation),
+            ).fetchall()]
+            if any(
+                snapshot is not None and self.has_membership(
+                    row["namespace"], generation, provider_id, snapshot_id=int(snapshot),
+                )
+                for snapshot in (row["active_snapshot"], row["building_snapshot"], *superseded)
+            ) or self._db.execute(
+                "SELECT 1 FROM pending_work WHERE namespace=? AND generation=? AND item_key=? "
+                "AND action='upsert' AND acknowledged_at IS NULL AND superseded_at IS NULL",
+                (row["namespace"], generation, provider_id),
+            ).fetchone() is not None:
+                claimants.append(str(row["namespace"]))
+        return claimants
+
+    def withdraw_lost_root_support(
+        self, namespace: str, generation: int, root_id: str, *, snapshot_id: int,
+    ) -> list[str]:
+        """Withdraw a verified-lost root's support from a BUILDING snapshot (AIO-1167 final review, High).
+
+        A root whose own metadata the provider answered not-found supports nothing (R48 D1). What
+        this build already materialized through it — pages listed before the loss, while pagination
+        or a sibling root kept the build open — must not survive into its publication. In one
+        transaction: the root leaves every member's ``root_ids`` (with its ancestry), a member left
+        with no root leaves the snapshot, and an upsert owed by THIS snapshot's own pages for such a
+        member is superseded exactly as publication supersedes a retired snapshot's — it would ingest
+        a document the snapshot no longer selects. Support through any other root (a direct file, an
+        overlapping folder) is kept, other snapshots and other streams are not touched, and nothing is
+        removed from the brain: the fenced reconciliation of the published snapshot does that.
+
+        Page membership is applied once, when a page is first materialized, and never on replay, so a
+        withdrawn root cannot be restored by replaying its old pages. Only a ``building`` snapshot is
+        changed — a published one is never rewritten here. Idempotent. Returns the provider ids that
+        lost their final support."""
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            status = self._db.execute(
+                "SELECT status FROM selection_snapshots WHERE namespace=? AND generation=? AND snapshot_id=?",
+                (namespace, generation, snapshot_id),
+            ).fetchone()
+            if status is None or status["status"] != "building":
+                self._db.rollback()
+                return []
+            lost: list[str] = []
+            for row in self._db.execute(
+                "SELECT provider_id,root_ids FROM selected_membership "
+                "WHERE namespace=? AND generation=? AND snapshot_id=? ORDER BY provider_id",
+                (namespace, generation, snapshot_id),
+            ).fetchall():
+                roots = set(json.loads(row["root_ids"]))
+                if root_id not in roots:
+                    continue
+                roots.discard(root_id)
+                provider_id = str(row["provider_id"])
+                self._db.execute(
+                    "DELETE FROM membership_ancestry WHERE namespace=? AND generation=? AND snapshot_id=? "
+                    "AND provider_id=? AND root_id=?",
+                    (namespace, generation, snapshot_id, provider_id, root_id),
+                )
+                if roots:
+                    self._db.execute(
+                        "UPDATE selected_membership SET root_ids=?,seen_at=? WHERE namespace=? "
+                        "AND generation=? AND snapshot_id=? AND provider_id=?",
+                        (json.dumps(sorted(roots)), _now_iso(), namespace, generation, snapshot_id,
+                         provider_id),
+                    )
+                else:
+                    self._db.execute(
+                        "DELETE FROM selected_membership WHERE namespace=? AND generation=? "
+                        "AND snapshot_id=? AND provider_id=?",
+                        (namespace, generation, snapshot_id, provider_id),
+                    )
+                    lost.append(provider_id)
+            now = _now_iso()
+            for provider_id in lost:
+                for obsolete in self._db.execute(
+                    "SELECT w.observation_revision,w.page_id FROM pending_work w "
+                    "JOIN materialized_pages p ON p.namespace=w.namespace AND p.generation=w.generation "
+                    "AND p.page_id=w.page_id "
+                    "WHERE w.namespace=? AND w.generation=? AND w.item_key=? AND w.action='upsert' "
+                    "AND w.acknowledged_at IS NULL AND w.superseded_at IS NULL AND p.snapshot_id=?",
+                    (namespace, generation, provider_id, snapshot_id),
+                ).fetchall():
+                    self._db.execute(
+                        "UPDATE pending_work SET superseded_at=?,updated_at=? WHERE namespace=? "
+                        "AND generation=? AND item_key=? AND action='upsert' AND observation_revision=?",
+                        (now, now, namespace, generation, provider_id, obsolete["observation_revision"]),
+                    )
+                    self._db.execute(
+                        "UPDATE page_obligation_outcomes SET status='superseded',superseded_by_snapshot=?,"
+                        "updated_at=? WHERE namespace=? AND generation=? AND page_id=? AND item_key=? "
+                        "AND observation_revision=? AND status='pending'",
+                        (snapshot_id, now, namespace, generation, obsolete["page_id"], provider_id,
+                         obsolete["observation_revision"]),
+                    )
+            self._db.commit()
+            return lost
+        except Exception:
+            self._db.rollback()
+            raise
+
+    def supersede_pending_trash(self, namespace: str, generation: int, item_key: str) -> bool:
+        """A LATER observation shows the document is not trashed (AIO-1167 final review A1 ordering).
+
+        An explicit-trash removal still owed for it — not yet acknowledged by the sink, e.g. after a
+        failed or lost acknowledgment on an earlier page — is superseded exactly as publication
+        supersedes obsolete work: never sent, its page outcome recorded superseded, its page free to
+        commit. Only evidence-bearing trash removals are touched (an ambiguous removal stays on its
+        own gates), nothing is upserted here, and a removal already acknowledged is history. Idempotent.
+        Returns whether anything was superseded."""
+        rows = self._db.execute(
+            "SELECT observation_revision,page_id,payload FROM pending_work WHERE namespace=? AND generation=? "
+            "AND item_key=? AND action='remove' AND acknowledged_at IS NULL AND superseded_at IS NULL",
+            (namespace, generation, item_key),
+        ).fetchall()
+        superseded = False
+        now = _now_iso()
+        for row in rows:
+            try:
+                payload = json.loads(row["payload"] or "{}")
+            except ValueError:
+                continue
+            if payload.get("trashed") is not True or payload.get("reason") != "explicit_trash":
+                continue
+            self._db.execute(
+                "UPDATE pending_work SET superseded_at=?,updated_at=? WHERE namespace=? AND generation=? "
+                "AND item_key=? AND action='remove' AND observation_revision=?",
+                (now, now, namespace, generation, item_key, row["observation_revision"]),
+            )
+            self._db.execute(
+                "UPDATE page_obligation_outcomes SET status='superseded',updated_at=? WHERE namespace=? "
+                "AND generation=? AND page_id=? AND item_key=? AND observation_revision=? AND status='pending'",
+                (now, namespace, generation, row["page_id"], item_key, row["observation_revision"]),
+            )
+            superseded = True
+        if superseded:
+            self._db.commit()
+        return superseded
+
+    def remove_membership(self, namespace: str, generation: int, provider_id: str,
+                          *, snapshot_id: int | None = None) -> bool:
+        selected = snapshot_id if snapshot_id is not None else self.snapshot_id(namespace)
+        cur = self._db.execute(
+            "DELETE FROM selected_membership WHERE namespace=? AND generation=? AND snapshot_id=? AND provider_id=?",
+            (namespace, generation, selected, provider_id),
+        )
+        self._db.commit()
+        return cur.rowcount == 1
+
+    def roots_for_parent(self, namespace: str, generation: int, parent_id: str,
+                         *, snapshot_id: int | None = None) -> list[str]:
+        selected = snapshot_id if snapshot_id is not None else self.snapshot_id(namespace, building=False)
+        if selected is None:
+            return []
+        return [r[0] for r in self._db.execute(
+            "SELECT DISTINCT root_id FROM traversal_queue WHERE namespace=? AND generation=? "
+            "AND snapshot_id=? AND folder_id=?",
+            (namespace, generation, selected, parent_id),
+        ).fetchall()]
+
+    def reset_selection_snapshot(self, namespace: str, generation: int, *, start_token: str) -> int:
+        """Restart the authoritative roots under a fresh token, retaining their membership."""
+        active = self.snapshot_id(namespace, building=False)
+        roots = self.list_roots(namespace, generation, snapshot_id=active)
+        return self.restart_selection_snapshot(namespace, generation, [
+            (row["root_id"], row["root_kind"], row["drive_id"], bool(row["recursive"]))
+            for row in roots
+        ], start_token=start_token)
+
+    def snapshot_complete(self, namespace: str, generation: int, snapshot_id: int | None) -> bool:
+        if snapshot_id is None:
+            return False
+        row = self._db.execute(
+            "SELECT status FROM selection_snapshots WHERE namespace=? AND generation=? AND snapshot_id=?",
+            (namespace, generation, snapshot_id),
+        ).fetchone()
+        if not row or row["status"] != "active":
+            return False
+        traversal = self._db.execute(
+            "SELECT 1 FROM traversal_queue WHERE namespace=? AND generation=? AND snapshot_id=? "
+            "AND completed_at IS NULL LIMIT 1",
+            (namespace, generation, snapshot_id),
+        ).fetchone()
+        return traversal is None
+
+    def snapshot_build_complete(self, namespace: str, generation: int, snapshot_id: int | None) -> bool:
+        if snapshot_id is None:
+            return False
+        row = self._db.execute(
+            "SELECT status FROM selection_snapshots WHERE namespace=? AND generation=? AND snapshot_id=?",
+            (namespace, generation, snapshot_id),
+        ).fetchone()
+        if not row or row["status"] != "building":
+            return False
+        return self.next_traversal(namespace, generation, snapshot_id=snapshot_id) is None
+
+    def page_committed(self, namespace: str, generation: int, page_id: str | None) -> bool:
+        if not page_id:
+            return True
+        page = self.get_page(namespace, generation, page_id)
+        return bool(page and page.committed_at)
+
+    def publish_selection_snapshot(self, namespace: str, generation: int, snapshot_id: int) -> None:
+        """Atomically swap completed membership into authority after the server checkpoint.
+
+        The same transaction ends what the snapshots it replaces still owed for documents the
+        published one does not hold. That snapshot was enumerated in full without them, so such
+        an upsert is superseded — never acknowledged: nothing was ingested — its page outcome
+        records the snapshot that superseded it, and it stops counting as a claim of this stream.
+        An upsert for a document the published snapshot holds stays owed until its ingestion is
+        acknowledged. Removals and their barriers are not touched, and nothing is removed here:
+        what the brain holds for a document is settled only by the fenced reconciliation of every
+        stream. A publication that does not complete changes none of it.
+        """
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            pending_traversal = self._db.execute(
+                "SELECT 1 FROM traversal_queue WHERE namespace=? AND generation=? AND snapshot_id=? "
+                "AND completed_at IS NULL LIMIT 1",
+                (namespace, generation, snapshot_id),
+            ).fetchone()
+            if pending_traversal:
+                raise RuntimeError("cannot publish incomplete selection traversal")
+            # A superseded build stops claiming what it listed once its replacement is authoritative.
+            self._db.execute(
+                "UPDATE selection_snapshots SET status='retired' WHERE namespace=? AND generation=? "
+                "AND status IN ('active','superseded')",
+                (namespace, generation),
+            )
+            cur = self._db.execute(
+                "UPDATE selection_snapshots SET status='active',completed_at=? "
+                "WHERE namespace=? AND generation=? AND snapshot_id=? AND status='building'",
+                (_now_iso(), namespace, generation, snapshot_id),
+            )
+            if cur.rowcount != 1:
+                already = self._db.execute(
+                    "SELECT status FROM selection_snapshots WHERE namespace=? AND generation=? AND snapshot_id=?",
+                    (namespace, generation, snapshot_id),
+                ).fetchone()
+                if not already or already["status"] != "active":
+                    raise RuntimeError("selection snapshot is not publishable")
+            now = _now_iso()
+            for obsolete in self._db.execute(
+                "SELECT w.item_key,w.observation_revision,w.page_id FROM pending_work w "
+                "JOIN materialized_pages p ON p.namespace=w.namespace AND p.generation=w.generation "
+                "AND p.page_id=w.page_id "
+                "JOIN selection_snapshots s ON s.namespace=p.namespace AND s.generation=p.generation "
+                "AND s.snapshot_id=p.snapshot_id "
+                "WHERE w.namespace=? AND w.generation=? AND w.action='upsert' "
+                "AND w.acknowledged_at IS NULL AND w.superseded_at IS NULL AND s.status='retired' "
+                "AND NOT EXISTS (SELECT 1 FROM selected_membership m WHERE m.namespace=w.namespace "
+                "AND m.generation=w.generation AND m.snapshot_id=? AND m.provider_id=w.item_key)",
+                (namespace, generation, snapshot_id),
+            ).fetchall():
+                self._db.execute(
+                    "UPDATE pending_work SET superseded_at=?,updated_at=? WHERE namespace=? "
+                    "AND generation=? AND item_key=? AND action='upsert' AND observation_revision=?",
+                    (now, now, namespace, generation, obsolete["item_key"],
+                     obsolete["observation_revision"]),
+                )
+                self._db.execute(
+                    "UPDATE page_obligation_outcomes SET status='superseded',superseded_by_snapshot=?,"
+                    "updated_at=? WHERE namespace=? AND generation=? AND page_id=? AND item_key=? "
+                    "AND observation_revision=? AND status='pending'",
+                    (snapshot_id, now, namespace, generation, obsolete["page_id"],
+                     obsolete["item_key"], obsolete["observation_revision"]),
+                )
+            self._db.execute(
+                "UPDATE stream_progress SET active_snapshot=?,building_snapshot=NULL,recovery_required=0,"
+                "listing_complete=1,updated_at=? WHERE namespace=?",
+                (snapshot_id, _now_iso(), namespace),
+            )
+            self._db.commit()
+        except Exception:
+            self._db.rollback()
+            raise
+
+    def materialize_page(
+        self, namespace: str, generation: int, page_id: str, page_kind: str,
+        input_token: str | None, next_token: str | None, terminal_token: str | None,
+        obligations: list[tuple[str, str, dict[str, Any]]],
+        *,
+        snapshot_id: int | None = None,
+        membership_additions: list[tuple[str, str, str] | tuple[str, str, str, str | None]] | None = None,
+        membership_removals: list[str] | None = None,
+        membership_root_removals: list[tuple[str, str]] | None = None,
+        traversal_additions: list[tuple[str, str, str, str | None]] | None = None,
+        traversal_completion: tuple[str, str, str | None] | None = None,
+        rescan_roots: list[tuple[str, str, str, bool]] | None = None,
+        drain_observation: int = 0,
+    ) -> MaterializedPage:
+        """Atomically retain a provider page and every required outcome before processing."""
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            existing_page = self._db.execute(
+                "SELECT snapshot_id,rescan_snapshot_id FROM materialized_pages "
+                "WHERE namespace=? AND generation=? AND page_id=?",
+                (namespace, generation, page_id),
+            ).fetchone()
+            selected = (
+                existing_page["snapshot_id"]
+                if existing_page is not None and existing_page["snapshot_id"] is not None
+                else snapshot_id if snapshot_id is not None else self.snapshot_id(namespace)
+            )
+            # Replaying a page after its rescan published (for example, a crash immediately before
+            # page retirement) must repair the original incarnation, never create another one.
+            rescan_snapshot_id: int | None = (
+                int(existing_page["rescan_snapshot_id"])
+                if existing_page is not None and existing_page["rescan_snapshot_id"] is not None
+                else None
+            )
+            if rescan_roots is not None:
+                if rescan_snapshot_id is None:
+                    progress = self._db.execute(
+                        "SELECT building_snapshot FROM stream_progress WHERE namespace=?",
+                        (namespace,),
+                    ).fetchone()
+                    rescan_snapshot_id = int(progress[0]) if progress and progress[0] is not None else int(
+                        self._db.execute(
+                            "SELECT coalesce(max(snapshot_id),0)+1 FROM selection_snapshots "
+                            "WHERE namespace=? AND generation=?",
+                            (namespace, generation),
+                        ).fetchone()[0]
+                    )
+                self._db.execute(
+                    "INSERT OR IGNORE INTO selection_snapshots(namespace,generation,snapshot_id,status) "
+                    "VALUES(?,?,?,'building')",
+                    (namespace, generation, rescan_snapshot_id),
+                )
+                for root_id, kind, drive_id, recursive in rescan_roots:
+                    self._db.execute(
+                        "INSERT OR IGNORE INTO selection_roots(namespace,generation,snapshot_id,root_id,root_kind,drive_id,recursive) "
+                        "VALUES(?,?,?,?,?,?,?)",
+                        (namespace, generation, rescan_snapshot_id, root_id, kind, drive_id, int(recursive)),
+                    )
+                    if kind in {"folder", "drive"}:
+                        self._db.execute(
+                            "INSERT OR IGNORE INTO traversal_queue(namespace,generation,snapshot_id,root_id,folder_id,drive_id,page_token) "
+                            "VALUES(?,?,?,?,?,?,?)",
+                            (namespace, generation, rescan_snapshot_id, root_id,
+                             drive_id if kind == "drive" else root_id, drive_id, ""),
+                        )
+                        seed_folder = drive_id if kind == "drive" else root_id
+                        self._db.execute(
+                            "INSERT OR IGNORE INTO traversal_ancestry(namespace,generation,snapshot_id,root_id,folder_id,ancestor_id) "
+                            "VALUES(?,?,?,?,?,?)",
+                            (namespace, generation, rescan_snapshot_id, root_id, seed_folder, seed_folder),
+                        )
+                rescan_status = self._db.execute(
+                    "SELECT status FROM selection_snapshots WHERE namespace=? AND generation=? AND snapshot_id=?",
+                    (namespace, generation, rescan_snapshot_id),
+                ).fetchone()
+                if rescan_status is not None and rescan_status["status"] == "building":
+                    self._db.execute(
+                        "UPDATE stream_progress SET building_snapshot=?,listing_complete=0,phase='baselining',"
+                        "terminal_drain_token=NULL,terminal_drain_checkpoint_id=NULL,"
+                        "terminal_drain_acknowledged=0,terminal_drain_observation=NULL,updated_at=? "
+                        "WHERE namespace=?",
+                        (rescan_snapshot_id, _now_iso(), namespace),
+                    )
+            self._db.execute(
+                "INSERT OR IGNORE INTO materialized_pages(namespace,generation,page_id,page_kind,drain_observation,snapshot_id,input_token,next_token,terminal_token,rescan_snapshot_id) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (namespace, generation, page_id, page_kind, drain_observation, selected,
+                 input_token or "", next_token, terminal_token, rescan_snapshot_id),
+            )
+            for item_key, action, payload in obligations:
+                replay = self._db.execute(
+                    "SELECT observation_revision,status FROM page_obligation_outcomes "
+                    "WHERE namespace=? AND generation=? AND page_id=? AND item_key=? AND action=? "
+                    "ORDER BY observation_revision DESC LIMIT 1",
+                    (namespace, generation, page_id, item_key, action),
+                ).fetchone()
+                if replay is None:
+                    self._observe_work(
+                        namespace, generation, item_key, action, payload, page_id=page_id,
+                    )
+                elif replay["status"] == "pending":
+                    current = self._db.execute(
+                        "SELECT observation_revision,action FROM item_observations "
+                        "WHERE namespace=? AND generation=? AND item_key=?",
+                        (namespace, generation, item_key),
+                    ).fetchone()
+                    if (
+                        current
+                        and int(current["observation_revision"]) == int(replay["observation_revision"])
+                        and current["action"] == action
+                    ):
+                        self._db.execute(
+                            "INSERT OR IGNORE INTO pending_work(namespace,generation,item_key,action,"
+                            "observation_revision,payload,page_id,deadline_tracked,created_at,updated_at) "
+                            "VALUES(?,?,?,?,?,?,?,1,?,?)",
+                            (namespace, generation, item_key, action,
+                             int(replay["observation_revision"]),
+                             json.dumps(payload, separators=(",", ":")), page_id,
+                             _now_iso(), _now_iso()),
+                        )
+            # The page row, membership and traversal outcomes share this transaction. Replaying an
+            # already-materialized older page may repair its still-current work row, but must never
+            # reapply membership over a newer conflicting observation.
+            if existing_page is None:
+                for membership in membership_additions or []:
+                    provider_id, root_id, drive_id = membership[:3]
+                    parent_id = membership[3] if len(membership) > 3 else None
+                    existing = self._db.execute(
+                        "SELECT root_ids FROM selected_membership WHERE namespace=? AND generation=? AND snapshot_id=? AND provider_id=?",
+                        (namespace, generation, selected, provider_id),
+                    ).fetchone()
+                    roots = set(json.loads(existing["root_ids"])) if existing else set()
+                    roots.add(root_id)
+                    self._db.execute(
+                        "INSERT INTO selected_membership(namespace,generation,snapshot_id,provider_id,root_ids,drive_id,seen_at) "
+                        "VALUES(?,?,?,?,?,?,?) ON CONFLICT(namespace,generation,snapshot_id,provider_id) DO UPDATE SET "
+                        "root_ids=excluded.root_ids,drive_id=excluded.drive_id,seen_at=excluded.seen_at",
+                        (namespace, generation, selected, provider_id, json.dumps(sorted(roots)), drive_id, _now_iso()),
+                    )
+                    if parent_id:
+                        ancestors = self._db.execute(
+                            "SELECT ancestor_id FROM traversal_ancestry WHERE namespace=? AND generation=? "
+                            "AND snapshot_id=? AND root_id=? AND folder_id=?",
+                            (namespace, generation, selected, root_id, parent_id),
+                        ).fetchall()
+                        for ancestor in ancestors:
+                            self._db.execute(
+                                "INSERT OR IGNORE INTO membership_ancestry(namespace,generation,snapshot_id,provider_id,root_id,ancestor_id) "
+                                "VALUES(?,?,?,?,?,?)",
+                                (namespace, generation, selected, provider_id, root_id, ancestor["ancestor_id"]),
+                            )
+                for provider_id in membership_removals or []:
+                    self._db.execute(
+                        "DELETE FROM selected_membership WHERE namespace=? AND generation=? AND snapshot_id=? AND provider_id=?",
+                        (namespace, generation, selected, provider_id),
+                    )
+                    self._db.execute(
+                        "DELETE FROM membership_ancestry WHERE namespace=? AND generation=? AND snapshot_id=? AND provider_id=?",
+                        (namespace, generation, selected, provider_id),
+                    )
+                for provider_id, root_id in membership_root_removals or []:
+                    row = self._db.execute(
+                        "SELECT root_ids FROM selected_membership WHERE namespace=? AND generation=? "
+                        "AND snapshot_id=? AND provider_id=?",
+                        (namespace, generation, selected, provider_id),
+                    ).fetchone()
+                    if row is None:
+                        continue
+                    roots = set(json.loads(row["root_ids"]))
+                    roots.discard(root_id)
+                    self._db.execute(
+                        "DELETE FROM membership_ancestry WHERE namespace=? AND generation=? AND snapshot_id=? "
+                        "AND provider_id=? AND root_id=?",
+                        (namespace, generation, selected, provider_id, root_id),
+                    )
+                    if roots:
+                        self._db.execute(
+                            "UPDATE selected_membership SET root_ids=?,seen_at=? WHERE namespace=? "
+                            "AND generation=? AND snapshot_id=? AND provider_id=?",
+                            (json.dumps(sorted(roots)), _now_iso(), namespace, generation, selected, provider_id),
+                        )
+                    else:
+                        self._db.execute(
+                            "DELETE FROM selected_membership WHERE namespace=? AND generation=? "
+                            "AND snapshot_id=? AND provider_id=?",
+                            (namespace, generation, selected, provider_id),
+                        )
+                for root_id, folder_id, drive_id, traversal_token in traversal_additions or []:
+                    self._db.execute(
+                        "INSERT OR IGNORE INTO traversal_queue(namespace,generation,snapshot_id,root_id,folder_id,drive_id,page_token) "
+                        "VALUES(?,?,?,?,?,?,?)",
+                        (namespace, generation, selected, root_id, folder_id, drive_id, traversal_token or ""),
+                    )
+                    parent_folder = traversal_completion[1] if traversal_completion is not None else root_id
+                    ancestors = self._db.execute(
+                        "SELECT ancestor_id FROM traversal_ancestry WHERE namespace=? AND generation=? "
+                        "AND snapshot_id=? AND root_id=? AND folder_id=?",
+                        (namespace, generation, selected, root_id, parent_folder),
+                    ).fetchall()
+                    for ancestor_id in [folder_id, *(row["ancestor_id"] for row in ancestors)]:
+                        self._db.execute(
+                            "INSERT OR IGNORE INTO traversal_ancestry(namespace,generation,snapshot_id,root_id,folder_id,ancestor_id) "
+                            "VALUES(?,?,?,?,?,?)",
+                            (namespace, generation, selected, root_id, folder_id, ancestor_id),
+                        )
+                if traversal_completion is not None:
+                    root_id, folder_id, traversal_token = traversal_completion
+                    self._db.execute(
+                        "UPDATE traversal_queue SET completed_at=? WHERE namespace=? AND generation=? "
+                        "AND snapshot_id=? AND root_id=? AND folder_id=? AND page_token=?",
+                        (_now_iso(), namespace, generation, selected, root_id, folder_id,
+                         traversal_token or ""),
+                    )
+            self._db.commit()
+        except Exception:
+            self._db.rollback()
+            raise
+        page = self.get_page(namespace, generation, page_id)
+        if page is None:  # pragma: no cover
+            raise RuntimeError("failed to materialize provider page")
+        return page
+
+    def get_page(self, namespace: str, generation: int, page_id: str) -> MaterializedPage | None:
+        row = self._db.execute(
+            "SELECT * FROM materialized_pages WHERE namespace=? AND generation=? AND page_id=?",
+            (namespace, generation, page_id),
+        ).fetchone()
+        return MaterializedPage(
+            row["namespace"], row["generation"], row["page_id"], row["page_kind"],
+            int(row["drain_observation"] or 0), row["input_token"], row["next_token"],
+            row["terminal_token"], row["committed_at"],
+            row["snapshot_id"], row["rescan_snapshot_id"],
+        ) if row else None
+
+    def next_uncommitted_page(self, namespace: str, generation: int,
+                              *, snapshot_id: int | None = None) -> MaterializedPage | None:
+        sql = (
+            "SELECT page_id FROM materialized_pages WHERE namespace=? AND generation=? "
+            "AND committed_at IS NULL"
+        )
+        args: list[Any] = [namespace, generation]
+        if snapshot_id is not None:
+            sql += " AND snapshot_id=?"
+            args.append(snapshot_id)
+        sql += " ORDER BY materialized_at,rowid LIMIT 1"
+        row = self._db.execute(sql, args).fetchone()
+        return self.get_page(namespace, generation, row["page_id"]) if row else None
+
+    def commit_page(self, namespace: str, generation: int, page_id: str,
+                    *, require_acks: bool = True) -> None:
+        if require_acks and self.page_pending_count(namespace, generation, page_id):
+            raise RuntimeError("cannot commit provider page with unacknowledged obligations")
+        page = self.get_page(namespace, generation, page_id)
+        if page and page.rescan_snapshot_id is not None and not self.snapshot_complete(
+            namespace, generation, page.rescan_snapshot_id,
+        ):
+            raise RuntimeError("cannot commit provider page before its subtree rescan publishes")
+        self._db.execute(
+            "UPDATE materialized_pages SET committed_at=coalesce(committed_at,?) "
+            "WHERE namespace=? AND generation=? AND page_id=?",
+            (_now_iso(), namespace, generation, page_id),
+        )
+        self._db.commit()
+
+    # -- stream serialization ------------------------------------------------
+    def acquire_lease(self, namespace: str, *, ttl_seconds: int = 300) -> tuple[str, int] | None:
+        """Acquire one fenced local-worker lease, or return None while another owner is live."""
+        from datetime import timedelta
+
+        owner = secrets.token_hex(16)
+        now = datetime.now(timezone.utc)
+        until = (now + timedelta(seconds=max(30, ttl_seconds))).isoformat()
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._db.execute(
+                "SELECT owner,fence,lease_until FROM stream_leases WHERE namespace=?", (namespace,)
+            ).fetchone()
+            if row and datetime.fromisoformat(row["lease_until"]) > now:
+                self._db.rollback()
+                return None
+            fence = (int(row["fence"]) + 1) if row else 1
+            self._db.execute(
+                "INSERT INTO stream_leases(namespace,owner,fence,lease_until) VALUES(?,?,?,?) "
+                "ON CONFLICT(namespace) DO UPDATE SET owner=excluded.owner,fence=excluded.fence,lease_until=excluded.lease_until",
+                (namespace, owner, fence, until),
+            )
+            self._db.commit()
+            return owner, fence
+        except Exception:
+            self._db.rollback()
+            raise
+
+    def renew_lease(self, namespace: str, owner: str, fence: int, *, ttl_seconds: int = 300) -> bool:
+        from datetime import timedelta
+
+        until = (datetime.now(timezone.utc) + timedelta(seconds=max(30, ttl_seconds))).isoformat()
+        cur = self._db.execute(
+            "UPDATE stream_leases SET lease_until=? WHERE namespace=? AND owner=? AND fence=?",
+            (until, namespace, owner, fence),
+        )
+        self._db.commit()
+        return cur.rowcount == 1
+
+    def release_lease(self, namespace: str, owner: str, fence: int) -> None:
+        self._db.execute(
+            "UPDATE stream_leases SET lease_until=? WHERE namespace=? AND owner=? AND fence=?",
+            ("1970-01-01T00:00:00+00:00", namespace, owner, fence),
+        )
+        self._db.commit()
+
+
+def verification_hash(token: str) -> str:
+    return _token_hash(token)
+
+
+def _token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _instant(value: object) -> datetime:
+    """An ISO instant for ordering; an unparseable value sorts first, so it never outranks a real one."""
+    try:
+        at = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    return at if at.tzinfo is not None else at.replace(tzinfo=timezone.utc)
+
+
+def _unexpired(value: object, *, now: datetime | None = None) -> bool:
+    """True only for a parseable expiration strictly in the future; anything else is expired."""
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        at = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=timezone.utc)
+    return at > (now or datetime.now(timezone.utc))

@@ -3,14 +3,39 @@ import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { once } from "node:events";
 import type { TestProject } from "vitest/node";
+import neo4j from "neo4j-driver";
 import { BASE_URL, HTTP_TEST_PORT as PORT } from "./server-url";
-import { queryServerEnv, startFakeGraphiti, startFakeLlm, type FakeServer } from "./fake-providers";
+import { neo4jTestTarget, queryServerEnv, startFakeGraphiti, startFakeLlm, type FakeServer } from "./fake-providers";
 
 // Global setup for the OPT-IN TIERRET-1 query harness ONLY (vitest.tierret1-query.config.ts). The
-// ordinary HTTP tier keeps test/http/global-setup.ts and its no-LLM server; this one starts the two
-// loopback fakes FIRST, then boots `next start` with LLM_BASE_URL / GRAPHITI_URL pinned to them and
+// ordinary HTTP tier keeps test/http/global-setup.ts and its no-LLM server; this one checks the
+// isolated test Neo4j is up, starts the two loopback fakes, then boots `next start` with
+// LLM_BASE_URL / GRAPHITI_URL pinned to the fakes, NEO4J_* pinned to the loopback test Neo4j, and
 // every cloud credential blanked (fake-providers.ts#queryServerEnv), so the real /api/v1/query route
-// streams a real answer without any paid or external call.
+// streams a real answer, reading the graph the production way, without any paid or external call.
+//
+// LOCAL PREREQUISITE: `npm run db:test:neo4j:up` (compose.test.neo4j.yml). CI's HTTP job runs the
+// same image as a service. The suite seeds and deletes only its own teams' graph rows, so the shared
+// test Neo4j is never wiped.
+
+/** Fail before booting anything when the isolated test Neo4j is not reachable: otherwise every
+ *  graph-scoped query would surface as the route's deliberate fail-closed 503. */
+async function requireTestNeo4j(): Promise<void> {
+  const target = neo4jTestTarget();
+  const driver = neo4j.driver(target.url, neo4j.auth.basic(target.user, target.password), {
+    connectionTimeout: 5000,
+  });
+  try {
+    await driver.verifyConnectivity();
+  } catch (e) {
+    throw new Error(
+      `TIERRET-1 query harness: the isolated test Neo4j at ${target.url} is not reachable ` +
+        `(${e instanceof Error ? e.message : String(e)}). Run \`npm run db:test:neo4j:up\` first.`,
+    );
+  } finally {
+    await driver.close();
+  }
+}
 
 async function probe(): Promise<boolean> {
   try {
@@ -44,6 +69,7 @@ export default async function setup(project: TestProject): Promise<() => Promise
   if (await probe()) {
     throw new Error(`TIERRET-1 query harness: ${BASE_URL} is already serving — stop that server first`);
   }
+  await requireTestNeo4j();
 
   const fakes: FakeServer[] = [];
   let server: ChildProcess | null = null;
@@ -74,6 +100,7 @@ export default async function setup(project: TestProject): Promise<() => Promise
 
     project.provide("tierret1FakeLlmUrl", llm.url);
     project.provide("tierret1FakeGraphitiUrl", graphiti.url);
+    project.provide("tierret1Neo4j", neo4jTestTarget());
   } catch (e) {
     try { stop("SIGKILL"); } catch { /* already gone */ }
     await closeFakes();

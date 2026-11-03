@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { canReuseArcs } from "@/lib/graph/arcs";
+import { arcPriorForEpoch, canReuseArcs, type NarrativeArc } from "@/lib/graph/arcs";
 
 // Spec: the fact-set-hash STABILITY guard. The background refresh reuses the prior arcs (skips the
 // non-deterministic LLM) ONLY when the exact LLM input is byte-identical, there's no human correction,
@@ -37,5 +37,21 @@ describe("canReuseArcs (arc stability guard)", () => {
 
   it("never reuses an empty prior (a prior with 0 arcs isn't worth keeping)", () => {
     expect(canReuseArcs({ factsHash: "abc", arcCount: 0 }, "abc", false)).toBe(false);
+  });
+
+  it("never reuses or feeds prior prose from another authorization epoch", () => {
+    const oldArc = {
+      id: "old", title: "OLD EPOCH PROSE", summary: "must not become an input",
+      confidence: "high", participants: [], supporting_sources: [], evidence: [],
+      derived_at: new Date().toISOString(),
+    } satisfies NarrativeArc;
+    const prior = { arcs: [oldArc], factsHash: "abc", degraded: false, authorizationEpoch: 7 };
+
+    expect(canReuseArcs({ factsHash: "abc", arcCount: 1, authorizationEpoch: 7 }, "abc", false, 8)).toBe(false);
+    expect(arcPriorForEpoch(prior, 8)).toBeNull();
+    expect(JSON.stringify(arcPriorForEpoch(prior, 8))).not.toContain("OLD EPOCH PROSE");
+
+    expect(canReuseArcs({ factsHash: "abc", arcCount: 1, authorizationEpoch: 7 }, "abc", false, 7)).toBe(true);
+    expect(arcPriorForEpoch(prior, 7)).toBe(prior);
   });
 });

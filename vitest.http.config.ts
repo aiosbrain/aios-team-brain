@@ -42,8 +42,10 @@ export default defineConfig({
   test: {
     environment: "node",
     include: ["test/http/**/*.http.test.ts"],
-    // Boot one production server for the whole suite (not per file).
-    globalSetup: ["test/http/global-setup.ts"],
+    // First: mint this run's id and its run-safety state — `test/datamechanics/setup.ts` (reused
+    // below) refuses to truncate without it. Then boot one production server for the whole suite
+    // (not per file).
+    globalSetup: ["test/datamechanics/global-setup.ts", "test/http/global-setup.ts"],
     // Reuse the data-mechanics per-test truncation (TRUNCATE ... CASCADE clears the
     // same shared DB the server reads from).
     setupFiles: ["test/datamechanics/setup.ts"],

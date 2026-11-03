@@ -61,6 +61,7 @@ const STALE_MS_BY_SOURCE: Record<string, number | null> = {
   llm: null, // event-driven; not a banner leg at all since LLMOBS-1 — see NOT_PIPELINE_LEGS
   scan: null, // manual / CI
   pm_sync: null, // reactive — its own staleness heuristic lives in lib/pm-sync/runs
+  gdrive: null, // run ledger is team-scoped; connection progress supplies backlog/cursor diagnostics
   // One-time marker-guarded materialization (PRET-4): the tick retry writes a row ONLY on
   // failure (success is the boot log + the marker), so "no row for N hours" is its healthy
   // steady state forever — a staleness threshold can only cry wolf; a recorded FAILURE row
@@ -225,7 +226,14 @@ export function resolveBeatClock(args: {
  * ingested `items` are untouched — we only stop EXPECTING fresh syncs. Non-connector legs (llm,
  * dense, graph_*, meeting_notes, …) aren't integration-scoped and are never suppressed here.
  */
-const CONNECTOR_SOURCES: ReadonlySet<string> = new Set(["slack", "plane", "linear", "github"]);
+const CONNECTOR_SOURCES: ReadonlySet<string> = new Set(["slack", "plane", "linear", "github", "gdrive"]);
+// `gdrive` (AIO-1167 r37): a paused or disconnected Drive connection stops being polled, so a failure
+// recorded before the pause is frozen exactly like a deleted connector's. The orphan suppression
+// applies only when NO enabled Drive connection remains: while any is enabled, the source-wide
+// `gdrive` leg is never suppressed here. That is all it guarantees. The leg is ONE team-scoped
+// streak over every Drive connection's runs, so one enabled connection's failures can be broken —
+// and kept off the banner — by another connection's successes; per-connection failure is shown in
+// Admin's per-connection coordinator status, not by this banner.
 
 /**
  * Sources this banner does NOT speak for (LLMOBS-1). The banner's sentence is "N ingestion legs are

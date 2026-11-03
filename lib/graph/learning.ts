@@ -56,6 +56,9 @@ export interface AtomicFact {
   subject: string;
   object: string;
   episodeUuids: string[]; // source episodes (→ event grouping in Layer 2)
+  /** Immutable partition carried by the relationship itself. Multi-partition readers must retain
+   * this value so an authorized episode in one audience cannot authorize prose from another. */
+  groupId?: string;
 }
 
 /**
@@ -67,7 +70,9 @@ export interface AtomicFact {
 export async function recentFacts(
   groups: string[],
   sinceISO: string | null,
-  limit = 15
+  limit = 15,
+  offset = 0,
+  terms: readonly string[] = [],
 ): Promise<{ facts: AtomicFact[]; ok: boolean }> {
   // Not configured / no groups is a legitimate empty, not a failure — same distinction as
   // `resolveEpisodeItems`. Keeping the two legs of this module symmetric is the point: they feed the
@@ -79,14 +84,17 @@ export async function recentFacts(
     `MATCH (a:Entity)-[r:RELATES_TO]->(b:Entity)
      WHERE r.group_id IN $groups
        ${FACT_NOISE_FILTER}${withSince ? ` AND ${workTs("r")} >= datetime($since)` : ""}
+       ${terms.length > 0 ? " AND any(term IN $terms WHERE toLower(coalesce(r.fact,'') + ' ' + coalesce(a.name,'') + ' ' + coalesce(b.name,'')) CONTAINS term)" : ""}
      RETURN r.uuid AS id,
             r.fact AS fact,
             toString(${workTs("r")}) AS at,
             head([l IN labels(a) WHERE l <> 'Entity']) AS subjectType,
             a.name AS subject,
             b.name AS object,
-            r.episodes AS episodeUuids
+            r.episodes AS episodeUuids,
+            r.group_id AS groupId
      ORDER BY ${workTs("r")} DESC, r.uuid DESC
+     SKIP toInteger($offset)
      LIMIT toInteger($limit)`;
   const query = async (withSince: boolean): Promise<AtomicFact[]> => {
     const rows = await runRead<{
@@ -97,7 +105,8 @@ export async function recentFacts(
       subject: string | null;
       object: string | null;
       episodeUuids: string[] | null;
-    }>(factsCypher(withSince), { groups, since: sinceISO, limit });
+      groupId: string | null;
+    }>(factsCypher(withSince), { groups, since: sinceISO, limit, offset, terms });
     return rows.map((r) => ({
       id: r.id,
       fact: r.fact,
@@ -106,6 +115,7 @@ export async function recentFacts(
       subject: r.subject ?? "",
       object: r.object ?? "",
       episodeUuids: Array.isArray(r.episodeUuids) ? r.episodeUuids : [],
+      groupId: r.groupId ?? undefined,
     }));
   };
   try {
@@ -178,6 +188,8 @@ export interface GraphEvent {
   participants: string[];
   facts: string[];
   factCount: number;
+  /** Complete relationship provenance retained for the authoritative API gate. Never serialized. */
+  factEvidence?: Array<{ id: string; fact: string; episodeUuids: string[]; groupId: string }>;
 }
 
 /**
@@ -185,12 +197,12 @@ export interface GraphEvent {
  * is one ingested item (its `name` is `items:<id>`); we return its mentioned entities (participants)
  * and the facts extracted from it, so the panel can group facts by the event that produced them.
  */
-export async function recentEvents(
+export async function recentEventsWithStatus(
   groups: string[],
   sinceISO: string,
   limit = 30
-): Promise<GraphEvent[]> {
-  if (!neo4jConfigured() || groups.length === 0) return [];
+): Promise<{ events: GraphEvent[]; ok: boolean }> {
+  if (!neo4jConfigured() || groups.length === 0) return { events: [], ok: true };
   // `withSince` gates ONLY the time bound; both group_id tier filters are present either way.
   const eventsCypher = (withSince: boolean) =>
     `MATCH (ep:Episodic)
@@ -202,7 +214,7 @@ export async function recentEvents(
             ep.source_description AS title, toString(${workTs("ep")}) AS at,
             ${workTs("ep")} AS sortAt,
             collect(DISTINCT p.name) AS participants,
-            collect(DISTINCT r.fact) AS facts
+            collect(DISTINCT {id: r.uuid, fact: r.fact, episodeUuids: r.episodes, groupId: r.group_id}) AS factEvidence
      ORDER BY sortAt DESC
      LIMIT toInteger($limit)`;
   const query = async (withSince: boolean): Promise<GraphEvent[]> => {
@@ -213,12 +225,23 @@ export async function recentEvents(
       title: string | null;
       at: string;
       participants: (string | null)[] | null;
-      facts: (string | null)[] | null;
+      factEvidence: Array<{
+        id: string | null;
+        fact: string | null;
+        episodeUuids: string[] | null;
+        groupId: string | null;
+      }> | null;
     }>(eventsCypher(withSince), { groups, since: sinceISO, limit });
     return rows.map((r) => {
       const name = r.name ?? "";
       const participants = (r.participants ?? []).filter((x): x is string => !!x);
-      const facts = (r.facts ?? []).filter((x): x is string => !!x);
+      const factEvidence = (r.factEvidence ?? []).flatMap((entry) => (
+        entry.id && entry.fact && entry.groupId
+          ? [{ id: entry.id, fact: entry.fact, groupId: entry.groupId,
+              episodeUuids: Array.isArray(entry.episodeUuids) ? entry.episodeUuids : [] }]
+          : []
+      ));
+      const facts = factEvidence.map((entry) => entry.fact);
       return {
         id: r.id,
         itemId: itemIdFromEpisodeName(name) ?? null, // tolerant of the `#<chunk>` suffix on split items
@@ -228,14 +251,25 @@ export async function recentEvents(
         participants,
         facts,
         factCount: facts.length,
+        factEvidence,
       };
     });
   };
   try {
     const windowed = await query(true);
     // Same sparse-data fallback as recentFacts — most-recent-N when the window is empty.
-    return windowed.length > 0 ? windowed : await query(false);
-  } catch {
-    return [];
+    return { events: windowed.length > 0 ? windowed : await query(false), ok: true };
+  } catch (error) {
+    console.error("[graph] recentEvents failed:", error instanceof Error ? error.message : error);
+    return { events: [], ok: false };
   }
+}
+
+/** Backwards-compatible learning-panel helper. Security-sensitive routes use the status form. */
+export async function recentEvents(
+  groups: string[],
+  sinceISO: string,
+  limit = 30,
+): Promise<GraphEvent[]> {
+  return (await recentEventsWithStatus(groups, sinceISO, limit)).events;
 }

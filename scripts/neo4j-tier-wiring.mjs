@@ -78,6 +78,58 @@ function composeProbe(hc) {
   return typeof t === "string" ? t : null;
 }
 
+/** How a CI `services.neo4j` entry differs from the compose service: image, auth, bolt port, and
+ *  the authenticated health probe with its timings. One owner for every job that mirrors compose. */
+function serviceDrift(svc, ref) {
+  const v = [];
+  if (svc.image !== ref.image) v.push("image-drift");
+  const refAuth = composeAuth(ref);
+  if (String(svc.env?.NEO4J_AUTH ?? "") !== String(refAuth ?? "")) v.push("auth-drift");
+  const refBolt = (ref.ports ?? []).map(String).find((p) => p.endsWith(":7687"));
+  if (!(svc.ports ?? []).map(String).includes(String(refBolt))) v.push("port-drift");
+  const h = parseHealthOptions(svc.options);
+  const probe = composeProbe(ref.healthcheck);
+  // EQUALITY after whitespace normalization, not `includes` (Codex diff review L1: `true #
+  // cypher-shell …` would have passed `includes` while /bin/sh commented the probe out).
+  const norm = (x) => String(x ?? "").trim().replace(/\s+/g, " ");
+  if (!h.cmd || !probe || norm(h.cmd) !== norm(probe)) v.push("health-cmd-drift");
+  for (const k of ["interval", "timeout", "retries"]) {
+    if (String(h[k] ?? "") !== String(ref.healthcheck?.[k] ?? "")) v.push(`health-${k}-drift`);
+  }
+  return v;
+}
+
+/**
+ * AIO-1167 — the TIERRET-1 query harness reads the graph the way production does: retrieval's graph
+ * leg goes to Neo4j (provenance-complete reads), never Graphiti `/search`. Its server is pointed at
+ * the SAME isolated test Neo4j as the tier above (test/http/fake-providers.ts derives the loopback
+ * URL and test credentials from compose), so the HTTP job that runs it must carry that service, with
+ * the compose image/auth/bolt port and authenticated health probe — a missing or unhealthy service
+ * would turn the suite's positive graph contract into a fail-closed 503, or worse, point it nowhere.
+ * Codes are prefixed `tierret1-` so they cannot be confused with the dedicated tier job's.
+ */
+export const TIERRET1_JOB_ID = "http-tests";
+export const TIERRET1_RUN_STEP = "npm run test:http:tierret1-query";
+
+export function validateTierret1Neo4jWiring(ci, compose) {
+  const job = ci?.jobs?.[TIERRET1_JOB_ID];
+  if (!job) return ["tierret1-job-missing"];
+  const v = [];
+  const steps = Array.isArray(job.steps) ? job.steps : [];
+  if (!steps.some((s) => typeof s?.run === "string" && s.run.trim() === TIERRET1_RUN_STEP)) v.push("tierret1-run-step-missing");
+  // The harness pins the server's NEO4J_* itself (compose-derived, loopback); a job- or step-level
+  // NEO4J_* would hand some OTHER process in this job — the ordinary tier's server, the build — a
+  // graph it was never meant to read.
+  const envs = [job.env, ...steps.map((s) => s?.env)].filter((e) => e && typeof e === "object");
+  if (envs.some((e) => Object.keys(e).some((k) => k.startsWith("NEO4J_")))) v.push("tierret1-neo4j-env-leak");
+  const svc = job.services?.neo4j;
+  const ref = compose?.services?.neo4j;
+  if (!ref) v.push("tierret1-compose-service-missing");
+  if (!svc) v.push("tierret1-service-missing");
+  else if (ref) v.push(...serviceDrift(svc, ref).map((code) => `tierret1-${code}`));
+  return v;
+}
+
 export function validateNeo4jTierWiring(ci, compose, pkg) {
   const v = [];
   const job = ci?.jobs?.[JOB_ID];
@@ -112,20 +164,7 @@ export function validateNeo4jTierWiring(ci, compose, pkg) {
   if (!svc) {
     v.push("service-missing");
   } else if (ref) {
-    if (svc.image !== ref.image) v.push("image-drift");
-    const refAuth = composeAuth(ref);
-    if (String(svc.env?.NEO4J_AUTH ?? "") !== String(refAuth ?? "")) v.push("auth-drift");
-    const refBolt = (ref.ports ?? []).map(String).find((p) => p.endsWith(":7687"));
-    if (!(svc.ports ?? []).map(String).includes(String(refBolt))) v.push("port-drift");
-    const h = parseHealthOptions(svc.options);
-    const probe = composeProbe(ref.healthcheck);
-    // EQUALITY after whitespace normalization, not `includes` (Codex diff review L1: `true #
-    // cypher-shell …` would have passed `includes` while /bin/sh commented the probe out).
-    const norm = (x) => String(x ?? "").trim().replace(/\s+/g, " ");
-    if (!h.cmd || !probe || norm(h.cmd) !== norm(probe)) v.push("health-cmd-drift");
-    for (const k of ["interval", "timeout", "retries"]) {
-      if (String(h[k] ?? "") !== String(ref.healthcheck?.[k] ?? "")) v.push(`health-${k}-drift`);
-    }
+    v.push(...serviceDrift(svc, ref));
   }
 
   const script = pkg?.scripts?.["test:neo4j"];

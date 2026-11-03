@@ -23,6 +23,8 @@ import {
 } from "@/lib/access/admission";
 import { readableProjectRows, canReadProjectRow } from "@/lib/access/enforce";
 import { purgeAdmissionTimelineNamespace, timelineViewKey } from "@/lib/dashboard/timeline-cache";
+import { AttributionRepairPendingError } from "@/lib/access/authorization-epoch";
+import { repairAttributionNow } from "@/lib/ingest/reconcile-attribution";
 
 /**
  * TIERRET-1 — the ONE positive, fail-closed member-content admission resolver (AC-03/AC-04) and
@@ -370,21 +372,50 @@ describe("TIERRET-1 AC-12 — timeline cache: new namespace, v16, admission-sepa
   afterEach(async () => {
     await settleTimelineRefreshes();
   });
-  async function timelineFixture() {
+  const repairStatus = async (seed: Seed) =>
+    ((await db().from("team_identity_authority").select("repair_status").eq("team_id", seed.teamId).single()).data as { repair_status: string }).repair_status;
+
+  /**
+   * The timeline cache is read behind the attribution fence: while the team's identity repair is
+   * unfinished the read refuses (`AttributionRepairPendingError`), by design. `fixture()` leaves one
+   * unfinished — it adds a member, and activates them, on a team that already has content, and each
+   * roster write on such a team enqueues a repair. So a timeline case first runs that repair to
+   * completion, AFTER its last roster write and its content exist: the production bounded repair,
+   * not a status written by hand. Required, not assumed — a fixture that silently stayed pending
+   * turned every case below into the fence's refusal.
+   */
+  async function convergeIdentityRepair(seed: Seed): Promise<void> {
+    expect(await repairStatus(seed), "the fixture's roster writes left a repair to converge").not.toBe("complete");
+    const outcome = await repairAttributionNow(db(), seed.teamId, seed.teamSlug, { maxBatches: 20, batchSize: 100 });
+    expect(outcome.status, "the identity repair must converge inside its bounded budget").toBe("complete");
+    expect(await repairStatus(seed)).toBe("complete");
+  }
+
+  /** `converged: false` keeps the repair the fixture enqueued PENDING — the fence's own case. */
+  async function timelineFixture(opts: { converged?: boolean } = {}) {
     const F = await fixture();
     const now = new Date().toISOString();
     const c = await ingest(F.seed, { path: "commits/xc.md", body: "feat: xenolith work (LX-1)", access: "team", project: "src", kind: "deliverable", frontmatter: { source: "git", author: "t" } });
     await backfillTeamContext(db(), F.seed.teamId);
     await moveMembership(F.seed, c.id, F.X);
     await db().from("items").update({ member_id: F.seed.memberId, work_at: now, work_at_from_source: true }).eq("id", c.id);
+    if (opts.converged ?? true) {
+      await convergeIdentityRepair(F.seed);
+      // The repair re-applies current identity mappings; it must not have moved the credit this
+      // fixture gave the commit, or the cases below would be reading someone else's work.
+      const { data: credited } = await db().from("items").select("member_id").eq("id", c.id).single();
+      expect((credited as { member_id: string | null }).member_id).toBe(F.seed.memberId);
+    }
     return { F, commitId: c.id };
   }
   const keysOf = async (teamId: string) =>
     (((await db().from("work_timeline_cache").select("group_key, payload").eq("team_id", teamId)).data ?? []) as { group_key: string; payload: { v: number } }[]);
 
-  it("cold then warm: the granted content is served under adm:<class>:<tier>:<hash> at payload v16", async () => {
+  it("cold then warm: the granted content is served under adm:<class>:<tier>:<hash> at the current payload version", async () => {
     const { F } = await timelineFixture();
-    expect(PAYLOAD_VERSION, "15 is reserved by PR 714").toBe(16);
+    // 16 was TIERRET-1's own bump; AIO-1167's Drive-ledger meaning change takes 18 (17 is reserved
+    // by PR 714). The `adm:` namespace, not the number, is what this case is about.
+    expect(PAYLOAD_VERSION, "17 is reserved by PR 714").toBe(18);
     const cold = await getCachedWorkTimeline(db(), F.seed.teamId, "external", F.external);
     await settleTimelineRefreshes();
     const warm = await getCachedWorkTimeline(db(), F.seed.teamId, "external", F.external);
@@ -392,7 +423,7 @@ describe("TIERRET-1 AC-12 — timeline cache: new namespace, v16, admission-sepa
     const rows = await keysOf(F.seed.teamId);
     const key = await timelineViewKey(db(), F.seed.teamId, "external", F.external);
     expect(key.startsWith("adm:"), key).toBe(true);
-    expect(rows.find((r) => r.group_key === key)?.payload.v).toBe(16);
+    expect(rows.find((r) => r.group_key === key)?.payload.v).toBe(PAYLOAD_VERSION);
   });
 
   it("revoking the grant moves the member to a different variant that no longer names the work", async () => {
@@ -418,8 +449,34 @@ describe("TIERRET-1 AC-12 — timeline cache: new namespace, v16, admission-sepa
       },
       rpc: real.rpc.bind(real),
     } as unknown as ReturnType<typeof db>;
-    await expect(getCachedWorkTimeline(broken, F.seed.teamId, "external", F.external)).rejects.toThrow();
+    const failure = await getCachedWorkTimeline(broken, F.seed.teamId, "external", F.external).then(() => null, (error: unknown) => error);
+    // It is the ADMISSION read that failed. With the repair converged the fence is open, so this is
+    // not the fence's refusal standing in for the error this case is about.
+    expect(failure).toBeInstanceOf(Error);
+    expect(failure).not.toBeInstanceOf(AttributionRepairPendingError);
     expect((await keysOf(F.seed.teamId)).filter((r) => r.group_key.startsWith("adm:"))).toEqual([]);
+    // Control: the same read through the unbroken client serves, so the refusal was the broken read's.
+    expect(JSON.stringify((await getCachedWorkTimeline(db(), F.seed.teamId, "external", F.external)).days)).toContain("xenolith work");
+  });
+
+  it("identity repair PENDING: the timeline read refuses with the named fence error and writes no cache row; the bounded repair then opens it", async () => {
+    // The negative the converged fixture must not erase: the fence itself. Same fixture, same
+    // content, same grant — only the repair the roster writes enqueued has not been run.
+    const { F } = await timelineFixture({ converged: false });
+    expect(await repairStatus(F.seed)).toBe("pending");
+    await expect(getCachedWorkTimeline(db(), F.seed.teamId, "external", F.external)).rejects.toBeInstanceOf(AttributionRepairPendingError);
+    await settleTimelineRefreshes();
+    expect((await keysOf(F.seed.teamId)).filter((r) => r.group_key.startsWith("adm:")), "a fenced read publishes no variant").toEqual([]);
+    expect(await repairStatus(F.seed), "a refused read does not complete, or otherwise move, the repair").toBe("pending");
+
+    // The actual bounded repair, to completion — and only then does the same read serve and publish.
+    await convergeIdentityRepair(F.seed);
+    const cold = await getCachedWorkTimeline(db(), F.seed.teamId, "external", F.external);
+    await settleTimelineRefreshes();
+    const warm = await getCachedWorkTimeline(db(), F.seed.teamId, "external", F.external);
+    for (const r of [cold, warm]) expect(JSON.stringify(r.days)).toContain("xenolith work");
+    const key = await timelineViewKey(db(), F.seed.teamId, "external", F.external);
+    expect((await keysOf(F.seed.teamId)).map((r) => r.group_key)).toContain(key);
   });
 
   it("external→team reclassification removes the external member's new-namespace variant before it can serve the narrowed title", async () => {
@@ -428,6 +485,8 @@ describe("TIERRET-1 AC-12 — timeline cache: new namespace, v16, admission-sepa
     const e = await ingest(F.seed, { path: "commits/ext.md", body: "feat: shared cobaltine work", access: "external", project: "src", kind: "deliverable", frontmatter: { source: "git", author: "t" } });
     await backfillTeamContext(db(), F.seed.teamId);
     await db().from("items").update({ member_id: F.seed.memberId, work_at: now, work_at_from_source: true }).eq("id", e.id);
+    // Roster writes and content are in place: run the repair they enqueued before any fenced read.
+    await convergeIdentityRepair(F.seed);
     expect(JSON.stringify((await getCachedWorkTimeline(db(), F.seed.teamId, "external", F.external)).days)).toContain("cobaltine");
     await settleTimelineRefreshes();
     // Narrow through the production ingest path (reclassify → tier invalidation).

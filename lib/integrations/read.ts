@@ -56,6 +56,29 @@ export async function listIntegrations(
 }
 
 /**
+ * The TYPE of one of this team's integrations, or null when the team has no such row (or the viewer
+ * may not manage integrations). Metadata only — used by an Admin action to refuse a type-specific
+ * write before making it (AIO-1167 R43 F1: a Drive credential is never replaced by a pasted secret).
+ * A row's type never changes, so the answer cannot go stale before that write.
+ */
+export async function getIntegrationType(
+  db: DbClient,
+  teamId: string,
+  id: string,
+  viewer: IntegrationsViewer
+): Promise<IntegrationType | null> {
+  if (!canManageIntegrations(viewer.role)) return null;
+  const { data, error } = await db
+    .from("integrations")
+    .select("type")
+    .eq("id", id)
+    .eq("team_id", teamId)
+    .maybeSingle();
+  if (error) throw new Error(`integration type read failed: ${error.message}`);
+  return data ? ((data as { type: IntegrationType }).type) : null;
+}
+
+/**
  * Resolve a team-slug + auth-user into an admin write context, or null. This is the DB-level
  * half of the dashboard's `requireAdmin` gate (the session lookup happens in the server action):
  * it returns `{ teamId, memberId }` ONLY when the user is an `active`, `role==="admin"` member of

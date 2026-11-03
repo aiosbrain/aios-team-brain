@@ -107,6 +107,21 @@ export function mergeArcPair(survivor: NarrativeArc, absorbed: NarrativeArc): Na
     .map((s) => s.trim())
     .filter(Boolean)
     .reduce((acc, s) => (acc === "" || acc.includes(s) ? acc || s : `${acc} ${s}`), "");
+  const sourceItemIds = [
+    ...(survivor.source_provenance?.item_ids ?? []),
+    ...(absorbed.source_provenance?.item_ids ?? []),
+  ];
+  const correctionRevisionIds = [
+    ...(survivor.source_provenance?.correction_revision_ids ?? []),
+    ...(absorbed.source_provenance?.correction_revision_ids ?? []),
+  ];
+  const source_provenance = {
+    state: survivor.source_provenance?.state === "complete" && absorbed.source_provenance?.state === "complete"
+      ? "complete" as const
+      : "incomplete" as const,
+    item_ids: [...new Set(sourceItemIds)].sort(),
+    correction_revision_ids: [...new Set(correctionRevisionIds)].sort(),
+  };
   return {
     ...survivor,
     confidence:
@@ -117,6 +132,7 @@ export function mergeArcPair(survivor: NarrativeArc, absorbed: NarrativeArc): Na
     participants: [...new Set([...survivor.participants, ...absorbed.participants])],
     supporting_sources: [...new Set([...survivor.supporting_sources, ...absorbed.supporting_sources])],
     evidence: [...evidence.values()],
+    source_provenance,
     ...(supersedes.length ? { supersedes } : {}),
   };
 }
