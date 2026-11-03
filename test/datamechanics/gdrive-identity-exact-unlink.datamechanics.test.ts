@@ -156,6 +156,47 @@ describe("A5 — exact padded legacy Google email unlink through the Admin actio
     await unchanged();
   });
 
+  it("a remap committed while the exact unlink waits on the identity authority wins: nothing is removed", async () => {
+    const seed = await admin();
+    const address = `cy-${randomUUID().slice(0, 6)}@example.com`;
+    const cy = await member(seed, "cy", address);
+    const dee = await member(seed, "dee", `dee-${randomUUID().slice(0, 6)}@example.com`);
+    const legacy = ` Author-Email: ${address.toUpperCase()}`;
+    await rawLink(seed.teamId, cy, "gdrive", legacy);
+
+    const holder = await getPool().connect();
+    let unlinking: Promise<{ ok: boolean; error?: string }> | undefined;
+    try {
+      // Another identity writer holds the team identity authority and remaps the exact row to Dee.
+      await holder.query("begin");
+      await holder.query("select pg_advisory_xact_lock(hashtextextended($1, 0))", [`${seed.teamId}:identity-authority`]);
+      unlinking = unlinkMemberIdentity(seed.teamSlug, "gdrive", legacy, { memberId: cy, revision: 0 });
+      let waiting = 0;
+      for (let tries = 0; tries < 320 && waiting === 0; tries++) {
+        const { rows } = await getPool().query<{ n: number }>(
+          "select count(*)::int as n from pg_stat_activity where datname=current_database() and wait_event_type='Lock'");
+        waiting = rows[0].n;
+        if (waiting === 0) await new Promise((r) => setTimeout(r, 25));
+      }
+      expect(waiting, "the unlink is parked on the identity authority").toBeGreaterThan(0);
+      await holder.query(
+        "update member_identities set member_id=$3 where team_id=$1 and provider='gdrive' and external_id=$2",
+        [seed.teamId, legacy, dee]);
+      await holder.query(
+        "insert into member_identity_mapping_state(team_id,provider,external_id,member_id,revision,state) values ($1,'gdrive',$2,$3,1,'linked')",
+        [seed.teamId, legacy, dee]);
+      await holder.query("commit");
+    } finally {
+      await holder.query("rollback").catch(() => undefined);
+      holder.release();
+    }
+    const result = await unlinking!;
+    expect(result.ok).toBe(false); // the displayed holder and revision are stale now
+    expect(await rows(seed.teamId)).toEqual([{ provider: "gdrive", external_id: legacy, member_id: dee }]);
+    expect(await states(seed.teamId)).toEqual([{ external_id: legacy, state: "linked", revision: 1 }]);
+    expect(await removalAudits(seed.teamId)).toEqual([]);
+  }, 30_000);
+
   it("validation and other providers keep their semantics", async () => {
     const seed = await admin();
     const alice = await member(seed, "alice", `alice-${randomUUID().slice(0, 6)}@example.com`);

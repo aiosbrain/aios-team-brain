@@ -280,16 +280,20 @@ def _restrict_operation(
 
 
 def _restriction_evidence(
-    state: StateStore, execution: GdriveExecution, *, local: bool = True,
+    state: StateStore, execution: GdriveExecution, *, local: bool = True, local_holds: bool = True,
 ) -> dict[str, dict[str, Any]]:
     """Every provider minimum known for this connection: the brain's acknowledged evidence for
-    every verified account, merged with this sidecar's local journal (``local``), monotonically."""
+    every verified account, merged with this sidecar's local journal (``local``), monotonically.
+    ``local_holds=False`` merges only the local RESOURCE/operation minima: the acknowledged account
+    holds are carried unchanged and a merely local account hold is left for its own publication
+    owner (AIO-1167 final review A4 — a late watch quota publishes on the next fresh acquisition)."""
     evidence = parse_restriction_evidence(execution.progress)
     if local:
         for account in state.restriction_credentials(execution.integration_id):
-            add_hold(evidence, account, state.connection_hold(
-                execution.integration_id, execution.generation, account,
-            ))
+            if local_holds:
+                add_hold(evidence, account, state.connection_hold(
+                    execution.integration_id, execution.generation, account,
+                ))
             for provider_id, held in state.document_restrictions(
                 execution.integration_id, execution.generation, account,
             ).items():
@@ -298,7 +302,7 @@ def _restriction_evidence(
 
 
 def _restriction_sections(
-    state: StateStore, execution: GdriveExecution, credential: str,
+    state: StateStore, execution: GdriveExecution, credential: str, *, local_holds: bool = True,
 ) -> dict[str, Any]:
     """The three restriction sections a checkpoint of ``credential``'s worker publishes (R50).
 
@@ -307,7 +311,7 @@ def _restriction_sections(
     and nothing standing is dropped merely because this worker did not adopt it. Lapsed minimums are
     not republished; an unrepresentable one never lapses."""
     return restriction_sections(
-        _restriction_evidence(state, execution), credential=credential,
+        _restriction_evidence(state, execution, local_holds=local_holds), credential=credential,
         generation=int(execution.generation), standing=_restriction_standing,
     )
 
@@ -411,7 +415,7 @@ def _note_root_unavailable(summary: IngestSummary, kind: str, root_id: str) -> N
 
 async def _publish_restriction_evidence(
     client: BrainClient, execution: GdriveExecution, state: StateStore, credential: str,
-    total: IngestSummary,
+    total: IngestSummary, *, local_holds: bool = True,
 ) -> bool:
     """Publish the restriction sections onto the LATEST acknowledged document, changing nothing
     else, so no stream, root or watch the brain holds can regress. One attempt, never a loop.
@@ -421,8 +425,12 @@ async def _publish_restriction_evidence(
     uncertainty latch nothing is sent at all: only a fresh acquisition restores the revision
     (R47 F3). A terminal authority refusal is re-raised. Returns whether nothing is outstanding."""
     outstanding = _restriction_outstanding(state, execution)
+    if not local_holds:
+        outstanding = outstanding & {_RESOURCE_UNPUBLISHED}
     payload = copy.deepcopy(execution.progress)
-    apply_restriction_sections(payload, _restriction_sections(state, execution, credential))
+    apply_restriction_sections(
+        payload, _restriction_sections(state, execution, credential, local_holds=local_holds),
+    )
     if payload == execution.progress:
         return True  # the acknowledged document already carries every section
     if _progress_uncertain(client, execution):
@@ -2548,6 +2556,7 @@ async def _run_gdrive_stream_unlocked(
                         state.settle_root(execution.integration_id, generation, root_kind, root_id)
                 return held
 
+            last_trashed: dict[str, bool] = {}
             for change in page.changes:
                 change_type = str(change.get("changeType") or "file")
                 changed_drive_id = str(change.get("driveId") or "")
@@ -2631,6 +2640,10 @@ async def _run_gdrive_stream_unlocked(
                 # is kept apart from an ambiguous `removed` hint (a move, lost access, or a root that
                 # left this drive), which stays on the absence gates below (AIO-1167 R51 final 2).
                 trashed = bool(file.get("trashed"))
+                if file:
+                    # The document's own latest state in this page (only a change carrying its body
+                    # says whether it is trashed; a bare `removed` says nothing about restoration).
+                    last_trashed[file_id] = trashed
                 removed = bool(change.get("removed") or trashed)
                 selected = file_id in state.membership_ids(namespace, generation)
                 root_parents = sorted({
@@ -2714,6 +2727,15 @@ async def _run_gdrive_stream_unlocked(
                     for root in ([file_id] if direct else ([drive_root] if drive_root else [])):
                         membership_additions.append((file_id, root, drive_id, None))
                 obligations.append((file_id, "upsert", {"file_id": file_id, "metadata": file}))
+            # Ordering (A1): explicit trash later RESTORED within the same page is not trash any more. A
+            # restored document this stream cannot place (no local membership, its root unreadable)
+            # yields no superseding upsert, so its earlier trash removal is dropped here instead of
+            # suppressing restored content; an in-scope one is upserted below its removal as before.
+            obligations = [
+                (item_key, action, payload) for item_key, action, payload in obligations
+                if not (action == "remove" and payload.get("reason") == "explicit_trash"
+                        and last_trashed.get(item_key) is False)
+            ]
             if held_by_deferred_root:
                 # Reported, never charged: the document is owed to the deferred root's recovery.
                 summary.failure_categories = summary.failure_categories or {}

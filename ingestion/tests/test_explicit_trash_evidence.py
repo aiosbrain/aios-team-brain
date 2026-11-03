@@ -302,3 +302,58 @@ async def test_with_no_local_membership_an_ambiguous_removal_keeps_the_claim_and
     assert world.ledger.claims["doc-x"] == {"another-connection"}
     assert "doc-x" not in world.ledger.deleted
     state.close()
+
+
+@pytest.mark.asyncio
+async def test_with_no_local_membership_trash_then_restore_in_one_page_removes_nothing(
+    tmp_path, monkeypatch, clock,
+):
+    """Ordering (A1): a document trashed and then RESTORED within the same change page is not trash.
+    With no local membership and an unreadable parent nothing would upsert it, so the earlier trash
+    removal must not survive the page and suppress restored content."""
+    world = _nested_world(monkeypatch)
+    _path, state = await _recover_fresh_behind_restricted_parent(tmp_path, world, "a1-restore")
+    _trash(world, "doc-n")
+    world.files["doc-n"]["trashed"] = False  # restored — the later observation in the same page
+    world.logs[DRIVE].append({"fileId": "doc-n", "file": dict(world.files["doc-n"])})
+    world.calls.clear()
+    await run(world, state)
+
+    assert _owed_removal_payload(state, world, "doc-n") is None
+    assert "doc-n" not in world.removed
+    assert world.ledger.claims["doc-n"] == {world.integration_id}
+    assert not RESTRICTED_READS & set(world.calls) and _reads_of(world, "doc-n") == []
+
+    # A later page that trashes it again IS trash.
+    _trash(world, "doc-n")
+    await run(world, state)
+    assert "doc-n" in world.removed
+    state.close()
+
+
+@pytest.mark.asyncio
+async def test_membershipless_trash_still_respects_the_durable_queue_bound(tmp_path, monkeypatch, clock):
+    """Bounded materialization (A1): trash of documents with no local membership still counts against
+    the stream's durable backlog bound. A page that would exceed it is not materialized — the cursor
+    does not pass it and nothing is reconciled — rather than growing the queue without bound."""
+    from aios_ingest.gdrive_sync import _MAX_PENDING_PER_STREAM
+
+    world = _nested_world(monkeypatch)
+    _path, state = await _recover_fresh_behind_restricted_parent(tmp_path, world, "a1-bound")
+    namespace = world.namespace(DRIVE)
+    cursor = state.get_progress(namespace).page_token
+    for index in range(_MAX_PENDING_PER_STREAM + 1):
+        doc = f"stray-{index}"
+        world.put(doc, drive=DRIVE)
+        _trash(world, doc)
+    removed_before = list(world.removed)
+    outcome = await run(world, state)
+
+    assert outcome.failure_categories.get("queue_saturated") == 1
+    assert state.get_progress(namespace).page_token == cursor  # the page was not passed
+    assert world.removed == removed_before
+    assert state._db.execute(
+        "SELECT count(*) FROM pending_work WHERE namespace=? AND action='remove' AND acknowledged_at IS NULL",
+        (namespace,),
+    ).fetchone()[0] == 0
+    state.close()

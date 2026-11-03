@@ -248,6 +248,48 @@ describe("AIO-1167 Drive audience claims (real Postgres)", () => {
     expect(await canSeeItem(db(), readerB, item.id)).toBe(false);
   });
 
+  it("trash reported by a connection holding NO claim is a no-op for other connections and teams (A1)", async () => {
+    // AIO-1167 final review A1: the sidecar now delivers explicit trash even without local membership,
+    // so the owner must be the one that decides — a reporting connection with no claim on the item
+    // retires nothing, and another connection's (or another team's) claim and audience stand.
+    const seed = await seedTeam();
+    const projectB = await privateAudience(seed, seed.memberId, "trash-owner-b");
+    const projectC = await privateAudience(seed, seed.memberId, "trash-owner-c");
+    const connectionB = await connection(seed, "trash-owner-b", projectB);
+    const connectionC = await connection(seed, "trash-owner-c", projectC);
+    const item = await driveFixture(seed, {
+      project: "drive-trash-owner", path: "gdrive/claimed-elsewhere.md", body: "claimed by B only",
+      frontmatter: { source: "gdrive", source_id: "claimed-elsewhere", title: "Claimed elsewhere" },
+    }, { unclaimed: true });
+    await recordGdriveItemClaim(db(), {
+      teamId: seed.teamId, integrationId: connectionB, providerId: "claimed-elsewhere", itemId: item.id,
+      generation: 1, audienceProjectIds: [projectB],
+    });
+    const reader = { teamId: seed.teamId, memberId: seed.memberId };
+    expect(await canSeeItem(db(), reader, item.id)).toBe(true);
+    const epochBefore = (await runSql(
+      "select epoch from team_authorization_epochs where team_id=$1", [seed.teamId])).rows;
+
+    // Connection C never claimed it: nothing is retired, nothing suppressed, the epoch does not move.
+    await reconcileGdriveItems(db(), seed.teamId, {
+      connectionId: connectionC, removedProviderIds: ["claimed-elsewhere"],
+      reason: "Google Drive removal, trash, or access denial",
+    });
+    expect(await canSeeItem(db(), reader, item.id)).toBe(true);
+    expect((await runSql(
+      "select epoch from team_authorization_epochs where team_id=$1", [seed.teamId])).rows).toEqual(epochBefore);
+
+    // Another team's connection reporting the same provider id cannot reach this team's claim either.
+    const otherTeam = await seedTeam();
+    const otherProject = await privateAudience(otherTeam, otherTeam.memberId, "trash-owner-x");
+    const otherConnection = await connection(otherTeam, "trash-owner-x", otherProject);
+    await reconcileGdriveItems(db(), otherTeam.teamId, {
+      connectionId: otherConnection, removedProviderIds: ["claimed-elsewhere"],
+      reason: "Google Drive removal, trash, or access denial",
+    });
+    expect(await canSeeItem(db(), reader, item.id)).toBe(true);
+  });
+
   it("never adopts an unrelated exact path and deterministically allocates a safe Drive path", async () => {
     const seed = await seedTeam();
     const original = await ingest(seed, {

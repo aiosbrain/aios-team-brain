@@ -133,6 +133,37 @@ async def _publish_watch_restrictions(run: "_Run", conn: Connection, account_id:
         )
 
 
+async def _publish_watch_operation_minima(run: "_Run", conn: Connection, account_id: str) -> None:
+    """Publish the OPERATION minima a sweep journaled (AIO-1167 final review A4) — and nothing else.
+
+    Account holds keep their own publication rule: a timely quota answer publishes through
+    ``_publish_watch_restrictions``; a late (abandoned-worker) quota answer is journaled locally, blocks
+    every later call at once, and publishes only on the next fresh acquisition. So this carries the
+    acknowledged account holds unchanged and adds only local resource/operation minima, under this
+    execution's live fence. One attempt: a failed or lost acknowledgment, a timeout or a terminal
+    authority refusal keeps the local journal and is reported unpublished, never raised; under the
+    uncertainty latch nothing is sent. A no-op when no operation minimum is outstanding."""
+    from .gdrive_sync import _RESOURCE_UNPUBLISHED, _publish_restriction_evidence, _restriction_outstanding
+
+    if _RESOURCE_UNPUBLISHED not in _restriction_outstanding(run.state, run.execution):
+        return
+    report = IngestSummary(conn.name, failure_categories={}, integration_id=run.execution.integration_id)
+    try:
+        await run.bounded(_publish_restriction_evidence(
+            run.client, run.execution, run.state, account_id, report, local_holds=False,
+        ))
+    except WatchStepTimeout:
+        report.failure_categories[_RESOURCE_UNPUBLISHED] = 1
+    except BrainError as error:  # a terminal authority refusal: kept locally, reported, not raised
+        report.failure_categories[_RESOURCE_UNPUBLISHED] = 1
+        report.failure_categories[error.code] = 1
+    if report.failure_categories:
+        log.warning(
+            "Drive watch renewal for %s: operation minima %s",
+            conn.name, ", ".join(sorted(report.failure_categories)),
+        )
+
+
 class WatchStepTimeout(Exception):
     """A blocking step outlived the run deadline. ``started``: whether it ever began."""
 
@@ -651,10 +682,11 @@ async def _renew_connection(
                     provider_gate=provider_gate, account_id=account_id,
                 )
                 # Operation minima learned in this sweep (A4) are already in the local journal; publish
-                # them now under this execution's live fence through the ONE restriction owner (a no-op
-                # when nothing is outstanding). A failed or lost acknowledgment keeps the journal, and
-                # the next acquisition or poll checkpoint publishes it.
-                await _publish_watch_restrictions(run, conn, account_id)
+                # them now under this execution's live fence — ONLY them: a late account hold journaled
+                # during this sweep waits for the next fresh acquisition. A failed or lost
+                # acknowledgment keeps the journal, and the next acquisition or poll checkpoint
+                # publishes it.
+                await _publish_watch_operation_minima(run, conn, account_id)
             except _AccountQuotaHeld as held:
                 # The account's quota, learned from a watch call (R51 final 3): journaled locally
                 # FIRST — monotonic, under this verified account — so no watch or polling call for

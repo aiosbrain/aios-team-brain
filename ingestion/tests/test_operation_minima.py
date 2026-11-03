@@ -131,6 +131,63 @@ async def test_a_change_page_minimum_survives_a_generation_transition_and_fresh_
     fresh.close()
 
 
+@pytest.mark.asyncio
+async def test_a_listing_minimum_survives_a_same_account_reconnect_that_keeps_the_store(
+    tmp_path, monkeypatch, clock,
+):
+    """A same-account reconnect is a new generation for the SAME verified account and the same local
+    store: the operation minimum is the account's resource evidence, never generation authority."""
+    world = _world(monkeypatch)
+    world.calls = _FailingCalls({("list", DRIVE, "folder-a"): [real_deferral(503, LONG)]})
+    state = StateStore(str(tmp_path / "reconnect.sqlite"))
+    await run(world, state)
+    assert _restricted(state, world, "list-folder:folder-a") is not None
+
+    world.generation += 1  # reconnect: new generation, same account, same store
+    world.progress = {key: json.loads(json.dumps(world.progress[key])) for key in RESTRICTION_KEYS if key in world.progress}
+    world.calls = _FailingCalls({})
+    await run(world, state)
+    assert ("list", DRIVE, "folder-a") not in world.calls
+    assert ("list", DRIVE, "folder-b") in world.calls
+    state.close()
+
+
+@pytest.mark.asyncio
+async def test_a_listing_minimum_whose_acknowledgment_was_lost_is_honoured_from_the_brain(
+    tmp_path, monkeypatch, clock,
+):
+    """The checkpoint carrying the minimum is stored by the brain but its answer is lost. A fresh store
+    after a scope edit adopts it from the acknowledged progress: still no early listing."""
+    from aios_ingest.brain_client import BrainError
+
+    world = _world(monkeypatch)
+    world.calls = _FailingCalls({("list", DRIVE, "folder-a"): [real_deferral(503, LONG)]})
+
+    def stored_then_lost(progress):
+        items = (progress.get("document_restrictions") or {}).get("items") or []
+        if not any(item.get("id") == "list-folder:folder-a" for item in items):
+            return None
+        world.revision += 1
+        world.progress = json.loads(json.dumps(progress))
+        return BrainError(503, "server_error", "acknowledgment lost")
+
+    world.checkpoint_faults.append(stored_then_lost)
+    state = StateStore(str(tmp_path / "lost.sqlite"))
+    try:
+        await run(world, state)
+    except Exception:  # noqa: BLE001 — however the lost acknowledgment surfaced
+        pass
+    assert stored_then_lost not in world.checkpoint_faults  # the brain really stored it
+    assert _published(world, "list-folder:folder-a")
+    state.close()
+
+    fresh = _transition(world, monkeypatch, tmp_path, "lost-transition")
+    world.calls = _FailingCalls({})
+    await run(world, fresh)
+    assert ("list", DRIVE, "folder-a") not in world.calls
+    fresh.close()
+
+
 @pytest.mark.parametrize("header", [None, "soon"], ids=["missing", "malformed"])
 @pytest.mark.asyncio
 async def test_a_listing_or_change_answer_naming_no_minimum_stays_attempt_local(
