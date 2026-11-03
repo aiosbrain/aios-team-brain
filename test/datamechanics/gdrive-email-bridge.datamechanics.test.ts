@@ -57,10 +57,12 @@ async function member(seed: Seed, name: string, email: string): Promise<string> 
  * agreeing control) or nobody; `link` links `author-email:E` to A — the new manual writer, a legacy
  * row with an empty email column (and its decided state, as every upgraded link has), not at all, or
  * (`split`, R54) as two raw legacy spellings of E mapped to A and to a third member, with no decided
- * state and no stored email — rows the raw DB uniqueness allows and the map reads as ambiguous.
+ * state and no stored email — rows the raw DB uniqueness allows and the map reads as ambiguous; or
+ * (`linked-split`, R55) the canonical raw row mapped to A beside a legacy spelling mapped to a third
+ * member, which the ACTUAL manual writer then re-links for A — a decided `linked` state over a split.
  */
 async function world(
-  owner: "primary" | "alias" | "a" | "nobody", link: "manual" | "legacy" | "none" | "split",
+  owner: "primary" | "alias" | "a" | "nobody", link: "manual" | "legacy" | "none" | "split" | "linked-split",
 ): Promise<World> {
   const seed = await seedTeam();
   const writer = await fencedDriveWriter(seed);
@@ -82,6 +84,14 @@ async function world(
         "insert into member_identities(team_id,member_id,provider,external_id,handle,email) values ($1,$2,'gdrive',$3,'','')",
         [seed.teamId, memberId, spelling]);
     }
+  } else if (link === "linked-split") {
+    const c = await member(seed, "Cal", `cal-${tag}@example.com`);
+    for (const [memberId, spelling] of [[a, key], [c, `author-email:${address.toUpperCase()}`]] as const) {
+      await getPool().query(
+        "insert into member_identities(team_id,member_id,provider,external_id,handle,email) values ($1,$2,'gdrive',$3,'','')",
+        [seed.teamId, memberId, spelling]);
+    }
+    await setMemberIdentity(db(), seed.teamId, a, { provider: "gdrive", externalId: key });
   } else if (link === "legacy") {
     await getPool().query(
       "insert into member_identities(team_id,member_id,provider,external_id,handle,email) values ($1,$2,'gdrive',$3,'','')",
@@ -155,6 +165,21 @@ async function credit(w: World, itemId: string) {
     author: resolveAuthors(map, parseAuthorRefs(frontmatter), new Set()).memberId,
     projection: googleDriveContributionEvidence(frontmatter, itemId, map).map((row) => row.memberId),
   };
+}
+
+/** Every raw `author-email:` mapping row and mapping state of the team, exactly as stored. */
+async function legacyMappings(w: World) {
+  const pool = getPool();
+  return JSON.stringify({
+    identities: (await pool.query(
+      `select external_id,member_id,email::text from member_identities
+        where team_id=$1 and provider='gdrive' and lower(external_id) like 'author-email:%' order by external_id`,
+      [w.seed.teamId])).rows,
+    states: (await pool.query(
+      `select external_id,state,revision from member_identity_mapping_state
+        where team_id=$1 and provider='gdrive' and lower(external_id) like 'author-email:%' order by external_id`,
+      [w.seed.teamId])).rows,
+  });
 }
 
 async function conflictRows(w: World) {
@@ -258,20 +283,6 @@ describe("R53 — a linked author-email owner conflicting with the roster/alias 
  * replay. Not a conflict (no single linked owner), so nothing is audited as one.
  */
 describe("R54 — ambiguous legacy author-email spellings hold the email (real Postgres)", () => {
-  async function legacyMappings(w: World) {
-    const pool = getPool();
-    return JSON.stringify({
-      identities: (await pool.query(
-        `select external_id,member_id,email::text from member_identities
-          where team_id=$1 and provider='gdrive' and lower(external_id) like 'author-email:%' order by external_id`,
-        [w.seed.teamId])).rows,
-      states: (await pool.query(
-        `select external_id,state,revision from member_identity_mapping_state
-          where team_id=$1 and provider='gdrive' and lower(external_id) like 'author-email:%' order by external_id`,
-        [w.seed.teamId])).rows,
-    });
-  }
-
   it.each([
     ["primary email", "author-email first"],
     ["primary email", "permission first"],
@@ -317,6 +328,61 @@ describe("R54 — ambiguous legacy author-email spellings hold the email (real P
     const result = await credit(w, itemId);
     expect(result.evidence).toEqual([{ external_id: "permission:P", member_id: w.a, diagnostic: null }]);
     expect(result.timeline).toEqual([w.a]);
+  }, 60_000);
+});
+
+/**
+ * AIO-1167 R55 — a DECIDED `linked` state on the canonical key can coexist with live raw spellings of
+ * the address mapped to different members (the manual writer re-links an existing canonical row and
+ * leaves a legacy spelling it does not own untouched). The decision stands but names no owner the map
+ * can resolve: an actionable conflict — the conflict diagnostic on the evidence and the existing Admin
+ * discovery-conflict audit, beside the roster/alias owner — not R54's silent hold, and still no fallback
+ * credit, no permission link, and no raw mapping merged, deleted or rewritten.
+ */
+describe("R55 — a decided link over split live spellings is an actionable conflict (real Postgres)", () => {
+  it.each([
+    ["primary email", "author-email first"],
+    ["primary email", "permission first"],
+    ["alias", "author-email first"],
+    ["alias", "permission first"],
+  ] as const)("%s owner, %s: conflict evidence and audit, no credit, no P link, raw mappings unchanged", async (owner, order) => {
+    const w = await world(owner === "alias" ? "alias" : "primary", "linked-split");
+    const before = await legacyMappings(w);
+    // The actual manual writer decided the canonical key and kept both raw rows: two spellings, two owners.
+    const stored = JSON.parse(before) as { identities: Array<{ external_id: string; member_id: string }>; states: Array<{ external_id: string; state: string }> };
+    expect(stored.identities.map((row) => row.external_id).sort())
+      .toEqual([`author-email:${w.address.toUpperCase()}`, `author-email:${w.address}`].sort());
+    expect(new Set(stored.identities.map((row) => row.member_id)).size).toBe(2);
+    expect(stored.states).toEqual([expect.objectContaining({ external_id: `author-email:${w.address}`, state: "linked" })]);
+    for (const opts of [{ strict: true }, { strict: true, includeDeactivated: true }]) {
+      expect(googleEmailBridge(await buildIdentityMap(db(), w.seed.teamId, opts), w.address))
+        .toEqual({ outcome: "conflict", linkedMemberId: null, emailMemberId: w.b });
+    }
+    const viaAuthorEmail = observation(w, `author-email:${w.address}`);
+    const viaPermission = observation(w, "permission:P", "2026-10-20T10:00:00Z");
+    const steps = order === "author-email first" ? [viaAuthorEmail, viaPermission] : [viaPermission, viaAuthorEmail];
+
+    const first = await push(w, steps[0]);
+    // The direct author-email observation resolves to no spelling's owner — none is invented.
+    expect((await credit(w, first.itemId)).evidence.every((row) => row.member_id === null)).toBe(true);
+    const second = await push(w, steps[1]);
+    const replay = await push(w, viaPermission);
+    for (const discovery of [order === "author-email first" ? second.discovery : first.discovery, replay.discovery]) {
+      expect(discovery).toMatchObject({ linked: 0, conflict: 1 });
+    }
+
+    expect(await permissionHolders(w)).toEqual([]);
+    expect(await legacyMappings(w)).toBe(before);
+    const result = await credit(w, first.itemId);
+    expect(result.evidence).toEqual([{ external_id: "permission:P", member_id: null, diagnostic: "google_email_conflict" }]);
+    expect(result.timeline).toEqual([]);
+    expect(result.projection).toEqual([]);
+    expect(result.author).toBeNull();
+    const conflicts = await conflictRows(w);
+    expect(conflicts).toHaveLength(1);
+    expect(conflicts[0]).toMatchObject({
+      occurrences: 2, candidate: { id: w.b }, heldThen: null, current: { state: "absent" },
+    });
   }, 60_000);
 });
 

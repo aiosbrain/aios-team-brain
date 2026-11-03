@@ -248,7 +248,8 @@ export function googleEmailAttributionHeld(map: IdentityMap, email: string | nul
  *   · `conflict` — the address's `author-email:` identity is LINKED (a decided link, or a live legacy
  *     mapping), and its owner is not
  *     the one confirmed roster/alias owner of the address (another member holds it, the address is
- *     ambiguous, or the linked owner does not resolve in this map — e.g. deactivated, for linking).
+ *     ambiguous, or the linked owner does not resolve in this map — e.g. deactivated, for linking — or
+ *     the decided link's live spellings belong to different members, R55: `linkedMemberId` null).
  *     Neither member is credited and no permission id is linked to either.
  *   · `member` — exactly one owner: the linked `author-email:` owner and the confirmed owner agree, or
  *     only one of them exists (a legacy link with no stored email still counts as the owner).
@@ -269,11 +270,15 @@ export function googleEmailBridge(map: IdentityMap, email: string | null | undef
   const key = `author-email:${address}`;
   const state = providerIdentityState(map, "gdrive", key);
   if (state === "unlinked" || state === "ambiguous") return { outcome: "held" };
-  // Live legacy spellings of this address mapped to DIFFERENT members, with no decided state (R54): the
-  // map dropped the owner as ambiguous, which is ambiguous authority — held, never a roster fallback.
-  if (map.ambiguousProviderIds?.has(providerKey("gdrive", key))) return { outcome: "held" };
   const ambiguous = map.ambiguousEmails?.has(address) ?? false;
   const emailMemberId = ambiguous ? null : map.byEmail.get(address) ?? null;
+  // Live spellings of this address mapped to DIFFERENT members: the map dropped the owner as ambiguous.
+  // Undecided (R54), that is ambiguous authority — held, never a roster fallback. Under a decided
+  // `linked` state (R55) the decision stands but names no owner the map can resolve: an actionable
+  // conflict, beside the address's one confirmed owner if any — no owner is invented, no mapping touched.
+  if (map.ambiguousProviderIds?.has(providerKey("gdrive", key))) {
+    return state === "linked" ? { outcome: "conflict", linkedMemberId: null, emailMemberId } : { outcome: "held" };
+  }
   // The address's `author-email:` owner: a decided link, or a live mapping (a legacy row with no state).
   const linkedMemberId = resolveByProviderId(map, "gdrive", key);
   if (state !== "linked" && !linkedMemberId) {

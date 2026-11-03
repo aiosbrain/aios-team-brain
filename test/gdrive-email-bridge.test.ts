@@ -48,6 +48,9 @@ function map(over: {
  */
 const LEGACY_SPLIT = map({ byEmail: [[E, "member-b"]], ambiguousProviderIds: [KEY] });
 
+/** R55: the same live split, but the canonical key carries a DECIDED `linked` state (manual relink). */
+const LINKED_SPLIT = map({ byEmail: [[E, "member-b"]], ambiguousProviderIds: [KEY], states: [[KEY, "linked"]] });
+
 /** `author-email:E` deliberately linked to A, while the roster/alias email E belongs to B. */
 const CONFLICTED = map({
   byEmail: [[E, "member-b"]],
@@ -77,6 +80,19 @@ describe("googleEmailBridge — the decision", () => {
     // Another address's ambiguity holds nothing here: the control still bridges to its roster owner.
     const elsewhere = map({ byEmail: [[E, "member-b"]], ambiguousProviderIds: ["gdrive:author-email:other@example.com"] });
     expect(googleEmailBridge(elsewhere, E)).toEqual({ outcome: "member", memberId: "member-b" });
+  });
+
+  it("a decided link whose live spellings belong to different members is an actionable conflict (R55)", () => {
+    expect(googleEmailBridge(LINKED_SPLIT, E))
+      .toEqual({ outcome: "conflict", linkedMemberId: null, emailMemberId: "member-b" });
+    // No confirmed owner either: still the conflict — no owner is invented on either side.
+    expect(googleEmailBridge(map({ ambiguousProviderIds: [KEY], states: [[KEY, "linked"]] }), E))
+      .toEqual({ outcome: "conflict", linkedMemberId: null, emailMemberId: null });
+    // Applicable unlinked/ambiguous states keep holding, whatever the live spellings.
+    for (const state of ["unlinked", "ambiguous"] as const) {
+      expect(googleEmailBridge(map({ byEmail: [[E, "member-b"]], ambiguousProviderIds: [KEY], states: [[KEY, state]] }), E))
+        .toEqual({ outcome: "held" });
+    }
   });
 
   it("a linked author-email owner that disagrees with the confirmed owner is a conflict: neither is credited", () => {
@@ -144,6 +160,21 @@ describe("every Google consumer gives the same answer (consumer parity)", () => 
     const decided = map({
       byEmail: [[E, "member-b"]], ambiguousProviderIds: [KEY],
       byProviderId: [["gdrive:permission:P", "member-a"]], states: [["gdrive:permission:P", "linked"]],
+    });
+    expect(author(decided, PERMISSION)).toBe("member-a");
+    expect(timeline(decided, [PERMISSION])).toEqual(["member-a"]);
+  });
+
+  it("a decided link over split live spellings gives no fallback credit and invents no owner (R55)", () => {
+    expect(author(LINKED_SPLIT, PERMISSION)).toBeNull();
+    expect(timeline(LINKED_SPLIT, [PERMISSION])).toEqual([]);
+    expect(timeline(LINKED_SPLIT, [{ email: E, role: "editor", at: AT }])).toEqual([]);
+    expect(author(LINKED_SPLIT, AUTHOR_EMAIL)).toBeNull();
+    expect(timeline(LINKED_SPLIT, [AUTHOR_EMAIL])).toEqual([]);
+    const decided = map({
+      byEmail: [[E, "member-b"]], ambiguousProviderIds: [KEY],
+      byProviderId: [["gdrive:permission:P", "member-a"]],
+      states: [[KEY, "linked"], ["gdrive:permission:P", "linked"]],
     });
     expect(author(decided, PERMISSION)).toBe("member-a");
     expect(timeline(decided, [PERMISSION])).toEqual(["member-a"]);

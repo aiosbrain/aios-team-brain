@@ -1001,7 +1001,9 @@ R44 contracts (AIO-1167):
   ambiguous `author-email:E` holds it — ambiguous includes live legacy spellings of E mapped to different
   members with no decided state (R54) — so E bridges to no roster/alias owner; an `author-email:E` linked
   (or legacy-mapped, stored email or not)
-  to a member other than E's one confirmed roster/alias owner is a `conflict` — nobody is credited, the
+  to a member other than E's one confirmed roster/alias owner — or decided `linked` while its live
+  spellings belong to different members (R55: no owner is invented, no raw mapping touched) — is a
+  `conflict` — nobody is credited, the
   evidence row is `google_email_conflict`, and discovery links the permission id to neither member and
   audits `identity.discovery_conflict` for the Admin diagnostic; agreeing or single owners bridge as
   before. For each SURVIVING observation, exact permission authority, and a direct `author-email:`
