@@ -476,7 +476,10 @@ def _controlled_deadline(monkeypatch) -> asyncio.Event:
     """The renewal's worker deadline passes exactly when the test sets the returned event.
 
     Replaces only the bounded wait (``watch_renewal._wait_bounded``): the worker, the thread pool,
-    the abandonment, late-result handling and publication are all the production code.
+    the abandonment, late-result handling and publication are all the production code. It does NOT
+    move the run's absolute deadline — publication and the manager still see time left — so it models
+    a creation's dispatch deadline (which keeps a publication reserve), not the run's end; use
+    :func:`_absolute_deadline` for that.
     """
     deadline_passed = asyncio.Event()
 
@@ -492,6 +495,56 @@ def _controlled_deadline(monkeypatch) -> asyncio.Event:
 
     monkeypatch.setattr(watch_renewal, "_wait_bounded", wait_until_the_test_says)
     return deadline_passed
+
+
+class _Clock:
+    """``time`` as the watch modules see it: a frozen monotonic clock the test moves by hand, every
+    other attribute the real module. asyncio keeps its own clock, so the event loop is unaffected."""
+
+    def __init__(self):
+        self.now = time.monotonic()
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
+class _RunDeadline:
+    """The run's ABSOLUTE deadline, under the test's control (see :func:`_absolute_deadline`)."""
+
+    def __init__(self, clock: _Clock, worker_wait: asyncio.Event):
+        self.clock, self._worker_wait = clock, worker_wait
+
+    def advance_past(self) -> None:
+        """Only the clock moves past the deadline: a worker still being waited for is not yet given up."""
+        self.clock.now += watch_renewal.WATCH_RUN_SECONDS + 1
+
+    def expire(self) -> None:
+        """The deadline passes as in production: the clock renewal and the manager read moves past it
+        AND the bounded wait for the current worker ends, together."""
+        self.advance_past()
+        self._worker_wait.set()
+
+    def reset(self) -> None:
+        """For a later sweep: its own deadline lies ahead of the moved clock; its waits end normally."""
+        self._worker_wait.clear()
+
+
+def _absolute_deadline(monkeypatch) -> _RunDeadline:
+    """Run deadlines that pass exactly when the test says — the real ones, not just a worker wait.
+
+    ``watch_renewal`` and the watch manager read a frozen clock: no deadline passes on its own, and
+    ``expire()`` moves it beyond every run's deadline while ending the bounded wait. Publication then
+    refuses (``_Run.bounded``), admission questions get no time, and the manager's own guard applies —
+    the production code throughout; only the clock and the wait are the test's."""
+    from aios_ingest.sources import gdrive_watch
+
+    clock = _Clock()
+    monkeypatch.setattr(watch_renewal, "time", clock)
+    monkeypatch.setattr(gdrive_watch, "time", clock)
+    return _RunDeadline(clock, _controlled_deadline(monkeypatch))
 
 
 def _blocking_provider(brain: _Brain, resource_id: str):
@@ -744,6 +797,79 @@ def test_stop_treats_an_unknown_channel_as_already_gone():
     manager, _ = _manager_with(_HttpError(500))
     with pytest.raises(_HttpError):
         manager.stop("channel", "resource")
+
+
+def _stop_clock(monkeypatch) -> _Clock:
+    from aios_ingest.sources import gdrive_watch
+
+    clock = _Clock()
+    monkeypatch.setattr(gdrive_watch, "time", clock)
+    return clock
+
+
+@pytest.mark.parametrize("gate_returns, executions", [
+    pytest.param(-1, [("stop", 0)], id="before-the-deadline"),
+    pytest.param(0, [], id="at-the-deadline"),
+    pytest.param(1, [], id="after-the-deadline"),
+])
+def test_a_stop_is_executed_only_if_its_gate_returns_before_the_run_deadline(
+    monkeypatch, gate_returns, executions,
+):
+    """The gate — the live authority check plus any admission composed into it — answers SUCCESSFULLY,
+    but at ``gate_returns`` seconds from the run's absolute deadline. At or after it, the manager's own
+    guard refuses: the request is never executed and the stop is reported as not sent."""
+    clock = _stop_clock(monkeypatch)
+    deadline = clock.now + 30
+    manager, seen = _manager_with({})
+
+    def gate_answering_late():
+        seen["gate"] = seen.get("gate", 0) + 1
+        clock.now = deadline + gate_returns
+
+    manager._provider_gate = gate_answering_late
+    if executions:
+        manager.stop("channel", "resource", deadline=deadline)
+    else:
+        with pytest.raises(WatchNotDispatched):
+            manager.stop("channel", "resource", deadline=deadline)
+    assert seen["gate"] == 1
+    assert seen["executions"] == executions
+
+
+def test_a_stop_whose_request_setup_outlives_the_run_deadline_is_never_executed(monkeypatch):
+    """Client construction / credential refresh takes the run past its absolute deadline; the authority
+    check then answers successfully. The request is never executed."""
+    clock = _stop_clock(monkeypatch)
+    run_deadline = clock.now + 30
+    manager, seen = _manager_with({})
+    build = manager._service
+
+    def slow_setup(deadline=None):
+        clock.now = run_deadline + 1
+        return build(deadline)
+
+    manager._service = slow_setup
+    with pytest.raises(WatchNotDispatched):
+        manager.stop("channel", "resource", deadline=run_deadline)
+    assert seen["gate"] == 1 and seen["executions"] == []
+
+
+def test_an_authority_refusal_keeps_its_precedence_over_the_stop_deadline(monkeypatch):
+    """The live authority check refuses, and by then the deadline has passed too: the refusal itself is
+    raised — the caller ends the connection's run on it — and nothing is executed."""
+    clock = _stop_clock(monkeypatch)
+    deadline = clock.now + 30
+    manager, seen = _manager_with({})
+    refusal = BrainError(409, "connection_unavailable", "paused")
+
+    def refusing_after_the_deadline():
+        clock.now = deadline + 1
+        raise refusal
+
+    manager._provider_gate = refusing_after_the_deadline
+    with pytest.raises(BrainError) as raised:
+        manager.stop("channel", "resource", deadline=deadline)
+    assert raised.value is refusal and seen["executions"] == []
 
 
 def test_the_webhook_records_an_early_notification_for_a_pending_attempt_without_waking_anything(

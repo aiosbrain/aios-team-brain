@@ -93,6 +93,8 @@ class _Request:
         self.drive.calls.append((self.kind, self.target))
         answers = self.drive.watch_answers if self.kind == "watch" else self.drive.stop_answers
         answer = answers.pop(0) if answers else None
+        if callable(answer):  # runs inside the request — already sent — e.g. blocks, then answers
+            answer = answer()
         if isinstance(answer, Exception):
             raise answer
         if self.kind == "watch":
