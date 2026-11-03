@@ -1,0 +1,1099 @@
+diff --git a/ingestion/aios_ingest/sources/gdrive_watch.py b/ingestion/aios_ingest/sources/gdrive_watch.py
+index 4057de97..24525f5e 100644
+--- a/ingestion/aios_ingest/sources/gdrive_watch.py
++++ b/ingestion/aios_ingest/sources/gdrive_watch.py
+@@ -15,7 +15,8 @@ import time
+ from typing import Any
+ 
+ from ..watch_lifecycle import (
+-    WatchNotDispatched, WatchProviderMinimum, WatchQuotaLimited, WatchRecord, WatchRefused, parse_instant,
++    WatchNotDispatched, WatchProviderMinimum, WatchQuotaLimited, WatchRecord, WatchRefused,
++    WatchStopSetupFailed, parse_instant,
+ )
+ from .base import MissingExtraError
+ 
+@@ -174,11 +175,27 @@ class GoogleDriveWatchManager:
+             raise
+ 
+     def stop(self, channel_id: str, resource_id: str, *, deadline: float | None = None) -> None:
+-        """Stop one known channel. A channel the provider no longer knows (404) is already gone."""
+-        svc = self._service(deadline)
++        """Stop one known channel. A channel the provider no longer knows (404) is already gone.
++
++        ``deadline`` is the run's absolute ``time.monotonic`` deadline. It is enforced after the gate —
++        the live authority check, whose refusal is raised as is and keeps its precedence, and any
++        admission the caller composed into it — and immediately before the request: a stop whose gate
++        returns at or after the deadline, even successfully, is never executed and raises
++        :class:`WatchNotDispatched`. Neither transport's own timeout stands in for this bound.
++
++        The client's known setup failures — the missing 'gdrive' extra and unusable credentials —
++        happen before any request exists and are raised as :class:`WatchStopSetupFailed`; anything
++        else, from the gate or the request, keeps its own outcome.
++        """
++        try:
++            svc = self._service(deadline)
++        except (MissingExtraError, ValueError) as exc:
++            raise WatchStopSetupFailed(f"stop not sent: client setup failed: {type(exc).__name__}") from exc
+         request = svc.channels().stop(body={"id": channel_id, "resourceId": resource_id})
+         if self._provider_gate:
+             self._provider_gate()
++        if deadline is not None and _remaining(deadline) <= 0:
++            raise WatchNotDispatched("run deadline reached before the stop request was sent")
+         try:
+             request.execute(num_retries=0)
+         except Exception as exc:
+diff --git a/ingestion/aios_ingest/watch_lifecycle.py b/ingestion/aios_ingest/watch_lifecycle.py
+index e83935d1..87f75f68 100644
+--- a/ingestion/aios_ingest/watch_lifecycle.py
++++ b/ingestion/aios_ingest/watch_lifecycle.py
+@@ -77,7 +77,15 @@ class InvalidWatchTransition(ValueError):
+ 
+ 
+ class WatchNotDispatched(RuntimeError):
+-    """A creation step failed BEFORE the provider call was sent: no channel can exist from it."""
++    """A watch call — a channel creation or a cleanup stop — failed BEFORE its provider request was
++    sent: a creation can have created no channel, and a stop has not reached the provider."""
++
++
++class WatchStopSetupFailed(WatchNotDispatched):
++    """A cleanup stop's provider client could not be set up — the 'gdrive' extra is missing, or the
++    credentials are unusable — so its request was never built, let alone sent. Not a failed stop: the
++    channel stays exactly as acknowledged, no provider-failure attempt is counted, and the sweep's
++    other channels go on."""
+ 
+ 
+ class WatchRefused(RuntimeError):
+diff --git a/ingestion/aios_ingest/watch_renewal.py b/ingestion/aios_ingest/watch_renewal.py
+index 6621ad6d..329ecd34 100644
+--- a/ingestion/aios_ingest/watch_renewal.py
++++ b/ingestion/aios_ingest/watch_renewal.py
+@@ -11,9 +11,19 @@ acquires the same execution authority as polling, then:
+    bounded number per sweep, never while a stream already has the maximum of unresolved attempts
+    (polling covers it meanwhile), and always: durable ``prepared`` intent → fenced ``dispatched``
+    marker → ONE provider request in a worker thread → validated, fenced ``active``. The account hold
+-   and the drive's creation minimum are re-checked after each publication and, on the event loop,
+-   immediately before the request; a refused attempt was never sent and retires as such.
+-3. **Cleans up** known channels that must be stopped, within a reserved allowance.
++   and the drive's creation minimum are re-checked after each publication, on the event loop before
++   the worker starts the request, and once more after the manager's live authority check returns —
++   immediately before ``request.execute``, because that check can block while an abandoned worker
++   journals a restriction. The authority answer keeps its precedence; a refused attempt was never
++   sent and retires as such.
++3. **Cleans up** known channels that must be stopped, within a reserved allowance. The account hold
++   and the channel's stop minimum are checked the same way — before the worker starts and again after
++   the live authority check. A refused stop was never sent: the channel stays ``cleanup_pending``
++   with its stop attempts unchanged; an account hold ends that account's cleanup for the sweep, a
++   channel's minimum defers only that channel. The manager enforces the run's absolute deadline
++   after its gate and immediately before the request; a stop that reaches the deadline — refused by
++   that guard, or still queued, blocked or in flight — is not a failed attempt: nothing is published
++   and cleanup ends.
+ 
+ Every lifecycle change is published to the brain under the fence via the renewal-owned ``watches``
+ section (``connector_state.renewal_document``): renewal can never touch a cursor, and a stale
+@@ -60,6 +70,7 @@ from .state import StateStore, StreamKey, verification_hash
+ from .watch_lifecycle import (
+     ACTIVE, CLEANUP_PENDING, DISPATCHED, EXPIRED, PENDING_STATES, PREPARED, RETIRED, UNCERTAIN,
+     InvalidWatchResponse, WatchNotDispatched, WatchProviderMinimum, WatchQuotaLimited, WatchRecord, WatchRefused,
++    WatchStopSetupFailed,
+     from_section, now_iso, parse_instant, requested_expiry, to_section, transition,
+     validate_watch_response,
+ )
+@@ -388,6 +399,27 @@ def _creation_refusal(run: "_Run", account_id: str, drive_id: str) -> str | None
+     return None
+ 
+ 
++class _StopNotSent(Exception):
++    """A cleanup stop refused by restriction admission before its request was executed (R51 AC-04).
++
++    ``scope`` is ``"account"`` (the account's quota hold — no further same-account cleanup this
++    sweep), ``"operation"`` (this channel's stop minimum — the other channels go on) or
++    ``"unconfirmed"`` (admission could not be answered in time — cleanup ends for this sweep)."""
++
++    def __init__(self, scope: str):
++        super().__init__(f"stop not sent: {scope}")
++        self.scope = scope
++
++
++def _stop_refusal(run: "_Run", account_id: str, stop_operation: str) -> str | None:
++    """Event loop only: why a stop may NOT be sent now under the one restriction owner, or ``None``."""
++    if _account_held(run, account_id):
++        return "account"
++    if _operation_restricted(run.state, run.execution, account_id, stop_operation):
++        return "operation"
++    return None
++
++
+ def _ask_loop(loop: asyncio.AbstractEventLoop, fn: Callable[[], Any], timeout: float) -> Any:
+     """From a worker thread: run ``fn`` on the event loop that owns the StateStore and wait for its
+     answer, at most ``timeout`` seconds. Raises when the loop is gone or does not answer in time; the
+@@ -513,11 +545,9 @@ async def _create(
+     # published inside the run deadline.
+     dispatch_deadline = run.deadline - _publish_reserve()
+ 
+-    def dispatch_when_admitted() -> Any:
+-        # The final provider-dispatch boundary. A queued worker may start only after an abandoned one
+-        # has finished — and journaled its restriction — so admission is asked once more, on the loop
+-        # that owns the StateStore, immediately before the request. A refusal, or no answer, means
+-        # the request is never sent: `WatchNotDispatched` retires the attempt.
++    def confirm_admission() -> None:
++        # Asked from the worker, answered on the loop that owns the StateStore. A refusal, or no
++        # answer, means the request is never sent: `WatchNotDispatched` retires the attempt.
+         try:
+             refused = _ask_loop(
+                 loop, lambda: _creation_refusal(run, account_id, drive_id),
+@@ -527,9 +557,24 @@ async def _create(
+             raise WatchNotDispatched("not dispatched: admission could not be confirmed") from None
+         if refused is not None:
+             raise WatchNotDispatched(refused)
++
++    def admitted_gate() -> None:
++        # The manager calls its provider gate immediately before `request.execute`, and the live
++        # authority check inside it can block — long enough for an abandoned worker to journal the
++        # account's quota or this drive's creation minimum. So admission is decided once more AFTER
++        # that check returns: the authority answer keeps its precedence, and a restriction that landed
++        # meanwhile still stops the request before it is sent.
++        if provider_gate is not None:
++            provider_gate()
++        confirm_admission()
++
++    def dispatch_when_admitted() -> Any:
++        # A queued worker may start only after an abandoned one has finished — and journaled its
++        # restriction — so admission is asked before any client work too.
++        confirm_admission()
+         return manager.dispatch(
+             dispatched, page_token=cursor, verification_token=token,
+-            access_token=access_token, provider_gate=provider_gate, deadline=dispatch_deadline,
++            access_token=access_token, provider_gate=admitted_gate, deadline=dispatch_deadline,
+         )
+ 
+     try:
+@@ -637,20 +682,83 @@ async def _cleanup(
+             # this very sweep by a late worker. Waiting is not a failed stop: no attempt is spent, the
+             # record stays cleanup_pending, and the other channels are still stopped.
+             continue
+-        budget.stops -= 1
++        budget.stops -= 1  # the slot stays spent whatever happens: no refund, no retry in this sweep
+         operation = (
+             (run.execution.integration_id, int(run.execution.generation), account_id, stop_operation)
+             if account_id else None
+         )
+-        try:
+-            await run.offload(lambda r=record: manager.stop(
+-                r, str(r.resource_id), access_token=access_token, provider_gate=provider_gate,
++
++        def confirm_stop(stop_operation: str = stop_operation) -> None:
++            # Asked from the worker, answered on the loop that owns the StateStore, within the run
++            # deadline. A refusal — or no answer — means the request is never executed.
++            if not account_id:
++                return
++            try:
++                refused = _ask_loop(
++                    loop, lambda: _stop_refusal(run, account_id, stop_operation),
++                    run.deadline - time.monotonic(),
++                )
++            except Exception:
++                raise _StopNotSent("unconfirmed") from None
++            if refused is not None:
++                raise _StopNotSent(refused)
++
++        def admitted_gate(confirm: Callable[[], None] = confirm_stop) -> None:
++            # The manager calls its gate immediately before `request.execute`, and the live authority
++            # check inside it can block while an abandoned worker journals the account's quota or this
++            # channel's stop minimum. Authority answers first (its refusal keeps precedence); then
++            # restriction admission is decided once more before the request.
++            if provider_gate is not None:
++                provider_gate()
++            confirm()
++
++        def stop_when_admitted(r: WatchRecord = record, gate: Callable[[], None] = admitted_gate,
++                               confirm: Callable[[], None] = confirm_stop) -> Any:
++            # A queued worker may start only after an abandoned one has finished — and journaled its
++            # restriction — so admission is asked before any client work too.
++            confirm()
++            return manager.stop(
++                r, str(r.resource_id), access_token=access_token, provider_gate=gate,
+                 deadline=run.deadline,
+-            ), on_late=_late_evidence(loop, run.state, None, hold=hold, operation=operation))
++            )
++
++        try:
++            await run.offload(
++                stop_when_admitted,
++                on_late=_late_evidence(loop, run.state, None, hold=hold, operation=operation),
++            )
+         except asyncio.CancelledError:
+             raise
+         except BrainError:
+             raise
++        except _StopNotSent as exc:
++            # Provably unsent: the channel stays cleanup_pending with its resource and stop attempts
++            # unchanged, and nothing is published for it. A hold learned late stays local until the
++            # next fresh acquisition publishes it.
++            if exc.scope == "operation":
++                continue  # this channel waits for its minimum; the independent channels go on
++            return  # the account's hold — or unconfirmed admission — ends cleanup for this sweep
++        except WatchStopSetupFailed as exc:
++            # The client could not be set up, so no request was ever built: not a failed stop. The
++            # channel stays exactly as acknowledged — nothing published or projected, no attempt
++            # counted — its slot stays spent (never retried this sweep), and the next channel is
++            # still subject to the run deadline and the remaining budget.
++            log.warning("Drive watch renewal for %s: %s", connection, exc)
++            continue
++        except WatchNotDispatched:
++            # The manager's own guard: its gate returned at or after the run deadline, so the request
++            # was never executed. Not a failed stop — nothing is published or projected — and the run
++            # has no time left for another.
++            return
++        except WatchStepTimeout:
++            # The run deadline passed while the stop was queued, constructing its request, blocked in
++            # its gate or admission, or in flight. A worker having started is no proof the request was
++            # sent, so no failed attempt is counted and nothing is published or projected: the
++            # acknowledged cleanup_pending record stands for the next sweep. A worker still running
++            # is abandoned: past the deadline the manager never executes a request it has not sent,
++            # and a request already sent stays conservatively pending — its late answer can only add
++            # the account's hold or this channel's minimum, locally. Cleanup ends here.
++            return
+         except WatchQuotaLimited as exc:
+             # The channel still exists: the record stays cleanup_pending, spending no stop attempt —
+             # the account's quota is not this channel's failure (R51 final 3).
+diff --git a/ingestion/tests/test_watch_late_quota.py b/ingestion/tests/test_watch_late_quota.py
+index cf628359..efc2578c 100644
+--- a/ingestion/tests/test_watch_late_quota.py
++++ b/ingestion/tests/test_watch_late_quota.py
+@@ -18,10 +18,20 @@ ACCOUNT's quota, exactly as a timely one is:
+     publication is blocked — or while its admitted request is queued behind the abandoned worker —
+     prevents that request (R51 AC-04): the attempt retires as not dispatched, a failed retirement
+     publication leaves the acknowledged record to normal recovery, and the drive is eligible again
+-    only after the deadline.
+-
+-The controlled deadline replaces only ``watch_renewal._wait_bounded``; the worker pool, abandonment,
+-late-result delivery and publication are the production code.
++    only after the deadline;
++  * the same restriction landing while the production manager's live authority check blocks — for a
++    creation or a cleanup stop — still prevents that request: a refused stop is provably unsent and
++    leaves its channel cleanup_pending with its stop attempts; a failing authority check still wins;
++  * a cleanup stop that reaches the run's ABSOLUTE deadline — queued, constructing its request, blocked
++    in its authority check or final admission, or answered only afterwards — is never executed (the
++    manager's own guard refuses a late successful admission) and ends cleanup with nothing published or
++    projected for its channel; one already sent stays conservatively pending, and its late answer adds
++    only local evidence; an admission that cannot be confirmed retires a creation as not dispatched and
++    ends cleanup for a stop.
++
++The controlled deadline replaces only ``watch_renewal._wait_bounded``; the absolute one additionally
++gives the watch modules a frozen clock the test moves past the run's deadline. The worker pool,
++abandonment, late-result delivery, the manager and publication are the production code.
+ """
+ 
+ from __future__ import annotations
+@@ -29,6 +39,7 @@ from __future__ import annotations
+ import asyncio
+ import copy
+ import dataclasses
++import logging
+ import threading
+ import time
+ from concurrent.futures import Future
+@@ -45,10 +56,15 @@ from aios_ingest.watch_lifecycle import (
+     ACTIVE, CLEANUP_PENDING, DISPATCHED, PREPARED, RETIRED, UNCERTAIN, WatchProviderMinimum,
+     WatchQuotaLimited, from_section, to_section,
+ )
++from aios_ingest.sources.base import MissingExtraError
++from aios_ingest.sources.gdrive_watch import GoogleDriveWatchManager
+ from test_watch_lifecycle import (
+-    ACCOUNT, INTEGRATION, SETTINGS, _conn, _controlled_deadline, _Provider, _record,
++    ACCOUNT, INTEGRATION, SETTINGS, _absolute_deadline, _conn, _controlled_deadline, _Provider, _record,
++)
++from test_watch_quota_hold import (
++    GEN, LONG, _fake_drive, _GoogleError, _hold, _local_watch_state, _manager, _near, _published_hold,
++    _quota_brain,
+ )
+-from test_watch_quota_hold import GEN, LONG, _hold, _local_watch_state, _near, _published_hold, _quota_brain
+ 
+ OTHER_ACCOUNT = "previous-account"
+ 
+@@ -127,6 +143,29 @@ def _records_in(payload) -> list[dict]:
+     return list((payload.get("watches") or {}).get("records") or [])
+ 
+ 
++def _local_watch_row(state, attempt_id) -> tuple | None:
++    """The local projection of one watch record: (state, resource id, stop attempts)."""
++    row = state._db.execute(
++        "SELECT state, resource_id, stop_attempts FROM webhook_channels WHERE channel_id=?", (attempt_id,),
++    ).fetchone()
++    return tuple(row) if row else None
++
++
++_OLD0 = (CLEANUP_PENDING, "res-old0", 0)
++
++
++def _assert_old0_preserved(brain, state, since: int = 0) -> None:
++    """``old0`` stands exactly as acknowledged — cleanup_pending, its resource, no stop attempt spent —
++    in the brain's record, in EVERY checkpoint payload published from index ``since`` on, and in the
++    local projection."""
++    old0 = brain.records()["old0"]
++    assert (old0.state, old0.resource_id, old0.stop_attempts) == _OLD0
++    for payload in brain.checkpoints[since:]:
++        (entry,) = [r for r in _records_in(payload) if r["attempt_id"] == "old0"]
++        assert (entry["state"], entry["resource_id"], entry["stop_attempts"]) == _OLD0
++    assert _local_watch_row(state, "old0") == _OLD0
++
++
+ # ------------------------------------------------------------------------------------------------ #
+ # Creation and stop, end to end through the renewal sweep
+ # ------------------------------------------------------------------------------------------------ #
+@@ -228,34 +267,38 @@ def _brain_with_older_account_cleanup():
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_a_late_stop_quota_after_timeout_holds_the_current_transport_account_not_the_records(
++async def test_a_late_stop_quota_after_the_run_deadline_holds_the_current_transport_account_not_the_records(
+     tmp_path, monkeypatch,
+ ):
+-    deadline_passed = _controlled_deadline(monkeypatch)
++    """The run's absolute deadline passes while old0's stop is in flight. Nothing is published for it —
++    a started worker is no proof a request was sent, and no failed attempt is counted — and cleanup
++    ends. Only afterwards does the abandoned worker answer with the account's quota: it is journaled for
++    the verified account of the transport that stopped it, never the record's older account, and stays
++    local until a fresh acquisition."""
++    deadline = _absolute_deadline(monkeypatch)
+     brain = _brain_with_older_account_cleanup().install(monkeypatch)
+     streams_before = copy.deepcopy(brain.progress["streams"])
+     state = StateStore(str(tmp_path / "late-stop.sqlite"))
+     provider = _LateQuotaProvider(brain, kind="stop", not_before=_at(int(LONG)))
+ 
+-    async def answer_once_the_timeout_is_recorded(payload):
+-        old0 = next((r for r in _records_in(payload) if r["attempt_id"] == "old0"), None)
+-        if old0 and old0["stop_attempts"] == 1 and not provider.release.is_set():
+-            provider.release.set()
+-            await _until(lambda: _hold(state) is not None)
+-
+-    _hook_checkpoints(monkeypatch, answer_once_the_timeout_is_recorded)
+     sweep = asyncio.create_task(watch_renewal.renew_watches(state, provider, [_conn()], SETTINGS))
+     await asyncio.to_thread(provider.entered.wait, 10)
+-    deadline_passed.set()
++    deadline.expire()
+     await sweep
++    assert _hold(state) is None  # cleanup ended without waiting for the worker's answer
++    assert brain.checkpoints == []  # no failed-attempt checkpoint, no retirement
++    _assert_old0_preserved(brain, state)
++
++    provider.release.set()
++    await _until(lambda: _hold(state) is not None)
+ 
+     assert provider.calls == [("stop", "old0")]  # the second stop is never attempted
+     assert provider.stopped == []
+-    assert _hold(state) is not None  # the verified account of the transport that stopped it
+     assert _standing_account_hold(state, INTEGRATION, GEN, OTHER_ACCOUNT) is None  # not the record's
++    assert brain.checkpoints == []  # the late answer publishes nothing either
++    _assert_old0_preserved(brain, state)  # conservatively pending: the channel may still exist
+     records = brain.records()
+-    assert records["old0"].state == CLEANUP_PENDING and records["old1"].state == CLEANUP_PENDING
+-    assert records["old1"].stop_attempts == 0
++    assert records["old1"].state == CLEANUP_PENDING and records["old1"].stop_attempts == 0
+     assert records["current"].state == ACTIVE and records["current-x"].state == ACTIVE
+     assert _published_hold(brain) is None
+     assert brain.progress["streams"] == streams_before
+@@ -584,3 +627,537 @@ async def test_a_creation_queued_behind_the_abandoned_worker_is_refused_at_the_d
+     assert brain.progress["streams"] == streams_before
+     assert _published_hold(brain) is None
+     state.close()
++
++
++class _BlockingGate:
++    """The brain's live authority gate, whose FIRST check blocks in the worker until released — and
++    then, if ``failure`` is set, refuses with it (the live authority check failing). With
++    ``blocking=False`` every check passes at once. ``closed`` is set when the run closes it, which it
++    does only once every worker of the run — abandoned ones included — has finished."""
++
++    def __init__(self, failure: Exception | None = None, *, blocking: bool = True):
++        self.entered, self.release = threading.Event(), threading.Event()
++        self.closed = threading.Event()
++        self.checks = 0
++        self.failure = failure
++        self.blocking = blocking
++
++    def __call__(self):
++        self.checks += 1
++        if self.checks == 1 and self.blocking:
++            self.entered.set()
++            assert self.release.wait(10), "the test never released the authority check"
++            if self.failure is not None:
++                raise self.failure
++
++    def close(self):
++        self.closed.set()
++
++
++def _install_gate(monkeypatch, gate: _BlockingGate) -> _BlockingGate:
++    monkeypatch.setattr(
++        watch_renewal.brain_client.BrainClient, "gdrive_provider_gate", lambda self, execution: gate,
++    )
++    return gate
++
++
++_REFUSALS = {
++    "quota": "not dispatched: the account's provider quota hold stands",
++    "minimum": "not dispatched: a provider minimum for creating a channel on this drive stands",
++}
++
++
++@pytest.mark.parametrize("answer", ["quota", "minimum"])
++@pytest.mark.asyncio
++async def test_a_restriction_journaled_while_the_production_managers_authority_check_blocks_prevents_the_request(
++    tmp_path, monkeypatch, answer,
++):
++    """The PRODUCTION watch manager makes the live authority check immediately before
++    ``request.execute``, and that check can block. A fresh sweep's my-drive creation passes every
++    earlier admission and blocks inside it; meanwhile the cancelled sweep's abandoned worker answers and
++    its restriction — the account's quota or my-drive's creation minimum — is journaled on the loop.
++    When the check returns, admission is decided once more: ``request.execute`` is never called and the
++    attempt retires as provably not dispatched. A drive minimum leaves the independent drive's creation
++    alone; the account hold stops every further watch call."""
++    brain = _quota_brain(due=True).install(monkeypatch)
++    streams_before = copy.deepcopy(brain.progress["streams"])
++    state = StateStore(str(tmp_path / f"gate-{answer}.sqlite"))
++    late = _LateAnswerProvider(brain, _late_answer(answer))
++    abandoned = await _abandon_first_creation(state, late)
++
++    # Sweep 2 runs through the production manager over a scripted transport: every `request.execute`
++    # is recorded in `drive.calls`. Its authority check blocks the first time.
++    drive = _fake_drive(monkeypatch)
++    gate = _BlockingGate()
++    monkeypatch.setattr(
++        watch_renewal.brain_client.BrainClient, "gdrive_provider_gate", lambda self, execution: gate,
++    )
++    second = asyncio.create_task(watch_renewal.renew_watches(state, _manager(), [_conn()], SETTINGS))
++    await asyncio.to_thread(gate.entered.wait, 10)
++    assert _restriction(state, answer) is None  # every admission before the authority check passed
++    (attempt,) = [r for r in brain.records().values()
++                  if r.predecessor == "current" and r.attempt_id != abandoned.attempt_id]
++    assert attempt.state == DISPATCHED  # durably marked, inside the manager, not yet sent
++
++    late.release.set()  # the abandoned worker answers; its restriction is journaled on this loop
++    await _until(lambda: _restriction(state, answer) is not None)
++    gate.release.set()
++    await second
++
++    watch_requests = [call for call in drive.calls if call[0] == "watch"]
++    assert ("watch", "my-drive") not in watch_requests  # `request.execute` was never called for it
++    if answer == "quota":
++        assert drive.calls == []  # the account hold stops every watch call, stops included
++        assert _published_hold(brain) is None  # a late hold waits for a fresh acquisition
++    else:
++        assert watch_requests == [("watch", "shared-x")]  # the independent drive is still created
++    records = brain.records()
++    retired = records[attempt.attempt_id]
++    assert retired.state == RETIRED and retired.detail == _REFUSALS[answer]
++    assert retired.resource_id is None
++    assert _local_watch_state(state, attempt.attempt_id) == RETIRED
++    assert records[abandoned.attempt_id].state == UNCERTAIN  # recovered, never activated
++    assert records["current"].state == ACTIVE  # the predecessor is untouched
++    assert brain.progress["streams"] == streams_before  # no cursor moved
++    assert _restriction(state, answer) is not None  # the restriction persists
++    assert brain.events[-1] == "release"
++    state.close()
++
++
++# ------------------------------------------------------------------------------------------------ #
++# The same window for a cleanup STOP: a restriction that lands while its authority check blocks
++# ------------------------------------------------------------------------------------------------ #
++
++class _LateStopProvider(_LateAnswerProvider):
++    """Google, scripted: the FIRST stop blocks in its worker until released, then raises ``error``."""
++
++    def __init__(self, brain, error):
++        super().__init__(brain, error)
++        self.kind = "stop"
++
++
++def _late_stop_answer(answer: str):
++    if answer == "quota":
++        return WatchQuotaLimited(_deferral(_at(int(LONG))))
++    return WatchProviderMinimum(_minimum(int(LONG)))
++
++
++def _stop_restriction(state, answer: str):
++    """The restriction the late stop answer journals: the account's hold, or old0's stop minimum."""
++    if answer == "quota":
++        return _hold(state)
++    return state.document_restrictions(INTEGRATION, GEN, ACCOUNT).get("watch-stop:res-old0")
++
++
++async def _abandon_first_stop(state, provider):
++    """Sweep 1: its stop of ``old0`` blocks in a worker and the sweep is cancelled around it — the worker
++    keeps running, abandoned, with the production late-result handler attached."""
++    first = asyncio.create_task(watch_renewal.renew_watches(state, provider, [_conn()], SETTINGS))
++    await asyncio.to_thread(provider.entered.wait, 10)
++    first.cancel()
++    with pytest.raises(asyncio.CancelledError):
++        await first
++    records = provider.brain.records()
++    assert records["old0"].state == CLEANUP_PENDING and records["old0"].stop_attempts == 0
++
++
++@pytest.mark.parametrize("answer, authority_fails", [
++    pytest.param("quota", False, id="account-quota"),
++    pytest.param("minimum", False, id="stop-minimum"),
++    pytest.param("minimum", True, id="authority-failure-wins"),
++])
++@pytest.mark.asyncio
++async def test_a_restriction_journaled_while_a_stops_authority_check_blocks_prevents_the_stop(
++    tmp_path, monkeypatch, answer, authority_fails,
++):
++    """The PRODUCTION watch manager makes the live authority check immediately before a stop's
++    ``request.execute``, and that check can block. A fresh sweep's stop of ``old0`` passes initial
++    admission and blocks inside it; meanwhile the cancelled sweep's abandoned stop worker answers and
++    its restriction — the account's quota or old0's stop minimum — is journaled on the loop. When the
++    check returns, admission is decided once more: the stop is never executed, and it is provably
++    unsent — old0 stays cleanup_pending with its resource and stop attempts, and nothing is published
++    for it. The account hold ends the account's cleanup; old0's minimum defers old0 alone and old1 is
++    still stopped — with old0's refused stop and old1's stop the sweep's two slots are spent (no
++    refund, no retry), so old2 waits. A failing authority check keeps its precedence: the run ends on it."""
++    # No creation is due; old0, old1 and old2 to stop, with a two-stop sweep budget.
++    brain = _quota_brain(due=False, cleanups=3).install(monkeypatch)
++    streams_before = copy.deepcopy(brain.progress["streams"])
++    state = StateStore(str(tmp_path / f"stop-gate-{answer}-{authority_fails}.sqlite"))
++    late = _LateStopProvider(brain, _late_stop_answer(answer))
++    await _abandon_first_stop(state, late)
++    since = len(brain.checkpoints)
++
++    # Sweep 2 stops through the production manager over a scripted transport: every
++    # `request.execute` is recorded in `drive.calls`. Its first authority check blocks.
++    drive = _fake_drive(monkeypatch)
++    gate = _BlockingGate(BrainError(409, "connection_unavailable", "paused") if authority_fails else None)
++    monkeypatch.setattr(
++        watch_renewal.brain_client.BrainClient, "gdrive_provider_gate", lambda self, execution: gate,
++    )
++    second = asyncio.create_task(watch_renewal.renew_watches(state, _manager(), [_conn()], SETTINGS))
++    await asyncio.to_thread(gate.entered.wait, 10)
++    assert _stop_restriction(state, answer) is None  # old0's stop passed initial admission
++
++    late.release.set()  # the abandoned stop answers; its restriction is journaled on this loop
++    await _until(lambda: _stop_restriction(state, answer) is not None)
++    gate.release.set()
++    await second
++
++    assert ("stop", "old0") not in drive.calls  # `request.execute` was never called for old0
++    if answer == "quota" or authority_fails:
++        # The account hold ends the account's cleanup; a failed authority check ends the run.
++        assert drive.calls == []
++        assert brain.checkpoints[since:] == []  # nothing else had anything to publish
++    else:
++        assert drive.calls == [("stop", "old1")]  # the independent channel is still stopped
++    # old0 was never retired nor counted as a failed stop — in the brain, in every payload the sweep
++    # published (old1's retirement, the minimum's publication) and in the local projection.
++    _assert_old0_preserved(brain, state, since)
++    records = brain.records()
++    if answer == "minimum" and not authority_fails:
++        assert records["old1"].state == RETIRED and records["old1"].detail == "stopped"
++    else:
++        assert records["old1"].state == CLEANUP_PENDING and records["old1"].stop_attempts == 0
++    assert ("stop", "old2") not in drive.calls  # one slot per started stop, never refunded
++    assert records["old2"].state == CLEANUP_PENDING and records["old2"].stop_attempts == 0
++    assert records["current"].state == ACTIVE and records["current-x"].state == ACTIVE
++    assert brain.progress["streams"] == streams_before  # no cursor moved
++    assert _stop_restriction(state, answer) is not None  # the restriction persists
++    if answer == "quota":
++        assert _published_hold(brain) is None  # a late hold stays local until a fresh acquisition
++    assert brain.events[-1] == "release"
++    state.close()
++
++
++# ------------------------------------------------------------------------------------------------ #
++# A cleanup stop at the run's ABSOLUTE deadline, through the production manager
++# ------------------------------------------------------------------------------------------------ #
++
++def _assert_cleanup_ended_untouched(brain, state, streams_before) -> None:
++    """Nothing was published by the sweep — no failed attempt, no retirement — old0 stands as
++    acknowledged everywhere, and cleanup ended before old1."""
++    assert brain.checkpoints == []
++    _assert_old0_preserved(brain, state)
++    records = brain.records()
++    assert (records["old1"].state, records["old1"].stop_attempts) == (CLEANUP_PENDING, 0)
++    assert _local_watch_row(state, "old1") == (CLEANUP_PENDING, "res-old1", 0)
++    assert records["current"].state == ACTIVE and records["current-x"].state == ACTIVE
++    assert brain.progress["streams"] == streams_before
++    assert brain.events[-1] == "release"
++
++
++_RUN_STOPPED = "Drive watch renewal for gd stopped:"
++
++
++def _capture_renewal_warnings(caplog) -> None:
++    caplog.set_level(logging.WARNING, logger=watch_renewal.log.name)
++
++
++def _run_stopped_warnings(caplog) -> list[str]:
++    """The connection run's catch-all warnings: a deadline stop that fell through to failed-attempt
++    accounting tries to publish past the deadline, is refused, and ends the run with one of these —
++    with every persisted outcome still unchanged. Only the renewal module's run-level prefix counts."""
++    return [
++        record.getMessage() for record in caplog.records
++        if record.name == watch_renewal.log.name and record.getMessage().startswith(_RUN_STOPPED)
++    ]
++
++
++@pytest.mark.parametrize("phase", ["queued", "request-setup", "authority-check", "final-admission"])
++@pytest.mark.asyncio
++async def test_a_stop_that_reaches_the_run_deadline_is_never_executed_and_ends_cleanup(
++    tmp_path, monkeypatch, caplog, phase,
++):
++    """old0's stop is still queued behind busy workers, constructing its request, blocked in the live
++    authority check, or blocked in the final admission when the run's absolute deadline passes. The
++    sweep ends cleanup at once: no failed-attempt checkpoint, retirement or projection change for old0,
++    whose resource and stop attempts stand. Its worker — if it ever started — then goes on past the
++    deadline and never executes the request: an unanswerable admission refuses it, and an admission
++    answered successfully only after the deadline meets the manager's own guard. The next sweep, from
++    the acknowledged record, stops both channels."""
++    _capture_renewal_warnings(caplog)
++    deadline = _absolute_deadline(monkeypatch)
++    brain = _quota_brain(due=False).install(monkeypatch)  # no creation is due; old0 and old1 to stop
++    streams_before = copy.deepcopy(brain.progress["streams"])
++    state = StateStore(str(tmp_path / f"stop-deadline-{phase}.sqlite"))
++    drive = _fake_drive(monkeypatch)
++    gate = _install_gate(monkeypatch, _BlockingGate(blocking=phase == "authority-check"))
++    entered, release = threading.Event(), threading.Event()
++    asked: list[float] = []
++    busy: list[Future] = []
++    if phase == "request-setup":
++        def slow_setup(self, deadline=None):
++            entered.set()
++            assert release.wait(10), "the test never released the request setup"
++            return drive
++        monkeypatch.setattr(GoogleDriveWatchManager, "_service", slow_setup)
++    elif phase == "authority-check":
++        entered, release = gate.entered, gate.release
++    elif phase == "final-admission":
++        ask_loop = watch_renewal._ask_loop
++
++        def slow_final_admission(loop, fn, timeout):
++            asked.append(timeout)
++            if len(asked) == 2:  # the admission asked after the authority check
++                entered.set()
++                assert release.wait(10), "the test never released the final admission"
++            return ask_loop(loop, fn, timeout)  # answered — successfully — only after the deadline
++        monkeypatch.setattr(watch_renewal, "_ask_loop", slow_final_admission)
++    else:  # queued: both pool workers are busy, so old0's stop waits in the queue
++        busy = [watch_renewal._POOL.submit(release.wait, 10) for _ in range(2)]
++        await _until(lambda: all(future.running() for future in busy))
++
++    sweep = asyncio.create_task(watch_renewal.renew_watches(state, _manager(), [_conn()], SETTINGS))
++    if phase == "queued":
++        await _until(lambda: watch_renewal._POOL._work_queue.qsize() > 0)
++    else:
++        await asyncio.to_thread(entered.wait, 10)
++    deadline.expire()
++    await sweep
++    # Cleanup ENDED on the timeout — it did not fall through to a failed-attempt publication that the
++    # deadline then refused and the run swallowed (which would leave the same persisted state).
++    assert _run_stopped_warnings(caplog) == []
++    _assert_cleanup_ended_untouched(brain, state, streams_before)
++
++    release.set()  # the worker — if it ever started — continues past the deadline
++    for future in busy:
++        future.result(10)
++    assert await asyncio.to_thread(gate.closed.wait, 10)  # every worker of the run has finished
++    await asyncio.sleep(0)
++    assert drive.calls == []  # never executed: not old0, and old1 was never attempted
++    _assert_cleanup_ended_untouched(brain, state, streams_before)
++    assert _hold(state) is None
++    if phase == "final-admission":
++        assert len(asked) == 2  # admitted after the deadline: only the manager's guard refused it
++    assert _run_stopped_warnings(caplog) == []  # checked before the recovery sweep
++
++    # The acknowledged cleanup_pending record stands: the next sweep stops both channels.
++    deadline.reset()
++    await watch_renewal.renew_watches(state, _manager(), [_conn()], SETTINGS)
++    assert drive.calls == [("stop", "old0"), ("stop", "old1")]
++    records = brain.records()
++    assert records["old0"].state == RETIRED and records["old1"].state == RETIRED
++    state.close()
++
++
++@pytest.mark.asyncio
++async def test_a_stop_admitted_after_the_run_deadline_is_refused_by_the_managers_guard_and_ends_cleanup(
++    tmp_path, monkeypatch, caplog,
++):
++    """The run's absolute deadline passes while old0's authority check blocks, and the sweep is still
++    waiting for its worker. The check then returns and the final admission is answered SUCCESSFULLY —
++    after the deadline. Only the manager's own guard stands between that answer and the provider: it
++    refuses, and the sweep — seeing a stop that was never executed — ends cleanup without a failed
++    attempt, a checkpoint or a projection change. The one slot old0 took is not refunded: old1 waits."""
++    _capture_renewal_warnings(caplog)
++    deadline = _absolute_deadline(monkeypatch)
++    brain = _quota_brain(due=False).install(monkeypatch)
++    streams_before = copy.deepcopy(brain.progress["streams"])
++    state = StateStore(str(tmp_path / "stop-admitted-late.sqlite"))
++    drive = _fake_drive(monkeypatch)
++    gate = _install_gate(monkeypatch, _BlockingGate())
++    ask_loop = watch_renewal._ask_loop
++    monkeypatch.setattr(  # every admission question is answered, whatever time is left
++        watch_renewal, "_ask_loop", lambda loop, fn, timeout: ask_loop(loop, fn, 10.0),
++    )
++
++    sweep = asyncio.create_task(watch_renewal.renew_watches(state, _manager(), [_conn()], SETTINGS))
++    await asyncio.to_thread(gate.entered.wait, 10)
++    deadline.advance_past()  # the run's deadline passes; the bounded wait has not given the worker up
++    gate.release.set()
++    await sweep
++
++    # Cleanup ENDED on the manager's refusal — no fall-through to a refused failed-attempt publication.
++    assert _run_stopped_warnings(caplog) == []
++    assert drive.calls == []
++    assert gate.checks == 1  # old0 asked authority once; no retry, and old1 was never attempted
++    _assert_cleanup_ended_untouched(brain, state, streams_before)
++    state.close()
++
++
++@pytest.mark.parametrize("late", ["success", "quota", "minimum"])
++@pytest.mark.asyncio
++async def test_a_stop_sent_before_the_run_deadline_stays_pending_after_abandonment(
++    tmp_path, monkeypatch, caplog, late,
++):
++    """old0's stop request is already executing when the run's absolute deadline passes. Cleanup ends
++    without publishing anything for it. The abandoned request then answers: a late success retires
++    nothing — the record stays cleanup_pending, conservatively, until a sweep that owns it stops it — and
++    a late quota answer or stop minimum is journaled locally only, never published by this run."""
++    _capture_renewal_warnings(caplog)
++    deadline = _absolute_deadline(monkeypatch)
++    brain = _quota_brain(due=False).install(monkeypatch)
++    streams_before = copy.deepcopy(brain.progress["streams"])
++    state = StateStore(str(tmp_path / f"stop-sent-{late}.sqlite"))
++    drive = _fake_drive(monkeypatch)
++    gate = _install_gate(monkeypatch, _BlockingGate(blocking=False))
++    entered, release = threading.Event(), threading.Event()
++    answer = {"success": None, "quota": _GoogleError(429, LONG), "minimum": _GoogleError(503, LONG)}[late]
++
++    def in_flight():
++        entered.set()
++        assert release.wait(10), "the test never released the stop request"
++        return answer
++
++    drive.stop_answers = [in_flight]
++    sweep = asyncio.create_task(watch_renewal.renew_watches(state, _manager(), [_conn()], SETTINGS))
++    await asyncio.to_thread(entered.wait, 10)
++    deadline.expire()
++    await sweep
++    assert _run_stopped_warnings(caplog) == []  # cleanup ended on the timeout, nothing fell through
++    assert drive.calls == [("stop", "old0")]  # sent before the deadline; its answer had not come
++    _assert_cleanup_ended_untouched(brain, state, streams_before)
++
++    release.set()
++    assert await asyncio.to_thread(gate.closed.wait, 10)
++    if late == "quota":
++        await _until(lambda: _hold(state) is not None)
++        assert _published_hold(brain) is None
++    elif late == "minimum":
++        await _until(lambda: _stop_restriction(state, "minimum") is not None)
++        assert _hold(state) is None
++        published = (brain.progress.get("document_restrictions") or {}).get("items") or []
++        assert not [item for item in published if item.get("id") == "watch-stop:res-old0"]
++    else:
++        await asyncio.sleep(0)
++        assert _hold(state) is None and _stop_restriction(state, "minimum") is None
++    assert drive.calls == [("stop", "old0")]  # never resent
++    _assert_cleanup_ended_untouched(brain, state, streams_before)  # still pending; nothing published
++    state.close()
++
++
++# ------------------------------------------------------------------------------------------------ #
++# Admission that cannot be confirmed — before any client work, or after the authority check
++# ------------------------------------------------------------------------------------------------ #
++
++def _unanswered_admission(monkeypatch, nth: int) -> list[float]:
++    """The ``nth`` admission question the sweep asks gets no answer in time (the loop never replies);
++    every other one is answered by the production path."""
++    ask_loop = watch_renewal._ask_loop
++    asked: list[float] = []
++
++    def ask(loop, fn, timeout):
++        asked.append(timeout)
++        if len(asked) == nth:
++            raise TimeoutError("admission was not answered in time")
++        return ask_loop(loop, fn, timeout)
++
++    monkeypatch.setattr(watch_renewal, "_ask_loop", ask)
++    return asked
++
++
++@pytest.mark.parametrize("unanswered, authority_checks", [
++    pytest.param(1, 0, id="initial-admission"),
++    pytest.param(2, 1, id="post-authority-admission"),
++])
++@pytest.mark.asyncio
++async def test_a_stop_whose_admission_cannot_be_confirmed_is_never_executed_and_ends_cleanup(
++    tmp_path, monkeypatch, unanswered, authority_checks,
++):
++    """old0's admission is not answered — before any client work, or after the live authority check.
++    The stop is provably unsent: never executed, nothing published or projected for old0, and, with
++    restriction admission unconfirmed, cleanup ends for this sweep (old1 is not attempted)."""
++    brain = _quota_brain(due=False).install(monkeypatch)
++    streams_before = copy.deepcopy(brain.progress["streams"])
++    state = StateStore(str(tmp_path / f"stop-unconfirmed-{unanswered}.sqlite"))
++    drive = _fake_drive(monkeypatch)
++    gate = _install_gate(monkeypatch, _BlockingGate(blocking=False))
++    asked = _unanswered_admission(monkeypatch, unanswered)
++
++    await watch_renewal.renew_watches(state, _manager(), [_conn()], SETTINGS)
++
++    assert drive.calls == []
++    assert gate.checks == authority_checks  # an initial refusal comes before the authority check
++    assert len(asked) == unanswered  # no further question: no retry, no other channel
++    _assert_cleanup_ended_untouched(brain, state, streams_before)
++    assert _hold(state) is None
++    state.close()
++
++
++@pytest.mark.parametrize("unanswered, authority_checks", [
++    pytest.param(1, 3, id="initial-admission"),
++    pytest.param(2, 4, id="post-authority-admission"),
++])
++@pytest.mark.asyncio
++async def test_a_creation_whose_admission_cannot_be_confirmed_retires_as_not_dispatched(
++    tmp_path, monkeypatch, unanswered, authority_checks,
++):
++    """my-drive's creation is asked first; its admission is not answered — before any client work, or
++    after the live authority check. Nothing is sent, and the result arrives in time to be published:
++    the attempt retires, accurately, as not dispatched. Only that creation is affected — shared-x is
++    created and both channels are stopped (one authority check each); the predecessor and every cursor
++    are untouched."""
++    brain = _quota_brain(due=True).install(monkeypatch)
++    streams_before = copy.deepcopy(brain.progress["streams"])
++    state = StateStore(str(tmp_path / f"create-unconfirmed-{unanswered}.sqlite"))
++    drive = _fake_drive(monkeypatch)
++    gate = _install_gate(monkeypatch, _BlockingGate(blocking=False))
++    _unanswered_admission(monkeypatch, unanswered)
++
++    await watch_renewal.renew_watches(state, _manager(), [_conn()], SETTINGS)
++
++    assert ("watch", "my-drive") not in drive.calls
++    assert drive.calls == [("watch", "shared-x"), ("stop", "old0"), ("stop", "old1")]
++    assert gate.checks == authority_checks
++    records = brain.records()
++    (attempt,) = [r for r in records.values() if r.predecessor == "current"]
++    assert attempt.state == RETIRED
++    assert attempt.detail == "not dispatched: admission could not be confirmed"
++    assert attempt.resource_id is None
++    assert _local_watch_state(state, attempt.attempt_id) == RETIRED
++    assert records["current"].state == ACTIVE
++    assert brain.progress["streams"] == streams_before
++    assert _hold(state) is None
++    assert brain.events[-1] == "release"
++    state.close()
++
++
++# ------------------------------------------------------------------------------------------------ #
++# A stop whose provider client cannot be set up was never sent — not a failed stop
++# ------------------------------------------------------------------------------------------------ #
++
++@pytest.mark.parametrize("setup_error", [
++    pytest.param(lambda: MissingExtraError("gdrive", "google-api-python-client"), id="missing-extra"),
++    pytest.param(
++        lambda: ValueError("Google Drive watch credentials must be a local service account or brokered access token"),
++        id="unusable-credentials",
++    ),
++])
++@pytest.mark.asyncio
++async def test_a_stop_whose_client_cannot_be_set_up_spends_no_attempt_and_the_next_channel_is_stopped(
++    tmp_path, monkeypatch, setup_error,
++):
++    """old0's stop fails while the production manager sets up its client — the 'gdrive' extra is missing
++    or the credentials are unusable — before any request exists, let alone the authority check. That is
++    not a failed stop: no request, nothing published or projected for old0, no attempt counted. Its slot
++    stays spent and it is not retried; the independent old1 is stopped with the sweep's second slot, and
++    old2 waits for the next sweep."""
++    brain = _quota_brain(due=False, cleanups=3).install(monkeypatch)  # three to stop, two slots
++    streams_before = copy.deepcopy(brain.progress["streams"])
++    state = StateStore(str(tmp_path / "stop-setup-failed.sqlite"))
++    drive = _fake_drive(monkeypatch)
++    gate = _install_gate(monkeypatch, _BlockingGate(blocking=False))
++    failures = [setup_error()]
++
++    def setup(self, deadline=None):
++        if failures:  # the first client set up is old0's
++            raise failures.pop(0)
++        return drive
++
++    monkeypatch.setattr(GoogleDriveWatchManager, "_service", setup)
++
++    await watch_renewal.renew_watches(state, _manager(), [_conn()], SETTINGS)
++
++    assert failures == []  # old0's setup did fail
++    assert drive.calls == [("stop", "old1")]  # nothing executed for old0, and old0 was not retried
++    assert gate.checks == 1  # only old1's stop reached the authority check
++    _assert_old0_preserved(brain, state)  # in the brain, in every payload (old1's retirement), locally
++    records = brain.records()
++    assert records["old1"].state == RETIRED and records["old1"].detail == "stopped"
++    assert (records["old2"].state, records["old2"].stop_attempts) == (CLEANUP_PENDING, 0)
++    assert _local_watch_row(state, "old2") == (CLEANUP_PENDING, "res-old2", 0)
++    assert records["current"].state == ACTIVE and records["current-x"].state == ACTIVE
++    assert brain.progress["streams"] == streams_before
++    assert _hold(state) is None
++    assert brain.events[-1] == "release"
++    state.close()
+diff --git a/ingestion/tests/test_watch_lifecycle.py b/ingestion/tests/test_watch_lifecycle.py
+index 7ef935ff..7bc432c9 100644
+--- a/ingestion/tests/test_watch_lifecycle.py
++++ b/ingestion/tests/test_watch_lifecycle.py
+@@ -476,7 +476,10 @@ def _controlled_deadline(monkeypatch) -> asyncio.Event:
+     """The renewal's worker deadline passes exactly when the test sets the returned event.
+ 
+     Replaces only the bounded wait (``watch_renewal._wait_bounded``): the worker, the thread pool,
+-    the abandonment, late-result handling and publication are all the production code.
++    the abandonment, late-result handling and publication are all the production code. It does NOT
++    move the run's absolute deadline — publication and the manager still see time left — so it models
++    a creation's dispatch deadline (which keeps a publication reserve), not the run's end; use
++    :func:`_absolute_deadline` for that.
+     """
+     deadline_passed = asyncio.Event()
+ 
+@@ -494,6 +497,56 @@ def _controlled_deadline(monkeypatch) -> asyncio.Event:
+     return deadline_passed
+ 
+ 
++class _Clock:
++    """``time`` as the watch modules see it: a frozen monotonic clock the test moves by hand, every
++    other attribute the real module. asyncio keeps its own clock, so the event loop is unaffected."""
++
++    def __init__(self):
++        self.now = time.monotonic()
++
++    def monotonic(self) -> float:
++        return self.now
++
++    def __getattr__(self, name):
++        return getattr(time, name)
++
++
++class _RunDeadline:
++    """The run's ABSOLUTE deadline, under the test's control (see :func:`_absolute_deadline`)."""
++
++    def __init__(self, clock: _Clock, worker_wait: asyncio.Event):
++        self.clock, self._worker_wait = clock, worker_wait
++
++    def advance_past(self) -> None:
++        """Only the clock moves past the deadline: a worker still being waited for is not yet given up."""
++        self.clock.now += watch_renewal.WATCH_RUN_SECONDS + 1
++
++    def expire(self) -> None:
++        """The deadline passes as in production: the clock renewal and the manager read moves past it
++        AND the bounded wait for the current worker ends, together."""
++        self.advance_past()
++        self._worker_wait.set()
++
++    def reset(self) -> None:
++        """For a later sweep: its own deadline lies ahead of the moved clock; its waits end normally."""
++        self._worker_wait.clear()
++
++
++def _absolute_deadline(monkeypatch) -> _RunDeadline:
++    """Run deadlines that pass exactly when the test says — the real ones, not just a worker wait.
++
++    ``watch_renewal`` and the watch manager read a frozen clock: no deadline passes on its own, and
++    ``expire()`` moves it beyond every run's deadline while ending the bounded wait. Publication then
++    refuses (``_Run.bounded``), admission questions get no time, and the manager's own guard applies —
++    the production code throughout; only the clock and the wait are the test's."""
++    from aios_ingest.sources import gdrive_watch
++
++    clock = _Clock()
++    monkeypatch.setattr(watch_renewal, "time", clock)
++    monkeypatch.setattr(gdrive_watch, "time", clock)
++    return _RunDeadline(clock, _controlled_deadline(monkeypatch))
++
++
+ def _blocking_provider(brain: _Brain, resource_id: str):
+     entered, release = threading.Event(), threading.Event()
+ 
+@@ -746,6 +799,79 @@ def test_stop_treats_an_unknown_channel_as_already_gone():
+         manager.stop("channel", "resource")
+ 
+ 
++def _stop_clock(monkeypatch) -> _Clock:
++    from aios_ingest.sources import gdrive_watch
++
++    clock = _Clock()
++    monkeypatch.setattr(gdrive_watch, "time", clock)
++    return clock
++
++
++@pytest.mark.parametrize("gate_returns, executions", [
++    pytest.param(-1, [("stop", 0)], id="before-the-deadline"),
++    pytest.param(0, [], id="at-the-deadline"),
++    pytest.param(1, [], id="after-the-deadline"),
++])
++def test_a_stop_is_executed_only_if_its_gate_returns_before_the_run_deadline(
++    monkeypatch, gate_returns, executions,
++):
++    """The gate — the live authority check plus any admission composed into it — answers SUCCESSFULLY,
++    but at ``gate_returns`` seconds from the run's absolute deadline. At or after it, the manager's own
++    guard refuses: the request is never executed and the stop is reported as not sent."""
++    clock = _stop_clock(monkeypatch)
++    deadline = clock.now + 30
++    manager, seen = _manager_with({})
++
++    def gate_answering_late():
++        seen["gate"] = seen.get("gate", 0) + 1
++        clock.now = deadline + gate_returns
++
++    manager._provider_gate = gate_answering_late
++    if executions:
++        manager.stop("channel", "resource", deadline=deadline)
++    else:
++        with pytest.raises(WatchNotDispatched):
++            manager.stop("channel", "resource", deadline=deadline)
++    assert seen["gate"] == 1
++    assert seen["executions"] == executions
++
++
++def test_a_stop_whose_request_setup_outlives_the_run_deadline_is_never_executed(monkeypatch):
++    """Client construction / credential refresh takes the run past its absolute deadline; the authority
++    check then answers successfully. The request is never executed."""
++    clock = _stop_clock(monkeypatch)
++    run_deadline = clock.now + 30
++    manager, seen = _manager_with({})
++    build = manager._service
++
++    def slow_setup(deadline=None):
++        clock.now = run_deadline + 1
++        return build(deadline)
++
++    manager._service = slow_setup
++    with pytest.raises(WatchNotDispatched):
++        manager.stop("channel", "resource", deadline=run_deadline)
++    assert seen["gate"] == 1 and seen["executions"] == []
++
++
++def test_an_authority_refusal_keeps_its_precedence_over_the_stop_deadline(monkeypatch):
++    """The live authority check refuses, and by then the deadline has passed too: the refusal itself is
++    raised — the caller ends the connection's run on it — and nothing is executed."""
++    clock = _stop_clock(monkeypatch)
++    deadline = clock.now + 30
++    manager, seen = _manager_with({})
++    refusal = BrainError(409, "connection_unavailable", "paused")
++
++    def refusing_after_the_deadline():
++        clock.now = deadline + 1
++        raise refusal
++
++    manager._provider_gate = refusing_after_the_deadline
++    with pytest.raises(BrainError) as raised:
++        manager.stop("channel", "resource", deadline=deadline)
++    assert raised.value is refusal and seen["executions"] == []
++
++
+ def test_the_webhook_records_an_early_notification_for_a_pending_attempt_without_waking_anything(
+     tmp_path, monkeypatch,
+ ):
+diff --git a/ingestion/tests/test_watch_quota_hold.py b/ingestion/tests/test_watch_quota_hold.py
+index ce1dc281..507ce410 100644
+--- a/ingestion/tests/test_watch_quota_hold.py
++++ b/ingestion/tests/test_watch_quota_hold.py
+@@ -93,6 +93,8 @@ class _Request:
+         self.drive.calls.append((self.kind, self.target))
+         answers = self.drive.watch_answers if self.kind == "watch" else self.drive.stop_answers
+         answer = answers.pop(0) if answers else None
++        if callable(answer):  # runs inside the request — already sent — e.g. blocks, then answers
++            answer = answer()
+         if isinstance(answer, Exception):
+             raise answer
+         if self.kind == "watch":
