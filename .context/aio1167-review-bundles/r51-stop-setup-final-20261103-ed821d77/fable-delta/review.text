@@ -1,0 +1,63 @@
+I'll locate the review packet (delta.diff, accepted-spec.md, prior-adjudication-context.md, verification.md) and then read the delta against the surrounding code read-only.
+
+The bundle is `.context/aio1167-review-bundles/r51-stop-setup-final-20261103-ed821d77/fable-delta/`. Reading the packet files now.
+
+Packet read. Now the surrounding production code and test helpers, read-only.
+
+**Prompt restated:** Fable 5.1 read-only correction review of the delta `b6628c3e` → `ed821d77` (R51 stop-setup correction) against the accepted spec, AGENTS.md, the prior adjudication, and verification.md. Return CLEAN or CHANGES REQUIRED with only actionable findings, confirm candidate and delta hash, and do not infer certification or soak.
+
+## Verdict: CLEAN
+
+Reviewed candidate `ed821d771cf1da1cbf78a3422b46e9dff3f76230` via the bundle's `delta.diff` at `.context/aio1167-review-bundles/r51-stop-setup-final-20261103-ed821d77/fable-delta/`. The prompt states the delta SHA-256 as `700dd52f48401ace346867fac2b3cecbb8ddca58708dd3af47f01f3543cb36b9`. I could not recompute that hash because this review ran without command execution, so I attest to the file contents I read, not to an independently computed digest. No production Google certification or 24-hour soak is inferred from this review. Verification.md records them as not run.
+
+**Decision 2, exception boundary.** The translation at `ingestion/aios_ingest/sources/gdrive_watch.py:190-193` wraps only the `_service(deadline)` call. The stop request object is built on line 194, the gate runs on 195-196, the deadline guard on 197-198, and execute on 200. So every exception the new `except` can see is provably pre-request, and gate refusals, the manager's deadline guard, quota, minimum, 404 and raw execute errors keep their existing outcomes. `WatchStopSetupFailed` is never raised on the create path because `dispatch` calls `_service` directly and already folds everything into `WatchNotDispatched` at lines 163-164.
+
+**Cleanup handler.** `watch_renewal.py:741-747` sits after `_StopNotSent` and before the parent `WatchNotDispatched` handler, which is the required order for a subclass. It publishes nothing, bumps nothing, and `continue` re-enters the loop head at line 675, so the next channel is still subject to `budget.stops`, `MAX_STOP_ATTEMPTS`, `run.remaining()`, the account hold at 677 and the operation restriction at 680. The slot deducted at line 685 is not refunded. Authority precedence is unchanged: the pre-client `confirm()` at line 719 still runs before `manager.stop`, and the gate order inside `admitted_gate` is untouched.
+
+**Production-manager setup tests.** `test_watch_late_quota.py:1118-1162` uses `ConfiguredGoogleDriveWatchManager` via `_manager()`, parameterizes both setup errors, and seeds three cleanup channels against `MAX_STOPS_PER_SWEEP = 2`. The assertions pin each required property and each plausible mutation reddens a distinct one:
+- Drop the manager translation and old0 takes a failed attempt, failing `_assert_old0_preserved` on brain record, every checkpoint payload and the local row.
+- Drop the cleanup handler and the subclass falls into the parent `WatchNotDispatched` return, so old1 is never stopped and `drive.calls` fails.
+- Refund the slot and old2 is stopped, failing `drive.calls` and the old2 assertions.
+- Retry old0 and `drive.calls` gains a `("stop", "old0")` entry.
+
+**Decision 1, caplog discriminator.** With the frozen clock from `_absolute_deadline`, removing either explicit handler sends the exception into `except Exception` at line 774, `run.publish` hits `bounded()` at lines 213-216 with no time left, `WatchStepTimeout` escapes `_cleanup`, and `_renew_connection` logs `Drive watch renewal for gd stopped: WatchStepTimeout` at line 885. The helper at test lines 856-863 filters on that logger name and that exact prefix, the connection name is `gd` from `_conn()`, no dictConfig or propagate override exists under `ingestion/`, and `test_gdrive_poll_reporting.py:302-307` already shows caplog capturing an aios_ingest warning via root propagation. All three deadline tests assert before any recovery sweep or late-worker release. The info-level quota message at line 878 does not share the prefix.
+
+## Non-blocking observations
+
+- **LOW, `ingestion/tests/test_watch_late_quota.py:849-863`.** Trigger: the prefix is a hand-copied literal of the format string at `watch_renewal.py:885`. Impact: a future rewording of that warning silently turns the three `== []` assertions vacuous. Correction: add one positive control that drives the swallowed generic path deterministically and asserts the helper returns one entry, for example a `drive.stop_answers` callable that calls `deadline.advance_past()` inside the in-flight request and then raises a plain 500 with no Retry-After.
+- **LOW, `gdrive_watch.py:192`.** The `ValueError` catch spans all of `_service`, which with `deadline=None` also calls the provider gate and `build`. Today the only stop caller passes `run.deadline`, and gate failures are `BrainError` or `_StopNotSent`, neither a `ValueError`, so nothing is misclassified. If you want the catch to match the docstring literally, wrap only the credential construction at lines 101-111 inside `_service`.
+- **Out of scope by the adjudication, not a finding.** `ConfiguredGoogleDriveWatchManager._manager` raising on a missing `webhook_url`, and google-auth `MalformedError` on a bad key, still spend provider-failure attempts.
+
+The stop hook ran the claude-mem summarizer and reported no errors. Nothing further is needed from me; the review above stands as delivered.
+
+**Prompt restated:** Fable 5.1 read-only correction review of the R51 stop-setup delta `b6628c3e` → `ed821d77`.
+
+**Verdict: CLEAN** for candidate `ed821d771cf1da1cbf78a3422b46e9dff3f76230`. Two LOW non-blocking observations were noted: a positive control for the caplog prefix helper, and optionally narrowing the `ValueError` catch to the credential block inside `_service`. No certification or soak completion is inferred.
+
+**Prompt restated:** Fable 5.1 read-only correction review of the R51 stop-setup delta `b6628c3e` → `ed821d77`, followed by two claude-mem stop-hook summaries.
+
+The stop hook completed cleanly both times. The review is finished and unchanged: **CLEAN** for candidate `ed821d771cf1da1cbf78a3422b46e9dff3f76230`, with two LOW non-blocking observations and no inference of certification or soak completion.
+
+**Prompt restated:** Fable 5.1 read-only correction review of the R51 stop-setup delta `b6628c3e` → `ed821d77`, followed by repeated claude-mem stop-hook summaries.
+
+The hook keeps reporting success with no stderr. There is no outstanding work. Final answer stands: **CLEAN** for candidate `ed821d771cf1da1cbf78a3422b46e9dff3f76230`, two LOW non-blocking observations, no certification or soak inferred.
+
+**Prompt restated:** Fable 5.1 read-only correction review of the R51 stop-setup delta `b6628c3e` → `ed821d77`; the claude-mem stop hook has now fired four times with no errors.
+
+Nothing is pending. Verdict remains **CLEAN** for candidate `ed821d771cf1da1cbf78a3422b46e9dff3f76230`.
+
+**Prompt restated:** Fable 5.1 read-only correction review of the R51 stop-setup delta `b6628c3e` → `ed821d77`; the claude-mem stop hook continues to re-fire with no errors.
+
+The hook output is a successful summarizer run, not a request for more work. The review is complete: **CLEAN** for candidate `ed821d771cf1da1cbf78a3422b46e9dff3f76230`. If the hook loop itself is unwanted, that is a plugin configuration matter outside this session.
+
+**Prompt restated:** Fable 5.1 read-only correction review of the R51 stop-setup delta `b6628c3e` → `ed821d77`; sixth successful claude-mem stop-hook run.
+
+No action required. Verdict: **CLEAN**, candidate `ed821d771cf1da1cbf78a3422b46e9dff3f76230`.
+
+**Prompt restated:** Fable 5.1 read-only correction review of the R51 stop-setup delta; the claude-mem stop hook has re-fired a seventh time with no errors.
+
+Review complete, nothing pending. Verdict: **CLEAN**, candidate `ed821d771cf1da1cbf78a3422b46e9dff3f76230`.
+
+**Prompt restated:** Fable 5.1 read-only correction review of the R51 stop-setup delta; eighth successful claude-mem stop-hook run.
+
+Nothing pending. Verdict: **CLEAN**, candidate `ed821d771cf1da1cbf78a3422b46e9dff3f76230`.

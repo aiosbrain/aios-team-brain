@@ -15,14 +15,39 @@
       "prior-adjudication-context.md": "1f076d97af3e623b687479cd259df3d83c86a2d1ebf342817649876e9fa6dd95",
       "delta.diff": "700dd52f48401ace346867fac2b3cecbb8ddca58708dd3af47f01f3543cb36b9",
       "review-prompt.md": "9fe631ea6e8a420f2726881a38b86db13221a08763f99a282f87544732f4ce10",
-      "verification.md": "d5e00bbaa4e59e7113db79fd4711df25c74f8c690d05d098adfb651ebd5f9f55"
+      "verification.md": "f3764a15fdf835ab9dbb0931af36e267e035f9ca478e1c2083a8abd334cd2407",
+      "review-report.md": "dec78b1ca401d049d778cc2b08a8a01ae75f2aaacc4134df86cc296e9baa90b5",
+      "review.meta.json": "a402eb14b00a6e0663f5d98235e683e5eaf9ab9308b9f4611096fbb3b7e8073e",
+      "review.activity.log": "888372d82941ba1cb845e52c5810048169d539ad1fdfa2addfdcdc709f19c90f",
+      "review.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "review.exit": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
     },
     "blind-final": {
       "AGENTS.md": "e4117721d454be48f881a878037a07353ea7b355741e366169746276466bdb72",
       "accepted-spec.md": "297ee1df91463fd0b6c4863b34be8b999ad176fc7d40f0637bf196660bd65e3d",
       "full.diff": "b29dfd8ebf8b1778b0d4f79309ae6d5f110c122162ba397e1b9c6a9489126b31",
       "review-prompt.md": "036810ee1aeb385df9357fef51a10460f5344cf8e37b5f00dfb4a6f0e0ae2253",
-      "verification.md": "d5e00bbaa4e59e7113db79fd4711df25c74f8c690d05d098adfb651ebd5f9f55"
+      "verification.md": "f3764a15fdf835ab9dbb0931af36e267e035f9ca478e1c2083a8abd334cd2407"
+    }
+  },
+  "reviews": {
+    "fable-delta": {
+      "model": "claude-fable-5-1",
+      "provider": "firstParty",
+      "session_id": "a84ecca8-0b79-4142-b49a-870ca68cce10",
+      "subtype": "success",
+      "stop_reason": "end_turn",
+      "num_turns": 42,
+      "exit_code": 0,
+      "verdict": "CLEAN",
+      "nonblocking_low_observations": 2,
+      "report_sha256": "dec78b1ca401d049d778cc2b08a8a01ae75f2aaacc4134df86cc296e9baa90b5",
+      "metadata_sha256": "a402eb14b00a6e0663f5d98235e683e5eaf9ab9308b9f4611096fbb3b7e8073e",
+      "activity_tools": [
+        "Glob",
+        "Grep",
+        "Read"
+      ]
     }
   }
 }

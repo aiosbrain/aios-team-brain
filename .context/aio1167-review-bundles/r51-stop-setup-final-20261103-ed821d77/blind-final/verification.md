@@ -13,3 +13,5 @@ Coordinator checks:
 No production Google certification or 24-hour sandbox soak has run. No merge or deployment.
 
 Fresh quota read before review dispatch: 2026-11-03 10:49:45 UTC / 16:19:45 Asia/Kolkata, `/usage` in the already-authenticated interactive Claude CLI. All-model week **60%**, Fable week **73%**, reset 5:30 p.m. Asia/Kolkata; credits **off**. This CLI view did not show a session-limit percentage. Do not interpret session token/cost totals as quota percentages.
+
+Quota monitor during the active review: 2026-11-03 11:10:39 UTC / 16:40:39 Asia/Kolkata `/usage` showed all-model week 60%, Fable week 74%, credits off, reset 5:30 p.m.; no session-limit percentage was displayed. This was the 20-minute monitor check; continue 20-minute monitoring while work is active.
