@@ -70,6 +70,7 @@ from .state import StateStore, StreamKey, verification_hash
 from .watch_lifecycle import (
     ACTIVE, CLEANUP_PENDING, DISPATCHED, EXPIRED, PENDING_STATES, PREPARED, RETIRED, UNCERTAIN,
     InvalidWatchResponse, WatchNotDispatched, WatchProviderMinimum, WatchQuotaLimited, WatchRecord, WatchRefused,
+    WatchStopSetupFailed,
     from_section, now_iso, parse_instant, requested_expiry, to_section, transition,
     validate_watch_response,
 )
@@ -737,6 +738,13 @@ async def _cleanup(
             if exc.scope == "operation":
                 continue  # this channel waits for its minimum; the independent channels go on
             return  # the account's hold — or unconfirmed admission — ends cleanup for this sweep
+        except WatchStopSetupFailed as exc:
+            # The client could not be set up, so no request was ever built: not a failed stop. The
+            # channel stays exactly as acknowledged — nothing published or projected, no attempt
+            # counted — its slot stays spent (never retried this sweep), and the next channel is
+            # still subject to the run deadline and the remaining budget.
+            log.warning("Drive watch renewal for %s: %s", connection, exc)
+            continue
         except WatchNotDispatched:
             # The manager's own guard: its gate returned at or after the run deadline, so the request
             # was never executed. Not a failed stop — nothing is published or projected — and the run

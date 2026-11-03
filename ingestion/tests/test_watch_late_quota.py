@@ -39,6 +39,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import dataclasses
+import logging
 import threading
 import time
 from concurrent.futures import Future
@@ -55,6 +56,7 @@ from aios_ingest.watch_lifecycle import (
     ACTIVE, CLEANUP_PENDING, DISPATCHED, PREPARED, RETIRED, UNCERTAIN, WatchProviderMinimum,
     WatchQuotaLimited, from_section, to_section,
 )
+from aios_ingest.sources.base import MissingExtraError
 from aios_ingest.sources.gdrive_watch import GoogleDriveWatchManager
 from test_watch_lifecycle import (
     ACCOUNT, INTEGRATION, SETTINGS, _absolute_deadline, _conn, _controlled_deadline, _Provider, _record,
@@ -844,10 +846,27 @@ def _assert_cleanup_ended_untouched(brain, state, streams_before) -> None:
     assert brain.events[-1] == "release"
 
 
+_RUN_STOPPED = "Drive watch renewal for gd stopped:"
+
+
+def _capture_renewal_warnings(caplog) -> None:
+    caplog.set_level(logging.WARNING, logger=watch_renewal.log.name)
+
+
+def _run_stopped_warnings(caplog) -> list[str]:
+    """The connection run's catch-all warnings: a deadline stop that fell through to failed-attempt
+    accounting tries to publish past the deadline, is refused, and ends the run with one of these —
+    with every persisted outcome still unchanged. Only the renewal module's run-level prefix counts."""
+    return [
+        record.getMessage() for record in caplog.records
+        if record.name == watch_renewal.log.name and record.getMessage().startswith(_RUN_STOPPED)
+    ]
+
+
 @pytest.mark.parametrize("phase", ["queued", "request-setup", "authority-check", "final-admission"])
 @pytest.mark.asyncio
 async def test_a_stop_that_reaches_the_run_deadline_is_never_executed_and_ends_cleanup(
-    tmp_path, monkeypatch, phase,
+    tmp_path, monkeypatch, caplog, phase,
 ):
     """old0's stop is still queued behind busy workers, constructing its request, blocked in the live
     authority check, or blocked in the final admission when the run's absolute deadline passes. The
@@ -856,6 +875,7 @@ async def test_a_stop_that_reaches_the_run_deadline_is_never_executed_and_ends_c
     deadline and never executes the request: an unanswerable admission refuses it, and an admission
     answered successfully only after the deadline meets the manager's own guard. The next sweep, from
     the acknowledged record, stops both channels."""
+    _capture_renewal_warnings(caplog)
     deadline = _absolute_deadline(monkeypatch)
     brain = _quota_brain(due=False).install(monkeypatch)  # no creation is due; old0 and old1 to stop
     streams_before = copy.deepcopy(brain.progress["streams"])
@@ -894,6 +914,9 @@ async def test_a_stop_that_reaches_the_run_deadline_is_never_executed_and_ends_c
         await asyncio.to_thread(entered.wait, 10)
     deadline.expire()
     await sweep
+    # Cleanup ENDED on the timeout — it did not fall through to a failed-attempt publication that the
+    # deadline then refused and the run swallowed (which would leave the same persisted state).
+    assert _run_stopped_warnings(caplog) == []
     _assert_cleanup_ended_untouched(brain, state, streams_before)
 
     release.set()  # the worker — if it ever started — continues past the deadline
@@ -906,6 +929,7 @@ async def test_a_stop_that_reaches_the_run_deadline_is_never_executed_and_ends_c
     assert _hold(state) is None
     if phase == "final-admission":
         assert len(asked) == 2  # admitted after the deadline: only the manager's guard refused it
+    assert _run_stopped_warnings(caplog) == []  # checked before the recovery sweep
 
     # The acknowledged cleanup_pending record stands: the next sweep stops both channels.
     deadline.reset()
@@ -918,13 +942,14 @@ async def test_a_stop_that_reaches_the_run_deadline_is_never_executed_and_ends_c
 
 @pytest.mark.asyncio
 async def test_a_stop_admitted_after_the_run_deadline_is_refused_by_the_managers_guard_and_ends_cleanup(
-    tmp_path, monkeypatch,
+    tmp_path, monkeypatch, caplog,
 ):
     """The run's absolute deadline passes while old0's authority check blocks, and the sweep is still
     waiting for its worker. The check then returns and the final admission is answered SUCCESSFULLY —
     after the deadline. Only the manager's own guard stands between that answer and the provider: it
     refuses, and the sweep — seeing a stop that was never executed — ends cleanup without a failed
     attempt, a checkpoint or a projection change. The one slot old0 took is not refunded: old1 waits."""
+    _capture_renewal_warnings(caplog)
     deadline = _absolute_deadline(monkeypatch)
     brain = _quota_brain(due=False).install(monkeypatch)
     streams_before = copy.deepcopy(brain.progress["streams"])
@@ -942,6 +967,8 @@ async def test_a_stop_admitted_after_the_run_deadline_is_refused_by_the_managers
     gate.release.set()
     await sweep
 
+    # Cleanup ENDED on the manager's refusal — no fall-through to a refused failed-attempt publication.
+    assert _run_stopped_warnings(caplog) == []
     assert drive.calls == []
     assert gate.checks == 1  # old0 asked authority once; no retry, and old1 was never attempted
     _assert_cleanup_ended_untouched(brain, state, streams_before)
@@ -951,12 +978,13 @@ async def test_a_stop_admitted_after_the_run_deadline_is_refused_by_the_managers
 @pytest.mark.parametrize("late", ["success", "quota", "minimum"])
 @pytest.mark.asyncio
 async def test_a_stop_sent_before_the_run_deadline_stays_pending_after_abandonment(
-    tmp_path, monkeypatch, late,
+    tmp_path, monkeypatch, caplog, late,
 ):
     """old0's stop request is already executing when the run's absolute deadline passes. Cleanup ends
     without publishing anything for it. The abandoned request then answers: a late success retires
     nothing — the record stays cleanup_pending, conservatively, until a sweep that owns it stops it — and
     a late quota answer or stop minimum is journaled locally only, never published by this run."""
+    _capture_renewal_warnings(caplog)
     deadline = _absolute_deadline(monkeypatch)
     brain = _quota_brain(due=False).install(monkeypatch)
     streams_before = copy.deepcopy(brain.progress["streams"])
@@ -976,6 +1004,7 @@ async def test_a_stop_sent_before_the_run_deadline_stays_pending_after_abandonme
     await asyncio.to_thread(entered.wait, 10)
     deadline.expire()
     await sweep
+    assert _run_stopped_warnings(caplog) == []  # cleanup ended on the timeout, nothing fell through
     assert drive.calls == [("stop", "old0")]  # sent before the deadline; its answer had not come
     _assert_cleanup_ended_untouched(brain, state, streams_before)
 
@@ -1077,6 +1106,57 @@ async def test_a_creation_whose_admission_cannot_be_confirmed_retires_as_not_dis
     assert attempt.resource_id is None
     assert _local_watch_state(state, attempt.attempt_id) == RETIRED
     assert records["current"].state == ACTIVE
+    assert brain.progress["streams"] == streams_before
+    assert _hold(state) is None
+    assert brain.events[-1] == "release"
+    state.close()
+
+
+# ------------------------------------------------------------------------------------------------ #
+# A stop whose provider client cannot be set up was never sent — not a failed stop
+# ------------------------------------------------------------------------------------------------ #
+
+@pytest.mark.parametrize("setup_error", [
+    pytest.param(lambda: MissingExtraError("gdrive", "google-api-python-client"), id="missing-extra"),
+    pytest.param(
+        lambda: ValueError("Google Drive watch credentials must be a local service account or brokered access token"),
+        id="unusable-credentials",
+    ),
+])
+@pytest.mark.asyncio
+async def test_a_stop_whose_client_cannot_be_set_up_spends_no_attempt_and_the_next_channel_is_stopped(
+    tmp_path, monkeypatch, setup_error,
+):
+    """old0's stop fails while the production manager sets up its client — the 'gdrive' extra is missing
+    or the credentials are unusable — before any request exists, let alone the authority check. That is
+    not a failed stop: no request, nothing published or projected for old0, no attempt counted. Its slot
+    stays spent and it is not retried; the independent old1 is stopped with the sweep's second slot, and
+    old2 waits for the next sweep."""
+    brain = _quota_brain(due=False, cleanups=3).install(monkeypatch)  # three to stop, two slots
+    streams_before = copy.deepcopy(brain.progress["streams"])
+    state = StateStore(str(tmp_path / "stop-setup-failed.sqlite"))
+    drive = _fake_drive(monkeypatch)
+    gate = _install_gate(monkeypatch, _BlockingGate(blocking=False))
+    failures = [setup_error()]
+
+    def setup(self, deadline=None):
+        if failures:  # the first client set up is old0's
+            raise failures.pop(0)
+        return drive
+
+    monkeypatch.setattr(GoogleDriveWatchManager, "_service", setup)
+
+    await watch_renewal.renew_watches(state, _manager(), [_conn()], SETTINGS)
+
+    assert failures == []  # old0's setup did fail
+    assert drive.calls == [("stop", "old1")]  # nothing executed for old0, and old0 was not retried
+    assert gate.checks == 1  # only old1's stop reached the authority check
+    _assert_old0_preserved(brain, state)  # in the brain, in every payload (old1's retirement), locally
+    records = brain.records()
+    assert records["old1"].state == RETIRED and records["old1"].detail == "stopped"
+    assert (records["old2"].state, records["old2"].stop_attempts) == (CLEANUP_PENDING, 0)
+    assert _local_watch_row(state, "old2") == (CLEANUP_PENDING, "res-old2", 0)
+    assert records["current"].state == ACTIVE and records["current-x"].state == ACTIVE
     assert brain.progress["streams"] == streams_before
     assert _hold(state) is None
     assert brain.events[-1] == "release"

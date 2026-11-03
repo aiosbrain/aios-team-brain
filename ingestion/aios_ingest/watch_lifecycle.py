@@ -81,6 +81,13 @@ class WatchNotDispatched(RuntimeError):
     sent: a creation can have created no channel, and a stop has not reached the provider."""
 
 
+class WatchStopSetupFailed(WatchNotDispatched):
+    """A cleanup stop's provider client could not be set up — the 'gdrive' extra is missing, or the
+    credentials are unusable — so its request was never built, let alone sent. Not a failed stop: the
+    channel stays exactly as acknowledged, no provider-failure attempt is counted, and the sweep's
+    other channels go on."""
+
+
 class WatchRefused(RuntimeError):
     """The provider answered the creation request with a definitive refusal: nothing was created."""
 

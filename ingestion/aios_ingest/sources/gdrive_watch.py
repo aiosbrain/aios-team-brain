@@ -15,7 +15,8 @@ import time
 from typing import Any
 
 from ..watch_lifecycle import (
-    WatchNotDispatched, WatchProviderMinimum, WatchQuotaLimited, WatchRecord, WatchRefused, parse_instant,
+    WatchNotDispatched, WatchProviderMinimum, WatchQuotaLimited, WatchRecord, WatchRefused,
+    WatchStopSetupFailed, parse_instant,
 )
 from .base import MissingExtraError
 
@@ -181,8 +182,15 @@ class GoogleDriveWatchManager:
         admission the caller composed into it — and immediately before the request: a stop whose gate
         returns at or after the deadline, even successfully, is never executed and raises
         :class:`WatchNotDispatched`. Neither transport's own timeout stands in for this bound.
+
+        The client's known setup failures — the missing 'gdrive' extra and unusable credentials —
+        happen before any request exists and are raised as :class:`WatchStopSetupFailed`; anything
+        else, from the gate or the request, keeps its own outcome.
         """
-        svc = self._service(deadline)
+        try:
+            svc = self._service(deadline)
+        except (MissingExtraError, ValueError) as exc:
+            raise WatchStopSetupFailed(f"stop not sent: client setup failed: {type(exc).__name__}") from exc
         request = svc.channels().stop(body={"id": channel_id, "resourceId": resource_id})
         if self._provider_gate:
             self._provider_gate()
