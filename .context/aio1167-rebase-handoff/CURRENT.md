@@ -1,12 +1,20 @@
 # AIO-1167 current handoff
 
-Updated: 2026-10-31 (Asia/Kolkata)
+Updated: 2026-11-03 06:01 UTC (11:31 Asia/Kolkata)
 
 ## Objective and policy
 
 Continue the user-authorized AIO-1167 / PR #743 Drive connector work on the rebased feature branch. One coordinator owns checks, reviews, checkpoints, pushes and handoff; one existing Claude Opus 5.5 HIGH session is the sole writer. Subscription-authenticated Claude only. No merge, deployment, API billing or permission bypass. User resolved the Drive metadata boundary: ordinary/external keys cannot read Drive account or selection metadata; only the live bound connector key receives its own authorized connection metadata.
 
 Resolved current implementation questions: retain source-supported credit for a deactivated member when an existing stable identity mapping resolves it; deactivation blocks new links/authentication, not attribution of newly discovered historical work. Keep the production Google token endpoint fixed; the real-HTTP test may use a test-harness-only interception/injection to reach its loopback fixture, with no production environment override.
+
+## Current R51 review state — 2026-11-03 06:01 UTC
+
+- Existing Opus 5.5 HIGH writer `628402d5-a1c6-42b7-b736-e84358c1a749` completed its third follow-up at 05:40 UTC; it is idle. Source candidate `97b7bc92133f656ff369d31e437232d0a2a53cc8`; evidence/handoff HEAD `29db34cabb5978eb9cf554006bbd474f9d3c956a`. Verify remote branch before the next major phase.
+- Fresh full-user Claude.ai `/usage` (2026-11-03 about 11:30 Asia/Kolkata): all-model week 55%, Fable week 66%, credits off. API key/token overrides unset. Auth is first-party `claude.ai` Max. Both visible weekly windows are below 90%.
+- Reviews of the immutable 70-path candidate: Fable 5.1 completed CLEAN; blind Astra HIGH and blind GPT-6.1 Sol HIGH returned CHANGES REQUIRED. Accept two independently confirmed P2s: same-page trash→restore leaves stale membership removal for an already-selected document; ambiguous equivalent Google email per-key repair can erase established item/version credit. Fable’s four Low observations and review disagreement are adjudicated in `r51-final-review-disposition-20261103.md`.
+- Next: checkpoint/push the disposition + writer prompt (prompt SHA-256 `80588644c4f3509530803b1eb7af8c9ec333c6d2b08c9685f5669ee98c75d46a`), then resume the same Opus session for those two P2s plus the bounded Fable L2/L4 diagnostics regressions. No implementation writer is currently active. Coordinator owns verification, checkpoints, review routing and pushes. Fresh reviews are required after fixes. Full Fable report: `fable-r51-final-review-20261103.md`; disposition: `r51-final-review-disposition-20261103.md`.
+- PR714 identity ownership decision was re-read: PR743 owns Google `author-email:` behavior and this branch’s Google identity repair; PR714 retains Slack suppression/generation/cutover. Current PR714 worktree has no `lib/ingest/identity-repair.ts`. Keep shared locks and Slack code unchanged. Live Google certification and 24-hour soak remain open.
 
 ## Source and checkpoint
 
