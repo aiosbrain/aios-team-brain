@@ -1,6 +1,6 @@
 # AIO-1167 current handoff
 
-Updated: 2026-11-03 16:55 Asia/Kolkata
+Updated: 2026-11-03 17:20 Asia/Kolkata
 
 ## Objective and constraints
 
@@ -35,6 +35,6 @@ Exact review bundle: `.context/aio1167-review-bundles/r51-stop-setup-final-20261
 
 ## Next action
 
-Astra MEDIUM adjudicated both Fable LOW observations as non-blocking future-proofing; no source change is needed before the blind final reviews. The durable decision is `.context/aio1167-review-bundles/r51-stop-setup-final-20261103-ed821d77/fable-delta/astra-adjudication.md`. The positive-control suggestion and optional narrower ValueError catch are deferred. Astra HIGH blind final review is now CLEAN. After fresh Codex usage verification, conduct the independent blind GPT-6.1 Sol HIGH final review of the exact candidate. If either finds a confirmed in-scope failure, adjudicate and implement it with the existing Opus writer, then rerun invalidated checks/reviews. Keep the coordinator active through terminal verdicts and checkpoints. No merge or deployment.
+Astra MEDIUM adjudicated both Fable LOW observations as non-blocking future-proofing; no source change is needed before the blind final reviews. The durable decision is `.context/aio1167-review-bundles/r51-stop-setup-final-20261103-ed821d77/fable-delta/astra-adjudication.md`. The positive-control suggestion and optional narrower ValueError catch are deferred. Astra HIGH blind final review is now CLEAN. Fresh Codex quota admission at 2026-11-03 11:20 UTC / 16:50 Asia/Kolkata: 34% weekly use; no reset credits were used. Conduct the independent blind GPT-6.1 Sol HIGH final review of the exact candidate. If either finds a confirmed in-scope failure, adjudicate and implement it with the existing Opus writer, then rerun invalidated checks/reviews. Keep the coordinator active through terminal verdicts and checkpoints. No merge or deployment.
 
 Historical handoff and detailed phase records are preserved in `ARCHIVE-current-through-20261103-pre-ed821.md`; read only evidence relevant to the next decision.
