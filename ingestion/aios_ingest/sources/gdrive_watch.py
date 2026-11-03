@@ -174,11 +174,20 @@ class GoogleDriveWatchManager:
             raise
 
     def stop(self, channel_id: str, resource_id: str, *, deadline: float | None = None) -> None:
-        """Stop one known channel. A channel the provider no longer knows (404) is already gone."""
+        """Stop one known channel. A channel the provider no longer knows (404) is already gone.
+
+        ``deadline`` is the run's absolute ``time.monotonic`` deadline. It is enforced after the gate —
+        the live authority check, whose refusal is raised as is and keeps its precedence, and any
+        admission the caller composed into it — and immediately before the request: a stop whose gate
+        returns at or after the deadline, even successfully, is never executed and raises
+        :class:`WatchNotDispatched`. Neither transport's own timeout stands in for this bound.
+        """
         svc = self._service(deadline)
         request = svc.channels().stop(body={"id": channel_id, "resourceId": resource_id})
         if self._provider_gate:
             self._provider_gate()
+        if deadline is not None and _remaining(deadline) <= 0:
+            raise WatchNotDispatched("run deadline reached before the stop request was sent")
         try:
             request.execute(num_retries=0)
         except Exception as exc:

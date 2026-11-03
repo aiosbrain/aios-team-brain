@@ -20,7 +20,10 @@ acquires the same execution authority as polling, then:
    and the channel's stop minimum are checked the same way — before the worker starts and again after
    the live authority check. A refused stop was never sent: the channel stays ``cleanup_pending``
    with its stop attempts unchanged; an account hold ends that account's cleanup for the sweep, a
-   channel's minimum defers only that channel.
+   channel's minimum defers only that channel. The manager enforces the run's absolute deadline
+   after its gate and immediately before the request; a stop that reaches the deadline — refused by
+   that guard, or still queued, blocked or in flight — is not a failed attempt: nothing is published
+   and cleanup ends.
 
 Every lifecycle change is published to the brain under the fence via the renewal-owned ``watches``
 section (``connector_state.renewal_document``): renewal can never touch a cursor, and a stale
@@ -734,6 +737,20 @@ async def _cleanup(
             if exc.scope == "operation":
                 continue  # this channel waits for its minimum; the independent channels go on
             return  # the account's hold — or unconfirmed admission — ends cleanup for this sweep
+        except WatchNotDispatched:
+            # The manager's own guard: its gate returned at or after the run deadline, so the request
+            # was never executed. Not a failed stop — nothing is published or projected — and the run
+            # has no time left for another.
+            return
+        except WatchStepTimeout:
+            # The run deadline passed while the stop was queued, constructing its request, blocked in
+            # its gate or admission, or in flight. A worker having started is no proof the request was
+            # sent, so no failed attempt is counted and nothing is published or projected: the
+            # acknowledged cleanup_pending record stands for the next sweep. A worker still running
+            # is abandoned: past the deadline the manager never executes a request it has not sent,
+            # and a request already sent stays conservatively pending — its late answer can only add
+            # the account's hold or this channel's minimum, locally. Cleanup ends here.
+            return
         except WatchQuotaLimited as exc:
             # The channel still exists: the record stays cleanup_pending, spending no stop attempt —
             # the account's quota is not this channel's failure (R51 final 3).
