@@ -28,7 +28,8 @@
       "accepted-spec.md": "297ee1df91463fd0b6c4863b34be8b999ad176fc7d40f0637bf196660bd65e3d",
       "full.diff": "b29dfd8ebf8b1778b0d4f79309ae6d5f110c122162ba397e1b9c6a9489126b31",
       "review-prompt.md": "036810ee1aeb385df9357fef51a10460f5344cf8e37b5f00dfb4a6f0e0ae2253",
-      "verification.md": "f3764a15fdf835ab9dbb0931af36e267e035f9ca478e1c2083a8abd334cd2407"
+      "verification.md": "f3764a15fdf835ab9dbb0931af36e267e035f9ca478e1c2083a8abd334cd2407",
+      "astra-review-report.md": "06e1d083b43a56d2c707b0771b4899e310824cc96d1c7a6653e259a20529b679"
     }
   },
   "reviews": {
@@ -64,6 +65,16 @@
       "verdict": "DEFER both LOW observations; no source change required before blind final review",
       "scope": "only Fable correction-delta Lows; not a fresh overall review",
       "report_sha256": "17bef0431ea88e0fecbc10121f7c40a24b4307a5502ddd10b7d8c34b773843fd"
+    },
+    "astra-final": {
+      "model": "gpt-6-astra",
+      "reasoning_effort": "high",
+      "fresh_context": "aio1167_astra_final_fresh_nov03",
+      "candidate_head": "ed821d771cf1da1cbf78a3422b46e9dff3f76230",
+      "full_diff_sha256": "b29dfd8ebf8b1778b0d4f79309ae6d5f110c122162ba397e1b9c6a9489126b31",
+      "verdict": "CLEAN",
+      "actionable_findings": 0,
+      "report_sha256": "06e1d083b43a56d2c707b0771b4899e310824cc96d1c7a6653e259a20529b679"
     }
   }
 }
