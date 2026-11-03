@@ -1,0 +1,31 @@
+## Verdict: CLEAN for the accepted scope, with one Low non-blocking follow-up
+
+**Reviewed snapshot.** Source candidate `1a9ca6151a4ad98fe704476382f0bfd1170ea253` against baseline `b86b22d2e6b1561d0f7e57e0a4caac07e9880fb3`, via the 18-path delta patch and manifest in the bundle. The worktree HEAD is `f15e5f25`, which sits above the candidate by handoff-only commits according to the log. I did not verify that gap with git, so I compared the worktree code against every delta hunk I read, and they match. Patch SHA-256 values were not verified because no shell was used. No tests were run.
+
+**Coverage.** Read in full in the worktree: the OAuth callback route, the OAuth publisher, the identity writer, the shared resolver, the identity repair drain, watch renewal, and the brain-side root coverage gate. Read in the relevant regions: the stream coordinator (completion gate, enumeration, change-page absence handling, checkpoint and publish), the state store (root bindings, deferral, traversal, snapshots, membership, withdrawal, page materialization and commit), the contribution store, reattribution, the claim retirement path in source reconciliation, and the `_DriveWorld` and `_ClaimLedger` harness. Read from the patch only: `google-email-authority.ts`, `resolve-authors.ts`, `gdrive-contributions.ts`, and the five new or changed test files.
+
+### Prior findings
+
+**F1 (High, root restored while traversal open) is fixed.** The restore branch at `ingestion/aios_ingest/gdrive_sync.py:2921-2944` now defers a bound root carrying the unavailable detail whenever this build has finished any traversal entry of it, or has none open. The deferral and the closure of the remaining traversal are one `BEGIN IMMEDIATE` transaction in `state.py:1151-1204`, so a crash cannot leave a deferred root with an old remainder. The adjudication's extra concern is addressed: on restart a deferred root with a closed traversal is skipped without a read at `gdrive_sync.py:2887-2895`, so the old remainder can never be finished and settled. Coverage stays incomplete while the root is uncertain, both locally (`gdrive_sync.py:1088-1105`) and on the brain (`lib/integrations/gdrive-root-coverage.ts:79-83`), so no complete snapshot reaches `stageGdriveReconciliation` and no claim is retired. Relisting happens only under a fresh snapshot through `_deferred_root_admissible`. The regression test parametrizes a death right after withdrawal and a second death right after the restore deferral, asserts the traversal was open at loss, asserts every later complete reconciliation holds all of A's documents, checks claims are neither retired nor deleted, and checks `last_success_at` does not move. That matches what the adjudication required.
+
+**F2 (Low, callback subject messaging) is fixed.** `emailAttributionNote` at `app/api/auth/gdrive/callback/route.ts:190-216` now reports a tombstoned subject with its repair path for linked and preserved email outcomes, without implying it blocks email attribution. Both combinations are covered in the new callback test, including the paused-connection message.
+
+### Findings
+
+- **Low, non-blocking, pre-existing: a verified email that matches no member is reported as a plain success.** Trigger: Google returns a verified email, no roster or alias member matches it. Expected per AC-08: actionable unresolved attribution. Actual: the publisher returns subject and email both `unresolved`, and the note function returns an empty string, so the page reads only "Connected x. Return to Integrations". The sentence "not linked to a member" is built at `route.ts:196` but only emitted alongside a tombstoned or ambiguous email, which cannot co-occur with an unresolved subject, so it is dead. This predates the delta and is outside the two accepted findings. Recommend emitting the unresolved sentence with the Admin → Members path and adding one test case.
+
+### Verified as correct
+
+- `withdraw_lost_root_support` is building-only, transactional, idempotent, keeps support through other roots, and supersedes only this snapshot's own pending upserts (`state.py:2252-2336`).
+- Touched-root provider deferrals no longer write per-entry placeholders. This drops no retained membership compared to before, because the retained placeholder was applied only on the seed row, which is already completed for any touched root.
+- Late watch quota answers journal through the monotonic `hold_connection` on the event loop, activate nothing, and stop further creates and stops in the same sweep (`watch_renewal.py:277-315, 492, 655`). A worker cancelled before starting attaches no late handler.
+- Writer and readers share one Google email contract. Precedence in `setMemberIdentity` is other-owner conflict first, then canonical own state, then zero/one/many legacy histories, then same-member preserved (`member-identities.ts:249-294`). Refused and preserved outcomes write nothing. Readers group histories by canonical key and remove provider credit for unlinked or ambiguous (`resolve.ts:174-201`). The only consumers comparing the state to a literal are the `=== "unlinked"` checks in reattribution, which the new `ambiguous` value correctly does not satisfy.
+- PR714 boundary: every change in the shared writer, resolver, repair and reattribution is gated on provider `gdrive` and the `author-email:` prefix. Slack and opaque Google ids keep exact-byte semantics. No migration is added.
+- Email-keyed repair scans a bounded superset and advances the cursor over the whole page, so it terminates (`identity-repair.ts:260-321`).
+
+### Uncertain concerns and limits
+
+- A late quota answer arriving after the StateStore is closed is dropped with a warning. In the scheduler the store is long-lived, so this should not occur, but I did not read the scheduler.
+- The 503-deferral test depends on `real_deferral(503)` naming no minimum so `_deferred_root_admissible` is not blocked by a document restriction. I did not read that helper or the `clock` fixture.
+- Email-keyed obligations are now O(all Drive documents) per obligation. Performance only.
+- Tests were not executed. The new Python tests reach the real coordinator through `_DriveWorld`, whose `_metadata` returns 404 for removed files and whose ledger models claim retirement, so they exercise the intended path if they pass.
