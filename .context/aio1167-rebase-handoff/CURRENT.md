@@ -1,6 +1,14 @@
 # AIO-1167 current handoff
 
-Updated: 2026-11-03; R51 cleanup-stop correction verified locally
+Updated: 2026-11-03; R51 absolute-stop-deadline correction queued
+
+## Current action — R51 absolute stop deadline (2026-11-03)
+
+- The latest exact source checkpoint is `f3c4d3cba2142915c1032af3ff31efaf3ff5b31a`, with recovery remote `origin/codex/aio-1167-r51-resume-20261102` locally pointing to the same commit. Previous Fable/Astra/Sol reviews were clean for this snapshot except that Astra adjudication identified an adjacent stop-side absolute-deadline hole and evidence-only admission/checkpoint gaps. See `.context/aio1167-review-bundles/r51-stop-final-20261103-f3c4d3cb/adjudication.txt`.
+- The exact PR714 legacy-unlink identity decision was read and acknowledged; its durable acknowledgment is `pr743-pr714-ownership-ack-20261102.md` (decision SHA-256 `ff374ee337ebf52eb102c969a18d3326693a6577f0ea5d3b2a49bc7031ad476c`). PR743 remains owner of Google `author-email:` equivalence/tombstones and Google repair; PR714 retains Slack suppression/generation/cutover. This watch correction does not touch the shared identity or Slack paths.
+- Full-user `claude auth status` confirms first-party Claude.ai Max subscription, `loggedIn:true`. Attached to the existing Opus 5.5 HIGH session `628402d5-a1c6-42b7-b736-e84358c1a749`; its `/usage` display at 2026-11-03 showed all-model weekly usage 59%, Fable weekly usage 72%, and credits off. The session had no active writer turn before dispatch. API key/token overrides were unset. Do not start another writer; stop at 90% or an actual provider refusal.
+- Bounded next-turn prompt: `r51-opus-absolute-stop-deadline-prompt-20261103.md`. It asks the same writer to add a post-gate absolute-deadline guard before stop `request.execute`, handle `WatchStepTimeout` as no confirmed provider dispatch, repair the inaccurate timeout fixture, and add adjudicated admission/checkpoint/local-projection coverage. It prohibits writer-owned tests, commits, pushes, or reviews.
+- Next: send that prompt to the same Opus session; monitor actual worker and quota state. On return, inspect the exact diff, run coordinator-owned focused and full ingestion tests, update the verification record, checkpoint/push and independently read back the remote commit, then obtain fresh Fable 5.1, blind Astra HIGH, and blind GPT-6.1 Sol HIGH reviews on the exact corrected snapshot. Adjudicate findings before any PR #743 update. Production certification and the 24-hour sandbox soak remain open; no merge or deployment.
 
 ## Objective and policy
 
