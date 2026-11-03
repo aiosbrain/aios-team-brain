@@ -1,0 +1,9 @@
+# Existing Opus writer follow-up — remove test-helper import cycle
+
+Continue only in the same existing Opus 5.5 HIGH writer session `628402d5-a1c6-42b7-b736-e84358c1a749`; no other writer is active. The accepted production correction and new late-worker tests are checkpointed at `109a986d0184d9187565c646ac519e71fb6510f0`. Fresh Claude.ai `/usage` at 06:59 UTC showed all-model week 56%, Fable week 68%, credits off; API-key/auth-token environment overrides were unset. Claude auth is `claude.ai` first-party Max.
+
+The focused pytest command failed during collection, before tests ran. The cause is a test-only import cycle: `ingestion/tests/test_watch_late_quota.py` imports `_minimum` from `test_watch_operation_minima.py`, while `test_watch_operation_minima.py` already imports `_at`, `_deferral`, `_hook_checkpoints`, `_records_in`, and `_until` from `test_watch_late_quota.py`.
+
+Change only `ingestion/tests/test_watch_late_quota.py` to remove that cycle while preserving the minimum's shape and semantics (`not_before`, `category="provider_unavailable"`, `provider_deadline=True`, `diagnostic=None`). A local small `_minimum` factory is sufficient because `SimpleNamespace`, datetime, timezone and timedelta are already available there; alternatively use a neutral shared helper without creating a reverse test-module import. Do not alter production code for this collection error.
+
+No tests/checks/commit/push on this turn; the coordinator owns all verification and checkpoints. Do not use alternate tools to work around a denial. The corrected CLI launch uses the same session with `acceptEdits`, safe mode, only `Read,Glob,Grep,Write,Edit`, and read access to the exact shared skill directory. Read the shared skill and preserve its scope/quality requirements. Do not fold in deferred review questions or change PR714 Slack behavior. Report the one-file test fixture change concisely.
