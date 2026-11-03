@@ -11,3 +11,5 @@ Coordinator checks:
 - WIP checkpoint `ed821d771cf1da1cbf78a3422b46e9dff3f76230` pushed to recovery branch `origin/codex/aio-1167-r51-resume-20261102`; independent `git ls-remote` readback matched exactly. Pre-push docs-drift and skill-runtime hooks passed.
 
 No production Google certification or 24-hour sandbox soak has run. No merge or deployment.
+
+Fresh quota read before review dispatch: 2026-11-03 10:49:45 UTC / 16:19:45 Asia/Kolkata, `/usage` in the already-authenticated interactive Claude CLI. All-model week **60%**, Fable week **73%**, reset 5:30 p.m. Asia/Kolkata; credits **off**. This CLI view did not show a session-limit percentage. Do not interpret session token/cost totals as quota percentages.
