@@ -998,12 +998,16 @@ R44 contracts (AIO-1167):
   — a bare-email row, or a permission id nobody has decided — ONE Google email-bridge decision
   (`googleEmailBridge` in `lib/identity/resolve`, AIO-1167 R53) answers for evidence persistence, the
   dashboard/Timeline read, Google author attribution and permission discovery alike: an unlinked or
-  ambiguous `author-email:E` holds it; an `author-email:E` linked (or legacy-mapped, stored email or not)
+  ambiguous `author-email:E` holds it — ambiguous includes live legacy spellings of E mapped to different
+  members with no decided state (R54) — so E bridges to no roster/alias owner; an `author-email:E` linked
+  (or legacy-mapped, stored email or not)
   to a member other than E's one confirmed roster/alias owner is a `conflict` — nobody is credited, the
   evidence row is `google_email_conflict`, and discovery links the permission id to neither member and
   audits `identity.discovery_conflict` for the Admin diagnostic; agreeing or single owners bridge as
-  before. Exact permission authority and a direct `author-email:` observation's own owner are decided
-  first and never replaced.
+  before. For each SURVIVING observation, exact permission authority, and a direct `author-email:`
+  observation's own owner, are decided before any email fallback and never replaced by it; coalescing
+  itself is unchanged — an `author-email:` row folded into its one permission id is not kept, and that
+  surviving permission observation can stay unresolved under the bridge's diagnostic.
 - **Sidecar:** a service-account run is namespaced by the account its LOADED key authenticates as and
   refused before any progress is used when that differs from the verified identity; watch renewal
   resolves the same namespace. Jobs bind local entries by immutable integration id (a same-name entry

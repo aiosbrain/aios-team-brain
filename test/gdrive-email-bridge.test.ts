@@ -28,6 +28,7 @@ function map(over: {
   ambiguousEmails?: string[];
   byProviderId?: Array<[string, string]>;
   states?: Array<[string, "linked" | "unlinked" | "ambiguous"]>;
+  ambiguousProviderIds?: string[];
 } = {}): IdentityMap {
   return {
     byEmail: new Map(over.byEmail ?? []),
@@ -35,11 +36,17 @@ function map(over: {
     emailDomains: new Set(),
     byProviderId: new Map(over.byProviderId ?? []),
     ambiguousEmails: new Set(over.ambiguousEmails ?? []),
-    ambiguousProviderIds: new Set(),
+    ambiguousProviderIds: new Set(over.ambiguousProviderIds ?? []),
     providerIdentityStates: new Map(over.states ?? []),
     activeMemberIds: new Set(["member-a", "member-b"]),
   };
 }
+
+/**
+ * R54: two live legacy spellings of `author-email:E` mapped to DIFFERENT members, no decided state and
+ * no stored email — the map drops the owner as ambiguous — while E has one unique roster/alias owner B.
+ */
+const LEGACY_SPLIT = map({ byEmail: [[E, "member-b"]], ambiguousProviderIds: [KEY] });
 
 /** `author-email:E` deliberately linked to A, while the roster/alias email E belongs to B. */
 const CONFLICTED = map({
@@ -61,6 +68,15 @@ describe("googleEmailBridge — the decision", () => {
   it.each(["unlinked", "ambiguous"] as const)("an %s author-email history holds the address (PR743)", (state) => {
     expect(googleEmailBridge(map({ byEmail: [[E, "member-b"]], states: [[KEY, state]] }), E))
       .toEqual({ outcome: "held" });
+  });
+
+  it("legacy spellings of the address mapped to different members are ambiguous authority: held (R54)", () => {
+    expect(googleEmailBridge(LEGACY_SPLIT, E)).toEqual({ outcome: "held" });
+    expect(googleEmailBridge(LEGACY_SPLIT, ` ${E.toUpperCase()} `)).toEqual({ outcome: "held" });
+    expect(googleEmailBridgeMember(LEGACY_SPLIT, E)).toBeNull();
+    // Another address's ambiguity holds nothing here: the control still bridges to its roster owner.
+    const elsewhere = map({ byEmail: [[E, "member-b"]], ambiguousProviderIds: ["gdrive:author-email:other@example.com"] });
+    expect(googleEmailBridge(elsewhere, E)).toEqual({ outcome: "member", memberId: "member-b" });
   });
 
   it("a linked author-email owner that disagrees with the confirmed owner is a conflict: neither is credited", () => {
@@ -114,6 +130,23 @@ describe("every Google consumer gives the same answer (consumer parity)", () => 
     // The email-only form carries no provider authority of its own: it bridges the same way.
     expect(author(CONFLICTED, { provider: "gdrive", email: E, role: "editor" })).toBeNull();
     expect(timeline(CONFLICTED, [{ email: E, role: "editor", at: AT }])).toEqual([]);
+  });
+
+  it("ambiguous legacy author-email spellings give no fallback credit in any reader (R54)", () => {
+    expect(author(LEGACY_SPLIT, PERMISSION)).toBeNull();
+    expect(timeline(LEGACY_SPLIT, [PERMISSION])).toEqual([]);
+    expect(author(LEGACY_SPLIT, { provider: "gdrive", email: E, role: "editor" })).toBeNull();
+    expect(timeline(LEGACY_SPLIT, [{ email: E, role: "editor", at: AT }])).toEqual([]);
+    // The direct author-email observation resolves to neither spelling's owner, nor to the roster owner.
+    expect(author(LEGACY_SPLIT, AUTHOR_EMAIL)).toBeNull();
+    expect(timeline(LEGACY_SPLIT, [AUTHOR_EMAIL])).toEqual([]);
+    // An exact, independently established permission mapping keeps its authority.
+    const decided = map({
+      byEmail: [[E, "member-b"]], ambiguousProviderIds: [KEY],
+      byProviderId: [["gdrive:permission:P", "member-a"]], states: [["gdrive:permission:P", "linked"]],
+    });
+    expect(author(decided, PERMISSION)).toBe("member-a");
+    expect(timeline(decided, [PERMISSION])).toEqual(["member-a"]);
   });
 
   it("a direct author-email observation keeps its deliberately linked owner", () => {

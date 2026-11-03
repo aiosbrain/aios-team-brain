@@ -55,9 +55,13 @@ async function member(seed: Seed, name: string, email: string): Promise<string> 
 /**
  * `owner` gives the shared address E to B — as a primary email, as an alias, or to A herself (the
  * agreeing control) or nobody; `link` links `author-email:E` to A — the new manual writer, a legacy
- * row with an empty email column (and its decided state, as every upgraded link has), or not at all.
+ * row with an empty email column (and its decided state, as every upgraded link has), not at all, or
+ * (`split`, R54) as two raw legacy spellings of E mapped to A and to a third member, with no decided
+ * state and no stored email — rows the raw DB uniqueness allows and the map reads as ambiguous.
  */
-async function world(owner: "primary" | "alias" | "a" | "nobody", link: "manual" | "legacy" | "none"): Promise<World> {
+async function world(
+  owner: "primary" | "alias" | "a" | "nobody", link: "manual" | "legacy" | "none" | "split",
+): Promise<World> {
   const seed = await seedTeam();
   const writer = await fencedDriveWriter(seed);
   await placeMemberByTier(seed.teamId, seed.memberId, "team");
@@ -71,6 +75,13 @@ async function world(owner: "primary" | "alias" | "a" | "nobody", link: "manual"
   const key = `author-email:${address}`;
   if (link === "manual") {
     await setMemberIdentity(db(), seed.teamId, a, { provider: "gdrive", externalId: key });
+  } else if (link === "split") {
+    const c = await member(seed, "Cal", `cal-${tag}@example.com`);
+    for (const [memberId, spelling] of [[a, `author-email:${address.toUpperCase()}`], [c, key]] as const) {
+      await getPool().query(
+        "insert into member_identities(team_id,member_id,provider,external_id,handle,email) values ($1,$2,'gdrive',$3,'','')",
+        [seed.teamId, memberId, spelling]);
+    }
   } else if (link === "legacy") {
     await getPool().query(
       "insert into member_identities(team_id,member_id,provider,external_id,handle,email) values ($1,$2,'gdrive',$3,'','')",
@@ -236,6 +247,76 @@ describe("R53 — a linked author-email owner conflicting with the roster/alias 
     const result = await credit(w, itemId);
     expect(result.evidence).toEqual([{ external_id: "permission:P", member_id: w.b, diagnostic: null }]);
     expect(result.timeline).toEqual([w.b]);
+  }, 60_000);
+});
+
+/**
+ * AIO-1167 R54 — legacy spellings of E mapped to DIFFERENT members are ambiguous author-email authority.
+ * With no decided state, nothing but the map's ambiguity records it; the email must then be held, not
+ * bridged to E's unique roster/alias owner B: no permission link, no fallback evidence, Timeline or
+ * author credit for anyone, and both legacy mappings left exactly as they were — in either order and on
+ * replay. Not a conflict (no single linked owner), so nothing is audited as one.
+ */
+describe("R54 — ambiguous legacy author-email spellings hold the email (real Postgres)", () => {
+  async function legacyMappings(w: World) {
+    const pool = getPool();
+    return JSON.stringify({
+      identities: (await pool.query(
+        `select external_id,member_id,email::text from member_identities
+          where team_id=$1 and provider='gdrive' and lower(external_id) like 'author-email:%' order by external_id`,
+        [w.seed.teamId])).rows,
+      states: (await pool.query(
+        `select external_id,state,revision from member_identity_mapping_state
+          where team_id=$1 and provider='gdrive' and lower(external_id) like 'author-email:%' order by external_id`,
+        [w.seed.teamId])).rows,
+    });
+  }
+
+  it.each([
+    ["primary email", "author-email first"],
+    ["primary email", "permission first"],
+    ["alias", "author-email first"],
+    ["alias", "permission first"],
+  ] as const)("%s owner, %s: no P link, no fallback credit, legacy mappings unchanged", async (owner, order) => {
+    const w = await world(owner === "alias" ? "alias" : "primary", "split");
+    const before = await legacyMappings(w);
+    expect(before).toContain(`author-email:${w.address.toUpperCase()}`);
+    for (const opts of [{ strict: true }, { strict: true, includeDeactivated: true }]) {
+      expect(googleEmailBridge(await buildIdentityMap(db(), w.seed.teamId, opts), w.address)).toEqual({ outcome: "held" });
+    }
+    const viaAuthorEmail = observation(w, `author-email:${w.address}`);
+    const viaPermission = observation(w, "permission:P", "2026-10-20T10:00:00Z");
+    const steps = order === "author-email first" ? [viaAuthorEmail, viaPermission] : [viaPermission, viaAuthorEmail];
+
+    const first = await push(w, steps[0]);
+    // Neither spelling's owner nor the roster owner is credited, from the first push on.
+    expect((await credit(w, first.itemId)).evidence.every((row) => row.member_id === null)).toBe(true);
+    const second = await push(w, steps[1]);
+    const replay = await push(w, viaPermission);
+    for (const discovery of [order === "author-email first" ? second.discovery : first.discovery, replay.discovery]) {
+      expect(discovery).toMatchObject({ linked: 0, conflict: 0, reviewed: 1 });
+    }
+
+    expect(await permissionHolders(w)).toEqual([]);
+    expect(await legacyMappings(w)).toBe(before);
+    const result = await credit(w, first.itemId);
+    expect(result.evidence).toEqual([{ external_id: "permission:P", member_id: null, diagnostic: "unresolved_identity" }]);
+    expect(result.timeline).toEqual([]);
+    expect(result.projection).toEqual([]);
+    expect(result.author).toBeNull();
+    expect(await conflictRows(w)).toEqual([]);
+  }, 60_000);
+
+  it("an exact permission mapping keeps its authority over the held email", async () => {
+    const w = await world("primary", "split");
+    await setMemberIdentity(db(), w.seed.teamId, w.a, { provider: "gdrive", externalId: "permission:P" });
+    await convergeIdentityAttribution(w.seed);
+    const { discovery, itemId } = await push(w, observation(w, "permission:P"));
+    expect(discovery).toMatchObject({ linked: 0, reviewed: 1 });
+    expect(await permissionHolders(w)).toEqual([w.a]);
+    const result = await credit(w, itemId);
+    expect(result.evidence).toEqual([{ external_id: "permission:P", member_id: w.a, diagnostic: null }]);
+    expect(result.timeline).toEqual([w.a]);
   }, 60_000);
 });
 

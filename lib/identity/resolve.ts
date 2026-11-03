@@ -243,7 +243,8 @@ export function googleEmailAttributionHeld(map: IdentityMap, email: string | nul
  * permission discovery, so all four answer alike. It is asked only AFTER the observation's own exact
  * provider authority (a decided permission id, a linked `author-email:` key), which it never replaces.
  *
- *   · `held` — the address's own `author-email:` identity is unlinked or ambiguous (PR743): no bridge.
+ *   · `held` — the address's own `author-email:` identity is unlinked or ambiguous (PR743) — including
+ *     live legacy spellings mapped to different members with no decided state (R54): no bridge.
  *   · `conflict` — the address's `author-email:` identity is LINKED (a decided link, or a live legacy
  *     mapping), and its owner is not
  *     the one confirmed roster/alias owner of the address (another member holds it, the address is
@@ -268,6 +269,9 @@ export function googleEmailBridge(map: IdentityMap, email: string | null | undef
   const key = `author-email:${address}`;
   const state = providerIdentityState(map, "gdrive", key);
   if (state === "unlinked" || state === "ambiguous") return { outcome: "held" };
+  // Live legacy spellings of this address mapped to DIFFERENT members, with no decided state (R54): the
+  // map dropped the owner as ambiguous, which is ambiguous authority — held, never a roster fallback.
+  if (map.ambiguousProviderIds?.has(providerKey("gdrive", key))) return { outcome: "held" };
   const ambiguous = map.ambiguousEmails?.has(address) ?? false;
   const emailMemberId = ambiguous ? null : map.byEmail.get(address) ?? null;
   // The address's `author-email:` owner: a decided link, or a live mapping (a legacy row with no state).
