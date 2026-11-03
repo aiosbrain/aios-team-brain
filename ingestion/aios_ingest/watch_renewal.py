@@ -11,9 +11,16 @@ acquires the same execution authority as polling, then:
    bounded number per sweep, never while a stream already has the maximum of unresolved attempts
    (polling covers it meanwhile), and always: durable ``prepared`` intent → fenced ``dispatched``
    marker → ONE provider request in a worker thread → validated, fenced ``active``. The account hold
-   and the drive's creation minimum are re-checked after each publication and, on the event loop,
-   immediately before the request; a refused attempt was never sent and retires as such.
-3. **Cleans up** known channels that must be stopped, within a reserved allowance.
+   and the drive's creation minimum are re-checked after each publication, on the event loop before
+   the worker starts the request, and once more after the manager's live authority check returns —
+   immediately before ``request.execute``, because that check can block while an abandoned worker
+   journals a restriction. The authority answer keeps its precedence; a refused attempt was never
+   sent and retires as such.
+3. **Cleans up** known channels that must be stopped, within a reserved allowance. The account hold
+   and the channel's stop minimum are checked the same way — before the worker starts and again after
+   the live authority check. A refused stop was never sent: the channel stays ``cleanup_pending``
+   with its stop attempts unchanged; an account hold ends that account's cleanup for the sweep, a
+   channel's minimum defers only that channel.
 
 Every lifecycle change is published to the brain under the fence via the renewal-owned ``watches``
 section (``connector_state.renewal_document``): renewal can never touch a cursor, and a stale
@@ -388,6 +395,27 @@ def _creation_refusal(run: "_Run", account_id: str, drive_id: str) -> str | None
     return None
 
 
+class _StopNotSent(Exception):
+    """A cleanup stop refused by restriction admission before its request was executed (R51 AC-04).
+
+    ``scope`` is ``"account"`` (the account's quota hold — no further same-account cleanup this
+    sweep), ``"operation"`` (this channel's stop minimum — the other channels go on) or
+    ``"unconfirmed"`` (admission could not be answered in time — cleanup ends for this sweep)."""
+
+    def __init__(self, scope: str):
+        super().__init__(f"stop not sent: {scope}")
+        self.scope = scope
+
+
+def _stop_refusal(run: "_Run", account_id: str, stop_operation: str) -> str | None:
+    """Event loop only: why a stop may NOT be sent now under the one restriction owner, or ``None``."""
+    if _account_held(run, account_id):
+        return "account"
+    if _operation_restricted(run.state, run.execution, account_id, stop_operation):
+        return "operation"
+    return None
+
+
 def _ask_loop(loop: asyncio.AbstractEventLoop, fn: Callable[[], Any], timeout: float) -> Any:
     """From a worker thread: run ``fn`` on the event loop that owns the StateStore and wait for its
     answer, at most ``timeout`` seconds. Raises when the loop is gone or does not answer in time; the
@@ -650,20 +678,62 @@ async def _cleanup(
             # this very sweep by a late worker. Waiting is not a failed stop: no attempt is spent, the
             # record stays cleanup_pending, and the other channels are still stopped.
             continue
-        budget.stops -= 1
+        budget.stops -= 1  # the slot stays spent whatever happens: no refund, no retry in this sweep
         operation = (
             (run.execution.integration_id, int(run.execution.generation), account_id, stop_operation)
             if account_id else None
         )
-        try:
-            await run.offload(lambda r=record: manager.stop(
-                r, str(r.resource_id), access_token=access_token, provider_gate=provider_gate,
+
+        def confirm_stop(stop_operation: str = stop_operation) -> None:
+            # Asked from the worker, answered on the loop that owns the StateStore, within the run
+            # deadline. A refusal — or no answer — means the request is never executed.
+            if not account_id:
+                return
+            try:
+                refused = _ask_loop(
+                    loop, lambda: _stop_refusal(run, account_id, stop_operation),
+                    run.deadline - time.monotonic(),
+                )
+            except Exception:
+                raise _StopNotSent("unconfirmed") from None
+            if refused is not None:
+                raise _StopNotSent(refused)
+
+        def admitted_gate(confirm: Callable[[], None] = confirm_stop) -> None:
+            # The manager calls its gate immediately before `request.execute`, and the live authority
+            # check inside it can block while an abandoned worker journals the account's quota or this
+            # channel's stop minimum. Authority answers first (its refusal keeps precedence); then
+            # restriction admission is decided once more before the request.
+            if provider_gate is not None:
+                provider_gate()
+            confirm()
+
+        def stop_when_admitted(r: WatchRecord = record, gate: Callable[[], None] = admitted_gate,
+                               confirm: Callable[[], None] = confirm_stop) -> Any:
+            # A queued worker may start only after an abandoned one has finished — and journaled its
+            # restriction — so admission is asked before any client work too.
+            confirm()
+            return manager.stop(
+                r, str(r.resource_id), access_token=access_token, provider_gate=gate,
                 deadline=run.deadline,
-            ), on_late=_late_evidence(loop, run.state, None, hold=hold, operation=operation))
+            )
+
+        try:
+            await run.offload(
+                stop_when_admitted,
+                on_late=_late_evidence(loop, run.state, None, hold=hold, operation=operation),
+            )
         except asyncio.CancelledError:
             raise
         except BrainError:
             raise
+        except _StopNotSent as exc:
+            # Provably unsent: the channel stays cleanup_pending with its resource and stop attempts
+            # unchanged, and nothing is published for it. A hold learned late stays local until the
+            # next fresh acquisition publishes it.
+            if exc.scope == "operation":
+                continue  # this channel waits for its minimum; the independent channels go on
+            return  # the account's hold — or unconfirmed admission — ends cleanup for this sweep
         except WatchQuotaLimited as exc:
             # The channel still exists: the record stays cleanup_pending, spending no stop attempt —
             # the account's quota is not this channel's failure (R51 final 3).

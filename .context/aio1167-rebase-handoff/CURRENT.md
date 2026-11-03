@@ -1,6 +1,6 @@
 # AIO-1167 current handoff
 
-Updated: 2026-11-03 07:00 UTC (12:30 Asia/Kolkata)
+Updated: 2026-11-03; R51 cleanup-stop correction verified locally
 
 ## Objective and policy
 
@@ -8,7 +8,14 @@ Continue the user-authorized AIO-1167 / PR #743 Drive connector work on the reba
 
 Resolved current implementation questions: retain source-supported credit for a deactivated member when an existing stable identity mapping resolves it; deactivation blocks new links/authentication, not attribution of newly discovered historical work. Keep the production Google token endpoint fixed; the real-HTTP test may use a test-harness-only interception/injection to reach its loopback fixture, with no production environment override.
 
-## Current R51 review state — 2026-11-03 07:20 UTC (12:50 Asia/Kolkata)
+## Current R51 review state — 2026-11-03, cleanup-stop correction
+
+- The same Opus 5.5 HIGH session `628402d5-a1c6-42b7-b736-e84358c1a749` completed its second bounded correction successfully; no writer is active. It added the stop-path admission check after the production authority gate and three deterministic production-manager regressions. Writer result is recorded in `r51-opus-watch-gate-result-20261103.md`; coordinator verification is `r51-opus-stop-gate-verification-20261103.md`.
+- The correction starts from `84fd9b4d62eeacbbe977f45486692566a8661b53` and changes only `ingestion/aios_ingest/watch_renewal.py` and `ingestion/tests/test_watch_late_quota.py`. Late account quota or unconfirmed admission prevents the cleanup request and ends this account's cleanup for the sweep; a channel-specific stop minimum defers only that channel. The record stays `cleanup_pending`, the resource and attempt count are retained, no publication/retry occurs, and the reserved one-slot budget stays spent. Live authority failures keep precedence.
+- Coordinator `git diff --check` passed. Correct repository venv focused suite: **77 passed in 2.15s** (`test_watch_late_quota.py`, `test_watch_operation_minima.py`, `test_watch_quota_hold.py`, `test_watch_lifecycle.py`). Initial collection errors with default Anaconda pytest were due to wrong interpreter/import path; they are documented and not counted as test failures.
+- Next: checkpoint and remotely verify this source/evidence; run the full ingestion suite; create a frozen review packet of the combined `29676566a08280e12619b565711f9b0ff65271e0..HEAD` candidate; obtain fresh blind Astra HIGH, GPT-6.1 Sol HIGH and Fable 5.1 reviews; adjudicate findings. Do not update PR #743 until the final candidate and evidence are settled.
+
+## Prior R51 review state — 2026-11-03 07:20 UTC (12:50 Asia/Kolkata)
 
 - Exact candidate: `84fd9b4d62eeacbbe977f45486692566a8661b53`; source parent/reviewed baseline `29676566a08280e12619b565711f9b0ff65271e0`; feature branch `codex/aio-1167-google-docs-connector-rebased`. Only `ingestion/aios_ingest/watch_renewal.py` and `ingestion/tests/test_watch_late_quota.py` changed in the correction. Recovery remote `origin/codex/aio-1167-r51-resume-20261102` was independently read back at the exact candidate.
 - Previous candidate `29676566` received matching blind Astra HIGH and GPT-6.1 Sol HIGH P2 findings: admission was checked before `manager.dispatch`, but client setup and the blocking live-authority gate happened afterward, allowing a late quota/minimum journal to be missed. Candidate `84fd9b4` composes the create provider gate so authority runs first and restriction admission is then checked on the StateStore owner loop immediately before `request.execute`; refusal/unavailable remains `WatchNotDispatched`. Added production-manager interleavings for account quota and per-drive minimum, asserting no forbidden execute, accurate retirement, preserved predecessor/cursors, durable restriction, and independent-drive continuation. Both earlier findings are candidate-specific and fixed here; fresh final reviews of `84fd9b4` are pending.
