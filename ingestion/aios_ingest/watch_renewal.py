@@ -10,7 +10,9 @@ acquires the same execution authority as polling, then:
 2. **Creates** a channel for each stream whose newest active channel is missing or due — at most a
    bounded number per sweep, never while a stream already has the maximum of unresolved attempts
    (polling covers it meanwhile), and always: durable ``prepared`` intent → fenced ``dispatched``
-   marker → ONE provider request in a worker thread → validated, fenced ``active``.
+   marker → ONE provider request in a worker thread → validated, fenced ``active``. The account hold
+   and the drive's creation minimum are re-checked after each publication and, on the event loop,
+   immediately before the request; a refused attempt was never sent and retires as such.
 3. **Cleans up** known channels that must be stopped, within a reserved allowance.
 
 Every lifecycle change is published to the brain under the fence via the renewal-owned ``watches``
@@ -373,6 +375,41 @@ def _account_held(run: "_Run", account_id: str) -> bool:
     ) is not None
 
 
+def _creation_refusal(run: "_Run", account_id: str, drive_id: str) -> str | None:
+    """Why a channel may NOT be requested for this account/drive right now, or ``None`` (R51 AC-04).
+
+    Event loop only: it reads the one restriction owner — the account hold and the
+    `watch-create:<drive>` minimum — including evidence a late worker's callback journaled on this
+    loop a moment ago. The answer is the not-dispatched reason the attempt is retired with."""
+    if _account_held(run, account_id):
+        return "not dispatched: the account's provider quota hold stands"
+    if _operation_restricted(run.state, run.execution, account_id, f"{WATCH_CREATE_RESOURCE}{drive_id}"):
+        return "not dispatched: a provider minimum for creating a channel on this drive stands"
+    return None
+
+
+def _ask_loop(loop: asyncio.AbstractEventLoop, fn: Callable[[], Any], timeout: float) -> Any:
+    """From a worker thread: run ``fn`` on the event loop that owns the StateStore and wait for its
+    answer, at most ``timeout`` seconds. Raises when the loop is gone or does not answer in time; the
+    request is then withdrawn, so ``fn`` never runs late."""
+    answer: Future = Future()
+
+    def evaluate() -> None:
+        if not answer.set_running_or_notify_cancel():
+            return
+        try:
+            answer.set_result(fn())
+        except BaseException as exc:  # handed back to the worker, never lost
+            answer.set_exception(exc)
+
+    loop.call_soon_threadsafe(evaluate)
+    try:
+        return answer.result(timeout=max(0.0, timeout))
+    except BaseException:
+        answer.cancel()
+        raise
+
+
 def _past(instant: str | None, now: datetime) -> bool:
     parsed = parse_instant(instant)
     return parsed is not None and parsed <= now
@@ -453,20 +490,51 @@ async def _create(
     )
     # 1. The intent is durable before anything else happens.
     await run.publish(intent)
+    # Admission is decided again after every publication wait (R51 AC-04): while it was in flight an
+    # abandoned worker of an earlier sweep may have answered with the account's quota or a minimum for
+    # creating on this drive, journaled on this loop. Nothing has been sent, so the attempt retires
+    # with the accurate reason; if that retirement cannot be published, its failure ends this run and
+    # the last acknowledged record is recovered by the next sweep — nothing unacknowledged is projected.
+    refusal = _creation_refusal(run, account_id, drive_id)
+    if refusal is not None:
+        await run.publish(transition(intent, RETIRED, detail=refusal))
+        return
     # 2. The dispatch marker: a fenced write, so a paused, replaced or revoked execution stops here,
     #    and a record that from now on says a channel MAY exist.
     dispatched = transition(intent, DISPATCHED)
     await run.publish(dispatched)
+    refusal = _creation_refusal(run, account_id, drive_id)
+    if refusal is not None:
+        # Still provably unsent: the request has not even been handed to a worker.
+        await run.publish(transition(dispatched, RETIRED, detail=refusal))
+        return
     loop = asyncio.get_running_loop()
     # The provider call ends early enough that its outcome — whatever it is — can still be
     # published inside the run deadline.
     dispatch_deadline = run.deadline - _publish_reserve()
+
+    def dispatch_when_admitted() -> Any:
+        # The final provider-dispatch boundary. A queued worker may start only after an abandoned one
+        # has finished — and journaled its restriction — so admission is asked once more, on the loop
+        # that owns the StateStore, immediately before the request. A refusal, or no answer, means
+        # the request is never sent: `WatchNotDispatched` retires the attempt.
+        try:
+            refused = _ask_loop(
+                loop, lambda: _creation_refusal(run, account_id, drive_id),
+                dispatch_deadline - time.monotonic(),
+            )
+        except Exception:
+            raise WatchNotDispatched("not dispatched: admission could not be confirmed") from None
+        if refused is not None:
+            raise WatchNotDispatched(refused)
+        return manager.dispatch(
+            dispatched, page_token=cursor, verification_token=token,
+            access_token=access_token, provider_gate=provider_gate, deadline=dispatch_deadline,
+        )
+
     try:
         response = await run.offload(
-            lambda: manager.dispatch(
-                dispatched, page_token=cursor, verification_token=token,
-                access_token=access_token, provider_gate=provider_gate, deadline=dispatch_deadline,
-            ),
+            dispatch_when_admitted,
             on_late=_late_evidence(
                 loop, run.state, dispatched,
                 hold=(run.execution.integration_id, int(run.execution.generation), account_id),

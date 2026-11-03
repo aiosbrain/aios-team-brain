@@ -13,7 +13,12 @@ ACCOUNT's quota, exactly as a timely one is:
   * the late callback activates nothing, retires nothing, moves no cursor and publishes nothing: the
     next acquisition, holding fresh authority, publishes it;
   * a shorter late deadline never shortens a longer hold; another account, a worker that never
-    started, a non-quota error and a late successful creation (cleanup evidence only) add no hold.
+    started, a non-quota error and a late successful creation (cleanup evidence only) add no hold;
+  * a late quota hold or creation minimum that lands while a NEW creation's PREPARED or DISPATCHED
+    publication is blocked — or while its admitted request is queued behind the abandoned worker —
+    prevents that request (R51 AC-04): the attempt retires as not dispatched, a failed retirement
+    publication leaves the acknowledged record to normal recovery, and the drive is eligible again
+    only after the deadline.
 
 The controlled deadline replaces only ``watch_renewal._wait_bounded``; the worker pool, abandonment,
 late-result delivery and publication are the production code.
@@ -33,15 +38,18 @@ from types import SimpleNamespace
 import pytest
 
 from aios_ingest import watch_renewal
+from aios_ingest.brain_client import BrainError
 from aios_ingest.gdrive_sync import _standing_account_hold
 from aios_ingest.state import StateStore, StreamKey
 from aios_ingest.watch_lifecycle import (
-    ACTIVE, CLEANUP_PENDING, DISPATCHED, UNCERTAIN, WatchQuotaLimited, from_section, to_section,
+    ACTIVE, CLEANUP_PENDING, DISPATCHED, PREPARED, RETIRED, UNCERTAIN, WatchProviderMinimum,
+    WatchQuotaLimited, from_section, to_section,
 )
 from test_watch_lifecycle import (
     ACCOUNT, INTEGRATION, SETTINGS, _conn, _controlled_deadline, _Provider, _record,
 )
-from test_watch_quota_hold import GEN, LONG, _hold, _near, _published_hold, _quota_brain
+from test_watch_operation_minima import _minimum
+from test_watch_quota_hold import GEN, LONG, _hold, _local_watch_state, _near, _published_hold, _quota_brain
 
 OTHER_ACCOUNT = "previous-account"
 
@@ -382,4 +390,189 @@ async def test_a_worker_cancelled_before_it_started_journals_nothing(tmp_path, m
     await asyncio.sleep(0.05)
     assert ran == []
     assert _hold(state) is None
+    state.close()
+
+
+# ------------------------------------------------------------------------------------------------ #
+# A late restriction that lands while a NEW creation is between admission and dispatch (R51 AC-04)
+# ------------------------------------------------------------------------------------------------ #
+
+class _LateAnswerProvider(_LateQuotaProvider):
+    """Google, scripted: the FIRST creation blocks in its worker until released, then raises ``error``
+    — the account's quota or a named minimum for creating on that drive. Later calls succeed."""
+
+    def __init__(self, brain, error):
+        super().__init__(brain, kind="watch", not_before="")
+        self.error = error
+
+    def _call(self, kind: str, target: str) -> None:
+        self.calls.append((kind, target))
+        if kind == self.kind and not self._answered:
+            self._answered = True
+            self.entered.set()
+            assert self.release.wait(10), "the test never released the provider call"
+            raise self.error
+
+
+def _late_answer(answer: str):
+    if answer == "quota":
+        return WatchQuotaLimited(_deferral(_at(int(LONG))))
+    return WatchProviderMinimum(_minimum(int(LONG)))
+
+
+def _restriction(state, answer: str):
+    """The restriction the late answer journals: the account's hold, or my-drive's creation minimum."""
+    if answer == "quota":
+        return _hold(state)
+    return state.document_restrictions(INTEGRATION, GEN, ACCOUNT).get("watch-create:my-drive")
+
+
+async def _abandon_first_creation(state, provider):
+    """Sweep 1: its my-drive creation blocks in a worker and the sweep is cancelled around it — the
+    worker keeps running, abandoned, with the production late-result handler attached."""
+    first = asyncio.create_task(watch_renewal.renew_watches(state, provider, [_conn()], SETTINGS))
+    await asyncio.to_thread(provider.entered.wait, 10)
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    (abandoned,) = [r for r in provider.brain.records().values() if r.predecessor == "current"]
+    assert abandoned.state == DISPATCHED
+    return abandoned
+
+
+@pytest.mark.parametrize("retirement", ["published", "publication-fails"])
+@pytest.mark.parametrize("answer", ["quota", "minimum"])
+@pytest.mark.parametrize("boundary", [PREPARED, DISPATCHED])
+@pytest.mark.asyncio
+async def test_a_restriction_journaled_while_a_creation_publication_is_blocked_prevents_its_dispatch(
+    tmp_path, monkeypatch, boundary, answer, retirement,
+):
+    """A fresh sweep admits a my-drive creation, then waits on its PREPARED or DISPATCHED publication.
+    Meanwhile the abandoned worker of the cancelled sweep answers and its restriction is journaled on
+    this loop. When the publication resumes, admission is decided again: no request is sent, and the
+    attempt retires as provably not dispatched. If that retirement cannot be published, the last
+    acknowledged record stands and the next sweep recovers it normally. The predecessor and every
+    cursor are untouched; the restriction persists and is honoured until its deadline only."""
+    error = _late_answer(answer)
+    brain = _quota_brain(due=True).install(monkeypatch)
+    streams_before = copy.deepcopy(brain.progress["streams"])
+    path = str(tmp_path / f"blocked-{boundary}-{answer}-{retirement}.sqlite")
+    state = StateStore(path)
+    provider = _LateAnswerProvider(brain, error)
+    abandoned = await _abandon_first_creation(state, provider)
+    assert _restriction(state, answer) is None  # the abandoned worker has not answered yet
+
+    blocked: list[str] = []
+
+    async def answer_while_publication_is_blocked(payload):
+        fresh = [r for r in _records_in(payload)
+                 if r["state"] == boundary and r["attempt_id"] != abandoned.attempt_id]
+        if fresh and not provider.release.is_set():
+            provider.release.set()
+            await _until(lambda: _restriction(state, answer) is not None)
+            blocked.append(fresh[0]["attempt_id"])
+
+    _hook_checkpoints(monkeypatch, answer_while_publication_is_blocked)
+    if retirement == "publication-fails":
+        def refuse_the_retirement(payload):
+            if any(r["state"] == RETIRED and str(r.get("detail") or "").startswith("not dispatched")
+                   for r in _records_in(payload)):
+                return BrainError(503, "server_error", "brain unavailable")
+            return None
+        brain.checkpoint_faults.append(refuse_the_retirement)
+
+    await watch_renewal.renew_watches(state, provider, [_conn()], SETTINGS)
+
+    (attempt_id,) = blocked  # the restriction landed while this attempt's publication was blocked
+    watch_calls = [call for call in provider.calls if call[0] == "watch"]
+    assert watch_calls.count(("watch", "my-drive")) == 1  # only the cancelled sweep's own request
+    if answer == "minimum" and retirement == "published":
+        # A drive-specific minimum blocks that drive only: the independent drive is still created.
+        assert watch_calls == [("watch", "my-drive"), ("watch", "shared-x")]
+    else:
+        assert watch_calls == [("watch", "my-drive")]
+    if answer == "quota":
+        assert provider.calls == [("watch", "my-drive")]  # the account hold stops every watch call
+        assert _published_hold(brain) is None  # a late hold waits for a fresh acquisition
+
+    records = brain.records()
+    attempt = records[attempt_id]
+    if retirement == "published":
+        assert attempt.state == RETIRED and attempt.detail.startswith("not dispatched")
+        assert _local_watch_state(state, attempt_id) == RETIRED
+    else:
+        assert attempt.state == boundary  # the last acknowledged record
+        assert _local_watch_state(state, attempt_id) == boundary  # no unacknowledged retirement
+    assert attempt.resource_id is None
+    assert records[abandoned.attempt_id].state == UNCERTAIN  # recovered, never activated
+    assert records["current"].state == ACTIVE  # the predecessor is untouched
+    assert brain.progress["streams"] == streams_before  # no cursor moved
+    state.close()
+
+    # Reopened, before the deadline: the restriction persists, my-drive is still not requested, and
+    # a failed retirement is recovered from the acknowledged record (an intent never sent retires; a
+    # marker whose outcome was not published is uncertain — the existing recovery rules).
+    state = StateStore(path)
+    assert _restriction(state, answer) is not None
+    provider.calls.clear()
+    await watch_renewal.renew_watches(state, provider, [_conn()], SETTINGS)
+    assert ("watch", "my-drive") not in provider.calls
+    records = brain.records()
+    if retirement == "publication-fails":
+        assert records[attempt_id].state == (RETIRED if boundary == PREPARED else UNCERTAIN)
+    assert records[attempt_id].resource_id is None
+    assert records["current"].state == ACTIVE
+    assert brain.progress["streams"] == streams_before
+    state.close()
+
+    if retirement == "publication-fails" and boundary == DISPATCHED:
+        return  # two unresolved attempts on my-drive: polling covers it until they resolve (cap)
+    # After the deadline my-drive is eligible again.
+    after = datetime.fromisoformat(str(error.deferral.not_before)) + timedelta(seconds=1)
+    monkeypatch.setattr("aios_ingest.gdrive_sync._now", lambda: after.isoformat())
+    state = StateStore(path)
+    provider.calls.clear()
+    await watch_renewal.renew_watches(state, provider, [_conn()], SETTINGS)
+    assert ("watch", "my-drive") in provider.calls
+    state.close()
+
+
+@pytest.mark.asyncio
+async def test_a_creation_queued_behind_the_abandoned_worker_is_refused_at_the_dispatch_boundary(
+    tmp_path, monkeypatch,
+):
+    """Both pool workers are busy — one is the cancelled sweep's abandoned creation — so the fresh
+    sweep's admitted, durably marked creation waits in the queue. The abandoned worker then answers
+    with the account's quota and its thread takes the queued request at once; the final check, asked on
+    the loop that owns the StateStore immediately before the request, sees the hold. Nothing is sent
+    and the attempt retires as not dispatched."""
+    brain = _quota_brain(due=True).install(monkeypatch)
+    streams_before = copy.deepcopy(brain.progress["streams"])
+    state = StateStore(str(tmp_path / "queued.sqlite"))
+    provider = _LateAnswerProvider(brain, _late_answer("quota"))
+    abandoned = await _abandon_first_creation(state, provider)
+    release_busy = threading.Event()
+    busy = watch_renewal._POOL.submit(release_busy.wait, 10)
+    try:
+        await _until(busy.running)  # both pool workers are now occupied
+        second = asyncio.create_task(watch_renewal.renew_watches(state, provider, [_conn()], SETTINGS))
+        await _until(lambda: watch_renewal._POOL._work_queue.qsize() > 0)  # the creation is queued
+        assert _hold(state) is None
+        provider.release.set()  # the abandoned worker answers; its thread then takes the queued item
+        await second
+    finally:
+        release_busy.set()
+        busy.result(10)
+
+    assert provider.calls == [("watch", "my-drive")]  # the queued request was never sent
+    assert _hold(state) is not None
+    records = brain.records()
+    (attempt,) = [r for r in records.values()
+                  if r.predecessor == "current" and r.attempt_id != abandoned.attempt_id]
+    assert attempt.state == RETIRED
+    assert attempt.detail == "not dispatched: the account's provider quota hold stands"
+    assert records[abandoned.attempt_id].state == UNCERTAIN
+    assert records["current"].state == ACTIVE
+    assert brain.progress["streams"] == streams_before
+    assert _published_hold(brain) is None
     state.close()
