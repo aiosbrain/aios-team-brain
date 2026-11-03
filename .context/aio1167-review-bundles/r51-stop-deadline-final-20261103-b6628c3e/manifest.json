@@ -1,0 +1,30 @@
+{
+  "candidate_head": "b6628c3ed0f252d58259345c24178c75e4be9b16",
+  "full_review_base": "29676566a08280e12619b565711f9b0ff65271e0",
+  "delta_review_base": "f3c4d3cba2142915c1032af3ff31efaf3ff5b31a",
+  "source_files": [
+    "ingestion/aios_ingest/sources/gdrive_watch.py",
+    "ingestion/aios_ingest/watch_lifecycle.py",
+    "ingestion/aios_ingest/watch_renewal.py",
+    "ingestion/tests/test_watch_late_quota.py",
+    "ingestion/tests/test_watch_lifecycle.py",
+    "ingestion/tests/test_watch_quota_hold.py"
+  ],
+  "artifacts": {
+    "fable-delta": {
+      "AGENTS.md": "e4117721d454be48f881a878037a07353ea7b355741e366169746276466bdb72",
+      "accepted-spec.md": "297ee1df91463fd0b6c4863b34be8b999ad176fc7d40f0637bf196660bd65e3d",
+      "delta.diff": "01e77897f471817eeae790a0de0b46e655ec12c2b3c5fca2980c8c6f8e364ac5",
+      "prior-adjudication-context.txt": "594762ad0b64bfa0ddc4c7e0bc5f78f6953d5eaf0be6cebaea3fb8b16f4876b1",
+      "review-prompt.md": "5c3710414b64e4846503e449f1ce7f480ee6a234a9356834581dd0187b801c47",
+      "verification.md": "c247c3149e2cbddc8336f6071c3a19fa91280c3edbc0ad8667ffdda5c51d80b7"
+    },
+    "blind-final": {
+      "AGENTS.md": "e4117721d454be48f881a878037a07353ea7b355741e366169746276466bdb72",
+      "accepted-spec.md": "297ee1df91463fd0b6c4863b34be8b999ad176fc7d40f0637bf196660bd65e3d",
+      "full.diff": "a8f91efb8617e2ff68a76227ba00fcb9623ec4b7bc7c0131e0bd9ad9fd6eddea",
+      "review-prompt.md": "9c71138a1fc55c810b6c1af40a6ef7645299890dc6cdef07fad83f4692ba97a0",
+      "verification.md": "c247c3149e2cbddc8336f6071c3a19fa91280c3edbc0ad8667ffdda5c51d80b7"
+    }
+  }
+}

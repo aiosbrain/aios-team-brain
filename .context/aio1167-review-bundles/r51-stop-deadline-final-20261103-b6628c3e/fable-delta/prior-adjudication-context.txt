@@ -1,0 +1,39 @@
+**Adjudication: item 3 warrants a narrow correctness correction, but Fable overstates the durable failed-attempt outcome at the real deadline. Items 1–2 are evidence gaps; item 4 is cosmetic.**
+
+I inspected clean HEAD `f3c4d3cba2142915c1032af3ff31efaf3ff5b31a` against base `29676566a08280e12619b565711f9b0ff65271e0`, the bundled accepted specification, and matching `AGENTS.md`. No edits or tests were performed.
+
+1. **`_ask_loop` failure coverage — evidence-only gap.**  
+   Both paths fail closed: creation raises `WatchNotDispatched`; stop raises `_StopNotSent("unconfirmed")`. Stop returns without publishing or incrementing attempts, and its allocated sweep slot remains spent. Creation retires when that result arrives with sufficient publication time remaining. An already-abandoned creation must retain conservative recovery; its late exception cannot authorize retirement.
+
+   Add deterministic coverage for failure at both the initial worker admission and post-authority admission. This requires no behavioral change. See [admission handling](/Users/chetan/.codex/worktrees/8d96/aios-team-brain/.context/aio1167-rebase-worktree/ingestion/aios_ingest/watch_renewal.py:544).
+
+2. **Checkpoint and local `old0` assertions — evidence-only gap.**  
+   The stop refusal handler performs no lifecycle publication, so source inspection supports the acknowledged-state assertions. Extend coverage to checkpoint payloads and the local projection, including resource ID and attempt count.
+
+   Do **not** assert that every scenario has zero checkpoints: the operation-minimum case legitimately retires `old1` and may publish restriction evidence. Assert that every subsequent payload preserves `old0` unchanged; where no other publication is expected, assert zero new checkpoints. See [existing assertions](/Users/chetan/.codex/worktrees/8d96/aios-team-brain/.context/aio1167-rebase-worktree/ingestion/tests/test_watch_late_quota.py:754).
+
+3. **Stop deadline — actionable, with two distinct conclusions.**
+
+   **The claimed persisted timeout failure is not established for actual absolute-deadline expiry.** `_Run.offload()` reports whether the worker started—not whether its provider request was sent. `_cleanup` indeed routes `WatchStepTimeout` into its generic failure handler and constructs a bumped record. However, `run.publish()` calls `bounded()`, which refuses publication once `run.deadline` has passed. `_bump_stop()` creates a replacement record; it does not mutate the existing one. Consequently, this path does not establish a persisted attempt increment or local projection change after the real deadline. See [offload/publication](/Users/chetan/.codex/worktrees/8d96/aios-team-brain/.context/aio1167-rebase-worktree/ingestion/aios_ingest/watch_renewal.py:218) and [cleanup handlers](/Users/chetan/.codex/worktrees/8d96/aios-team-brain/.context/aio1167-rebase-worktree/ingestion/aios_ingest/watch_renewal.py:721).
+
+   The existing `_controlled_deadline` helper expires only the worker wait; it does **not** advance the absolute deadline. Its late-stop test even releases the worker upon observing a bumped checkpoint. That fixture cannot prove production behavior at the actual deadline. See [timeout fixture](/Users/chetan/.codex/worktrees/8d96/aios-team-brain/.context/aio1167-rebase-worktree/ingestion/tests/test_watch_lifecycle.py:475).
+
+   **A post-deadline stop remains possible.** Unlike creation, `GoogleDriveWatchManager.stop()` has no deadline check after its composed gate and before `request.execute`. Final admission usually fails closed after expiry, but is not an absolute deadline guard: `_ask_loop` can return an already-completed answer even with a zero timeout, or the worker can resume after expiry following successful admission. The brokered OAuth transport retains a relative timeout established during construction; it does not independently enforce this absolute deadline. The service-account transport has an additional absolute HTTP guard, but that does not fix the manager’s contract across transports. See [stop dispatch boundary](/Users/chetan/.codex/worktrees/8d96/aios-team-brain/.context/aio1167-rebase-worktree/ingestion/aios_ingest/sources/gdrive_watch.py:176).
+
+   This is a pre-existing adjacent correctness issue under AC-04’s bounded-work requirement and the explicit 60-second contract. The new admission step does not eliminate it.
+
+4. **Creation’s diagnostic wording — cosmetic.**  
+   “Admission could not be confirmed” accurately describes the failed admission confirmation. Where a timely result permits retirement, both messages represent an unsent creation. No correction is required; do not expand the slice solely to change this text.
+
+**Smallest recommended correction:** add a stop-side absolute-deadline check immediately after the composed gate and before `execute`, with an explicit not-sent outcome that cleanup handles without a failed-attempt increment. Preserve raw authority refusals and existing admission scopes. Handle `WatchStepTimeout` explicitly by ending cleanup without lifecycle publication; worker-started status must not stand in for provider dispatch. Keep provable pre-request failures outside failed-provider-attempt accounting.
+
+Acceptance assertions should cover:
+
+- Initial and final admission failures: zero execution; stop state/resource/attempts unchanged in acknowledged state, checkpoint payloads and local projection; timely creation retires as not dispatched.
+- Actual deadline expiry while queued, constructing the request, or blocked in the gate/final admission: cleanup ends; releasing the worker causes no new `execute`, retirement, failed-attempt checkpoint or projection change.
+- A successful final admission returned at/after expiry: the manager’s own guard still prevents execution.
+- Authority refusal retains precedence; account/unconfirmed refusal ends cleanup, while a channel minimum permits independent cleanup within the remaining budget.
+- Exactly one allocated stop slot stays consumed, without refund or same-sweep retry. Requests already sent before expiry remain conservatively pending after abandonment; late success cannot retire them, and late quota/minimum evidence remains local until fresh authority.
+- Ordinary timely provider failures retain existing attempt accounting; timely success/404 retains retirement behavior.
+
+Update the old timeout fixture so worker release no longer depends on a fabricated failed-attempt checkpoint. Keep the accepted restriction-admission behavior and its CLEAN review evidence intact, while reviewing this correction separately. **Production certification and the 24-hour sandbox soak remain open.**

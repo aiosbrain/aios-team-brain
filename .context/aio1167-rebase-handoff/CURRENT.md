@@ -1,6 +1,6 @@
 # AIO-1167 current handoff
 
-Updated: 2026-11-03; R51 deadline correction verified, blind reviews pending
+Updated: 2026-11-03; R51 candidate frozen for final reviews
 
 ## Current action — R51 absolute stop deadline (2026-11-03)
 
@@ -9,8 +9,9 @@ Updated: 2026-11-03; R51 deadline correction verified, blind reviews pending
 - Full-user `claude auth status` confirms first-party Claude.ai Max subscription, `loggedIn:true`. Attached to the existing Opus 5.5 HIGH session `628402d5-a1c6-42b7-b736-e84358c1a749`; its `/usage` display at 2026-11-03 showed all-model weekly usage 59%, Fable weekly usage 72%, and credits off. The session had no active writer turn before dispatch. API key/token overrides were unset. Do not start another writer; stop at 90% or an actual provider refusal.
 - The same Opus session completed the implementation and test-writing turns (`end_turn`). The code correction is in `ingestion/aios_ingest/sources/gdrive_watch.py` and `ingestion/aios_ingest/watch_renewal.py`; tests/helpers are in `ingestion/tests/test_watch_late_quota.py`, `ingestion/tests/test_watch_lifecycle.py`, and `ingestion/tests/test_watch_quota_hold.py`. The writer ran no commands, tests, commits, pushes, or reviews. Full writer report is `r51-opus-deadline-regressions-result-20261103.md`.
 - The same writer then made one documentation-only correction to `WatchNotDispatched` in `ingestion/aios_ingest/watch_lifecycle.py`, clarifying it covers both creation and cleanup stops. It completed with `end_turn`; no behavior or test changes were made in that turn.
-- Coordinator verification on the code/test snapshot `b7284050ea8e9b877c8c6f5018545eb62c803d06`: focused watch suites **94 passed in 2.39s**; full ingestion **1,112 passed, 28 skipped, one existing Starlette/httpx deprecation warning, 54.01s**. Both passed after the test changes and before the subsequent docstring-only edit. Re-run focused watch tests and `git diff --check` after that textual correction, then checkpoint/push/read back the exact final candidate.
-- Next: freeze and hash the final source/test diff; obtain the Fable 5.1 correction review and blind Astra HIGH plus GPT-6.1 Sol HIGH reviews on the same exact final candidate; adjudicate findings before any PR #743 update. Production certification and the 24-hour sandbox soak remain open; no merge or deployment.
+- Coordinator verification: focused watch suites **94 passed in 3.22s** and `git diff --check` passed after the final docstring-only edit. Full ingestion **1,112 passed, 28 skipped, one existing Starlette/httpx deprecation warning, 54.01s** passed on `b7284050ea8e9b877c8c6f5018545eb62c803d06`; only the nonbehavioral exception docstring changed afterward. The final source/test candidate is `b6628c3ed0f252d58259345c24178c75e4be9b16`, pushed and independently read back from `origin/codex/aio-1167-r51-resume-20261102`.
+- Review packet: `.context/aio1167-review-bundles/r51-stop-deadline-final-20261103-b6628c3e/`. It separates the Fable delta packet (with prior adjudication context) from the blind full-diff packet (no prior review material). Manifest SHA-256: `5431c921e0f93bffe793cdc2f050ff6e386688385903e18744915a4272147dc2`. The exact six-file candidate is frozen; do not edit it during review.
+- Next: check full-user Claude.ai `/usage` before each review and keep every applicable window below 90%; obtain Fable 5.1 review of the `f3c4d3c..b6628c3e` delta, then blind Astra HIGH and GPT-6.1 Sol HIGH reviews of the same full candidate `29676566..b6628c3e`. Record each exact model, session, verdict and report hash. Adjudicate findings before any PR #743 update. Production certification and the 24-hour sandbox soak remain open; no merge or deployment.
 
 ## Objective and policy
 

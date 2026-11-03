@@ -1,0 +1,7 @@
+# Fable 5.1 read-only correction review
+
+Review the exact delta from `f3c4d3cba2142915c1032af3ff31efaf3ff5b31a` to `b6628c3ed0f252d58259345c24178c75e4be9b16` in `delta.diff`, against `accepted-spec.md`, `AGENTS.md`, `prior-adjudication-context.txt`, and `verification.md`. Inspect relevant callers and surrounding code read-only as needed. Do not edit files or run commands/tests. Use read/grep/glob access only.
+
+Assess the absolute stop-deadline behavior and tests against the adjudicated cases: guard immediately before `request.execute`; authority-refusal precedence; timeout as no confirmed provider dispatch; unchanged acknowledged state/resource/attempts in brain, checkpoint payloads and local projection; no late retirement or duplicate request; a request sent before deadline remains pending and late restrictions stay local; unanswered initial/final admission for create/stop; spent one-slot budget and independent per-channel continuation. Check fixtures advance the actual absolute deadline rather than relying on fabricated checkpoints. Check timely success, 404 and provider-error accounting.
+
+Return `CLEAN` or `CHANGES REQUIRED` and only actionable findings, each with severity, exact file/line, trigger, impact, and concrete correction. State that you reviewed exact candidate `b6628c3ed0f252d58259345c24178c75e4be9b16` and the diff SHA from the manifest. Do not infer production certification or soak completion.
