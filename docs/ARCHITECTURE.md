@@ -994,7 +994,16 @@ R44 contracts (AIO-1167):
   (`mergeGdriveContributions`), so its exact `author-email:` mapping authority is never traded for a
   roster-email match; the evidence store retires the stored equivalent (`supersededEvidenceKeys`), and the
   Timeline reads one row per item observation through `latestStoredGdriveObservations`, where recency
-  decides only between rows of the same provenance.
+  decides only between rows of the same provenance. Whenever a Google observation's EMAIL is the evidence
+  — a bare-email row, or a permission id nobody has decided — ONE Google email-bridge decision
+  (`googleEmailBridge` in `lib/identity/resolve`, AIO-1167 R53) answers for evidence persistence, the
+  dashboard/Timeline read, Google author attribution and permission discovery alike: an unlinked or
+  ambiguous `author-email:E` holds it; an `author-email:E` linked (or legacy-mapped, stored email or not)
+  to a member other than E's one confirmed roster/alias owner is a `conflict` — nobody is credited, the
+  evidence row is `google_email_conflict`, and discovery links the permission id to neither member and
+  audits `identity.discovery_conflict` for the Admin diagnostic; agreeing or single owners bridge as
+  before. Exact permission authority and a direct `author-email:` observation's own owner are decided
+  first and never replaced.
 - **Sidecar:** a service-account run is namespaced by the account its LOADED key authenticates as and
   refused before any progress is used when that differs from the verified identity; watch renewal
   resolves the same namespace. Jobs bind local entries by immutable integration id (a same-name entry

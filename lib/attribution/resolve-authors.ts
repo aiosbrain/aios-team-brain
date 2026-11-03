@@ -2,7 +2,7 @@ import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import type { ItemPayload } from "@/lib/api/schemas";
 import {
-  googleEmailAttributionHeld,
+  googleEmailBridgeMember,
   providerIdentityState,
   resolveByProviderId,
   resolveMemberDetailed,
@@ -161,11 +161,10 @@ function resolveRef(map: IdentityMap, ref: AuthorRef): { memberId: string | null
     // exact confirmed roster/alias email only. Never promote a same-domain local part, handle or
     // display name into a verified Google link.
     if (ref.provider?.toLowerCase() === "gdrive") {
-      const email = ref.email.trim().toLowerCase();
-      // The address's own Google email identity was unlinked, or its histories are ambiguous: the
-      // email bridge is held for Google evidence (AIO-1167 PR743).
-      if (googleEmailAttributionHeld(map, email)) return { memberId: null, method: "unresolved" };
-      const exact = !map.ambiguousEmails?.has(email) ? map.byEmail.get(email) : undefined;
+      // The one Google email-bridge decision (AIO-1167 R53): a held address (its own Google email
+      // identity unlinked or ambiguous, PR743) bridges nowhere, and a linked `author-email:` owner that
+      // disagrees with the confirmed roster/alias owner credits neither.
+      const exact = googleEmailBridgeMember(map, ref.email);
       if (exact) return { memberId: exact, method: "email" };
       return { memberId: null, method: "unresolved" };
     }

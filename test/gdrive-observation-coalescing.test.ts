@@ -324,8 +324,9 @@ describe("a legacy bare-email row and the producer's author-email row are one ob
     }, row.item_id, identities);
     const legacy = timelineRow(LEGACY_KEY, LEGACY, legacyAt);
     const author = timelineRow(AUTHOR_KEY, AUTHOR, authorAt);
-    // The fixture discriminates: the bare row alone would be credited to B through the roster email.
-    expect(render(legacy).map((row) => row.memberId)).toEqual(["member-b"]);
+    // The fixture discriminates: the bare row alone is never A's. Its email bridges to nobody — the
+    // linked `author-email:` owner (A) and the roster owner (B) disagree (R53 email-bridge conflict).
+    expect(render(legacy).map((row) => row.memberId)).toEqual([]);
     expect(render(author).map((row) => row.memberId)).toEqual(["member-a"]);
     for (const rows of [[legacy, author], [author, legacy]]) {
       const activities = latestStoredGdriveObservations(rows).flatMap(render);

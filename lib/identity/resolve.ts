@@ -236,6 +236,58 @@ export function googleEmailAttributionHeld(map: IdentityMap, email: string | nul
   return state === "unlinked" || state === "ambiguous";
 }
 
+/**
+ * THE Google email-bridge decision (AIO-1167 R53): whether a Google observation's EMAIL — the only
+ * evidence of a permission id nobody has decided, or of a bare-email observation — names one member.
+ * Shared by contribution persistence, the dashboard/Timeline read, Google author attribution and
+ * permission discovery, so all four answer alike. It is asked only AFTER the observation's own exact
+ * provider authority (a decided permission id, a linked `author-email:` key), which it never replaces.
+ *
+ *   · `held` — the address's own `author-email:` identity is unlinked or ambiguous (PR743): no bridge.
+ *   · `conflict` — the address's `author-email:` identity is LINKED (a decided link, or a live legacy
+ *     mapping), and its owner is not
+ *     the one confirmed roster/alias owner of the address (another member holds it, the address is
+ *     ambiguous, or the linked owner does not resolve in this map — e.g. deactivated, for linking).
+ *     Neither member is credited and no permission id is linked to either.
+ *   · `member` — exactly one owner: the linked `author-email:` owner and the confirmed owner agree, or
+ *     only one of them exists (a legacy link with no stored email still counts as the owner).
+ *   · `none` — no authority and no confirmed owner.
+ *
+ * Confirmed ownership is exact roster/alias email only (`byEmail`, ambiguity refused) — never a handle,
+ * domain or display name. `author-email:` stays non-stable: this decides the bridge, not identity.
+ */
+export type GoogleEmailBridge =
+  | { outcome: "member"; memberId: string }
+  | { outcome: "held" }
+  | { outcome: "conflict"; linkedMemberId: string | null; emailMemberId: string | null }
+  | { outcome: "none" };
+
+export function googleEmailBridge(map: IdentityMap, email: string | null | undefined): GoogleEmailBridge {
+  const address = (email ?? "").trim().toLowerCase();
+  if (!address) return { outcome: "none" };
+  const key = `author-email:${address}`;
+  const state = providerIdentityState(map, "gdrive", key);
+  if (state === "unlinked" || state === "ambiguous") return { outcome: "held" };
+  const ambiguous = map.ambiguousEmails?.has(address) ?? false;
+  const emailMemberId = ambiguous ? null : map.byEmail.get(address) ?? null;
+  // The address's `author-email:` owner: a decided link, or a live mapping (a legacy row with no state).
+  const linkedMemberId = resolveByProviderId(map, "gdrive", key);
+  if (state !== "linked" && !linkedMemberId) {
+    return emailMemberId ? { outcome: "member", memberId: emailMemberId } : { outcome: "none" };
+  }
+  if (linkedMemberId && !ambiguous && (!emailMemberId || emailMemberId === linkedMemberId)) {
+    return { outcome: "member", memberId: linkedMemberId };
+  }
+  if (!linkedMemberId && !ambiguous && !emailMemberId) return { outcome: "none" };
+  return { outcome: "conflict", linkedMemberId, emailMemberId };
+}
+
+/** The member a Google email bridges to, or null (`googleEmailBridge`). */
+export function googleEmailBridgeMember(map: IdentityMap, email: string | null | undefined): string | null {
+  const bridge = googleEmailBridge(map, email);
+  return bridge.outcome === "member" ? bridge.memberId : null;
+}
+
 /** How an identity resolved — the attribution CONFIDENCE. `email`/`handle` are exact matches;
  *  `heuristic` is the softer email-local-part → team-handle guess; `unresolved` is no match. */
 export type ResolveMethod = "email" | "handle" | "heuristic" | "unresolved";

@@ -1,5 +1,5 @@
 import {
-  googleEmailAttributionHeld, providerIdentityState, resolveByProviderId, type IdentityMap,
+  googleEmailBridgeMember, providerIdentityState, resolveByProviderId, type IdentityMap,
 } from "@/lib/identity/resolve";
 import { coalesceGdriveObservations } from "@/lib/ingest/gdrive-ledger";
 
@@ -60,11 +60,9 @@ export function googleDriveContributionEvidence(
     const hasMappingAuthority = externalId
       ? providerIdentityState(identities, "gdrive", externalId) !== null
       : false;
-    // An address whose own Google email identity is unlinked or ambiguous never bridges by email (PR743).
-    const exactEmail = !hasMappingAuthority && email && !identities.ambiguousEmails?.has(email)
-      && !googleEmailAttributionHeld(identities, email)
-      ? identities.byEmail.get(email) ?? null
-      : null;
+    // The one Google email-bridge decision (R53): an unlinked/ambiguous address never bridges (PR743),
+    // and a linked `author-email:` owner that disagrees with the confirmed owner credits neither.
+    const exactEmail = !hasMappingAuthority && email ? googleEmailBridgeMember(identities, email) : null;
     const resolvedMemberId =
       // Preserve the established `gdrive` provider namespace. The external id carries its kind
       // (`permission:<id>`), keeping Drive permission ids distinct from OAuth subjects.

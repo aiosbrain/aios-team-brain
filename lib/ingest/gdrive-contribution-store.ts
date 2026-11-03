@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import type { DbClient } from "@/lib/db/types";
 import {
   buildIdentityMap,
-  googleEmailAttributionHeld,
+  googleEmailBridge,
   providerIdentityState,
   resolveByProviderId,
   type IdentityMap,
@@ -137,16 +137,23 @@ export function supersededEvidenceKeys(
   return superseded;
 }
 
-function exactMember(identities: IdentityMap, row: NormalizedGdriveContribution): string | null {
+function exactMember(
+  identities: IdentityMap, row: NormalizedGdriveContribution,
+): { memberId: string | null; emailConflict: boolean } {
   const byId = row.externalId ? resolveByProviderId(identities, "gdrive", row.externalId) : null;
-  if (byId) return byId;
+  if (byId) return { memberId: byId, emailConflict: false };
   // A durable linked/unlinked authority row means this stable provider identity has been reviewed.
   // In particular, an explicit unlink must not be silently undone by the same row's email fallback.
-  if (row.externalId && providerIdentityState(identities, "gdrive", row.externalId)) return null;
-  if (!row.email || identities.ambiguousEmails?.has(row.email)) return null;
-  // The address's own Google email identity is unlinked or ambiguous: its email bridge is held (PR743).
-  if (googleEmailAttributionHeld(identities, row.email)) return null;
-  return identities.byEmail.get(row.email) ?? null;
+  if (row.externalId && providerIdentityState(identities, "gdrive", row.externalId)) {
+    return { memberId: null, emailConflict: false };
+  }
+  // The one Google email-bridge decision (R53): a held address bridges nowhere (PR743), and a linked
+  // `author-email:` owner that disagrees with the confirmed owner credits neither.
+  const bridge = googleEmailBridge(identities, row.email);
+  return {
+    memberId: bridge.outcome === "member" ? bridge.memberId : null,
+    emailConflict: bridge.outcome === "conflict",
+  };
 }
 
 export async function syncGdriveContributionEvidence(
@@ -193,7 +200,7 @@ export async function syncGdriveContributionEvidence(
   let resolved = 0;
   let diagnostics = 0;
   for (const row of rows) {
-    const sourceMemberId = exactMember(map, row);
+    const { memberId: sourceMemberId, emailConflict } = exactMember(map, row);
     const memberId = correction.memberIdLocked ? correction.memberId ?? null : sourceMemberId;
     if (memberId) resolved++;
     const correctionDiagnostic = correction.memberIdLocked
@@ -215,7 +222,8 @@ export async function syncGdriveContributionEvidence(
         ? null
         : row.externalId ? revisions.get(row.externalId) ?? null : null,
       authority_revision: correction.authorityRevision ?? null,
-      diagnostic: row.diagnostic ?? correctionDiagnostic ?? (memberId ? null : "unresolved_identity"),
+      diagnostic: row.diagnostic ?? correctionDiagnostic
+        ?? (memberId ? null : emailConflict ? "google_email_conflict" : "unresolved_identity"),
       updated_at: new Date().toISOString(),
     }, { onConflict: "team_id,item_id,evidence_key" });
     if (error) throw new Error(`gdrive contribution evidence write failed: ${error.message}`);

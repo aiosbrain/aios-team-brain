@@ -1,11 +1,11 @@
 import "server-only";
 
 import type { ApiAuth } from "@/lib/api/auth";
+import { audit } from "@/lib/api/audit";
 import type { DbClient } from "@/lib/db/types";
 import { withTransaction } from "@/lib/db/pg/pool";
 import { discoverMemberIdentity, type DiscoveredIdentityOutcome } from "@/lib/identity/member-identities";
-import { resolveConfirmedEmail } from "@/lib/identity/provider-sync";
-import { buildIdentityMap, googleEmailAttributionHeld, providerIdentityState } from "@/lib/identity/resolve";
+import { buildIdentityMap, googleEmailBridge, providerIdentityState } from "@/lib/identity/resolve";
 import {
   assertGdrivePayloadBinding,
   lockLiveGdriveExecution,
@@ -22,8 +22,11 @@ import { normalizeGdriveContributions } from "@/lib/ingest/gdrive-contribution-s
  * that snapshot sees any link made here, and the identity revision it validates is the new one.
  *
  * Evidence rule: an observation carrying both a `permission:` id and an email, where that email
- * resolves to exactly one ACTIVE member through the linking map (`resolveConfirmedEmail`, which
- * refuses ambiguous and deactivated matches). The shared owner (`discoverMemberIdentity`) then
+ * bridges to exactly one ACTIVE member through the linking map — the one Google email-bridge decision
+ * (`googleEmailBridge`, AIO-1167 R53), which refuses ambiguous and deactivated matches, a held address,
+ * and an address whose deliberately linked `author-email:` owner disagrees with its confirmed
+ * roster/alias owner (refused for BOTH and audited as a discovery conflict). The shared owner
+ * (`discoverMemberIdentity`) then
  * creates the link only if the id was never reviewed — an existing link, a manual mapping and an
  * unlink tombstone all stand, and a disagreeing email is recorded as a conflict, never a transfer.
  *
@@ -69,12 +72,30 @@ export async function discoverGdriveContributorIdentities(
       // concurrent unlink is either seen here or serialized after this link. Roster email for other
       // providers is untouched, and an independently established permission mapping (above) keeps
       // its authority.
-      if (googleEmailAttributionHeld(linking, email)) {
+      const bridge = googleEmailBridge(linking, email);
+      if (bridge.outcome === "held") {
         outcomes.reviewed++;
         continue;
       }
-      const memberId = resolveConfirmedEmail(linking, email);
-      if (!memberId) continue;
+      if (bridge.outcome === "conflict") {
+        // The address's `author-email:` identity is deliberately linked to one member while its confirmed
+        // roster/alias owner is another (or the address is ambiguous, or the linked owner is not
+        // eligible): the email cannot say whose permission id this is (AIO-1167 R53). No link to either
+        // member; the refusal is audited on the existing Google discovery-conflict path for the Admin
+        // diagnostic — the candidate the email names, beside the `author-email:` owner holding it.
+        await audit(db, {
+          team_id: auth.teamId, actor_kind: "api_key", member_id: auth.memberId,
+          action: "identity.discovery_conflict", target_type: "member", target_id: bridge.emailMemberId,
+          meta: {
+            provider: "gdrive", external_id: externalId, mapped_member_id: bridge.linkedMemberId,
+            reason: "author_email_owner",
+          },
+        });
+        outcomes.conflict++;
+        continue;
+      }
+      if (bridge.outcome !== "member") continue;
+      const memberId = bridge.memberId;
       outcomes[await discoverMemberIdentity(db, auth.teamId, memberId, {
         provider: "gdrive", externalId, email,
       }, { actor: { kind: "api_key", memberId: auth.memberId } })]++;
