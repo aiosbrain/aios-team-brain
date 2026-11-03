@@ -2,6 +2,8 @@
 
 The existing Opus 5.5 HIGH writer session `628402d5-a1c6-42b7-b736-e84358c1a749` completed the bounded test-only continuation with `end_turn`. It changed no behavior beyond the already checkpointed source correction in `f6354d1056b1242c46ff4cde5c8b8bfcd3650502`. The writer ran no commands, tests, commits, pushes or reviews.
 
+In a separate final one-line documentation turn, the same session corrected the `WatchNotDispatched` class docstring in `ingestion/aios_ingest/watch_lifecycle.py` to describe both creation and cleanup stop requests. No behavior or tests changed in that turn.
+
 New test/helper edits:
 
 - `ingestion/tests/test_watch_lifecycle.py`: a controllable absolute-deadline clock and production `GoogleDriveWatchManager` coverage for successful gate answers before/at/after deadline, request setup crossing deadline, and authority refusal precedence.

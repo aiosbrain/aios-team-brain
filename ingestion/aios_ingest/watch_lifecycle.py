@@ -77,7 +77,8 @@ class InvalidWatchTransition(ValueError):
 
 
 class WatchNotDispatched(RuntimeError):
-    """A creation step failed BEFORE the provider call was sent: no channel can exist from it."""
+    """A watch call — a channel creation or a cleanup stop — failed BEFORE its provider request was
+    sent: a creation can have created no channel, and a stop has not reached the provider."""
 
 
 class WatchRefused(RuntimeError):
