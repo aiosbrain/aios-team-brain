@@ -13,7 +13,10 @@ pinned in ``test/datamechanics/gdrive-audience-claims.datamechanics.test.ts``):
   * an unresolved selected root (an unknown roster) and a restriction on the document itself do not
     send verified trash back to a probe;
   * an ambiguous ``removed`` hint under the restricted parent is NOT trash evidence: it stays on the
-    absence gates, nothing is removed and nothing is read.
+    absence gates, nothing is removed and nothing is read;
+  * trash then restore of an already-selected document in ONE page keeps its membership: the trash
+    obligation and its membership removal are canceled together by the final observation (R51 P2),
+    while a page whose final observation is a removal still removes.
 """
 
 from __future__ import annotations
@@ -328,6 +331,115 @@ async def test_with_no_local_membership_trash_then_restore_in_one_page_removes_n
     _trash(world, "doc-n")
     await run(world, state)
     assert "doc-n" in world.removed
+    state.close()
+
+
+def _selected_world(monkeypatch, selection):
+    """A completed-baseline world whose document is selected through a folder root or directly."""
+    if selection == "folder":
+        return _nested_world(monkeypatch), "doc-n"
+    world = _DriveWorld(file_ids=["doc-f"]).install(monkeypatch)
+    world.ledger = _ClaimLedger()
+    world.put("doc-f", drive=DRIVE)
+    return world, "doc-f"
+
+
+def _owed_work(state, world):
+    return state._db.execute(
+        "SELECT count(*) FROM pending_work WHERE namespace=? AND generation=? "
+        "AND acknowledged_at IS NULL AND superseded_at IS NULL",
+        (world.namespace(DRIVE), world.generation),
+    ).fetchone()[0]
+
+
+def _listings(world):
+    return [call for call in world.calls if call[0] == "list"]
+
+
+@pytest.mark.parametrize("selection", ["direct-file", "folder"])
+@pytest.mark.asyncio
+async def test_a_selected_document_trashed_then_restored_in_one_page_keeps_membership_and_converges(
+    tmp_path, monkeypatch, clock, selection,
+):
+    """Same page, EXISTING local membership (Astra/Sol R51 P2): the trash obligation is canceled by the
+    later restore, and its membership removal must go with it — the page applies additions before
+    removals, so a surviving removal would erase the membership the restore re-asserted, strand the
+    restored upsert, and leave the connection unable to converge without another edit or rescan."""
+    world, doc = _selected_world(monkeypatch, selection)
+    path = str(tmp_path / f"in-scope-restore-{selection}.sqlite")
+    state = StateStore(path)
+    assert (await run(world, state)).authoritative_complete is True
+    namespace = world.namespace(DRIVE)
+    assert doc in state.membership_ids(namespace, world.generation)
+    state.close()
+
+    state = StateStore(path)  # reopened before the change page
+    _trash(world, doc)
+    _restore(world, doc)
+    world.calls.clear()
+    world.pushed.clear()
+    outcome = await run(world, state)
+
+    assert doc in state.membership_ids(namespace, world.generation)  # membership stands
+    assert doc in world.pushed  # the restored upsert was delivered…
+    assert _owed_work(state, world) == 0  # …and acknowledged: nothing is owed
+    assert not state.has_owed_work(namespace, world.generation, doc)
+    assert doc not in world.removed
+    assert (world.integration_id, doc) not in world.ledger.retired  # no claim retired
+    assert world.integration_id in world.ledger.claims[doc]
+    assert _listings(world) == []  # no rescan
+    assert outcome.authoritative_complete is True
+    state.close()
+
+    state = StateStore(path)  # reopened again: a quiet poll needs no edit, rescan or retry
+    world.calls.clear()
+    world.pushed.clear()
+    quiet = await run(world, state)
+    assert quiet.authoritative_complete is True
+    assert world.pushed == [] and doc not in world.removed
+    assert _listings(world) == [] and _reads_of(world, doc) == []
+    assert doc in state.membership_ids(namespace, world.generation)
+    assert _owed_work(state, world) == 0
+    state.close()
+
+
+@pytest.mark.parametrize("order", ["trash-only", "restore-then-trash", "restore-then-out-of-scope"])
+@pytest.mark.asyncio
+async def test_a_selected_document_whose_final_observation_in_the_page_is_removal_still_loses_membership(
+    tmp_path, monkeypatch, clock, order,
+):
+    """Controls for the same-page normalization: only a trash-origin removal CANCELED by a later
+    restore is dropped. Trash alone, a restore followed by trash, and a trash → restore followed by a
+    genuine out-of-scope move each end as a removal: membership goes and this connection's claim is
+    retired (additions-before-removals is unchanged)."""
+    world = _nested_world(monkeypatch)
+    world.put("folder-z", drive=DRIVE, folder=True)  # not selected
+    path = str(tmp_path / f"final-removal-{order}.sqlite")
+    state = StateStore(path)
+    assert (await run(world, state)).authoritative_complete is True
+    namespace = world.namespace(DRIVE)
+    assert "doc-n" in state.membership_ids(namespace, world.generation)
+    state.close()
+
+    state = StateStore(path)
+    if order == "trash-only":
+        _trash(world, "doc-n")
+    elif order == "restore-then-trash":
+        world.logs.setdefault(DRIVE, []).append({"fileId": "doc-n", "file": dict(world.files["doc-n"])})
+        _trash(world, "doc-n")
+    else:
+        _trash(world, "doc-n")
+        _restore(world, "doc-n")
+        world.files["doc-n"]["parents"] = ["folder-z"]  # then moved out of the selection
+        world.logs[DRIVE].append({"fileId": "doc-n", "file": dict(world.files["doc-n"])})
+    world.calls.clear()
+    world.pushed.clear()
+    await run(world, state)
+
+    assert "doc-n" not in state.membership_ids(namespace, world.generation)
+    assert "doc-n" in world.removed
+    assert (world.integration_id, "doc-n") in world.ledger.retired
+    assert _owed_work(state, world) == 0
     state.close()
 
 

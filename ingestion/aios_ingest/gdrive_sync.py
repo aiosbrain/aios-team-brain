@@ -2557,6 +2557,9 @@ async def _run_gdrive_stream_unlocked(
                 return held
 
             last_trashed: dict[str, bool] = {}
+            # Membership removals that come from explicit trash, kept apart so they follow the same
+            # final observation as the trash obligation they belong to (R51 P2, below).
+            trash_membership_removals: list[str] = []
             for change in page.changes:
                 change_type = str(change.get("changeType") or "file")
                 changed_drive_id = str(change.get("driveId") or "")
@@ -2706,7 +2709,7 @@ async def _run_gdrive_stream_unlocked(
                         "file_id": file_id, "trashed": True, "reason": "explicit_trash",
                     }))
                     if selected:
-                        membership_removals.append(file_id)
+                        trash_membership_removals.append(file_id)
                     continue
                 if removed or moved_out or (selected and not in_scope):
                     if (selected or moved_out) and absence_withheld(
@@ -2736,12 +2739,22 @@ async def _run_gdrive_stream_unlocked(
             # Ordering (A1): explicit trash later RESTORED within the same page is not trash any more. A
             # restored document this stream cannot place (no local membership, its root unreadable)
             # yields no superseding upsert, so its earlier trash removal is dropped here instead of
-            # suppressing restored content; an in-scope one is upserted below its removal as before.
+            # suppressing restored content; an in-scope one keeps only its restore upsert.
             obligations = [
                 (item_key, action, payload) for item_key, action, payload in obligations
                 if not (action == "remove" and payload.get("reason") == "explicit_trash"
                         and last_trashed.get(item_key) is False)
             ]
+            # Membership effects follow the SAME final observation (Astra/Sol R51 P2): the page applies
+            # additions before removals, so a trash-origin removal left behind by a canceled trash
+            # obligation would erase the membership the restore just re-asserted, and the restored
+            # upsert could never be delivered. Only trash-origin removals are dropped; a genuine
+            # removal recorded later in the page (out of scope, absence) stands, and a restore
+            # followed by trash still removes.
+            membership_removals.extend(
+                item_key for item_key in trash_membership_removals
+                if last_trashed.get(item_key) is not False
+            )
             if held_by_deferred_root:
                 # Reported, never charged: the document is owed to the deferred root's recovery.
                 summary.failure_categories = summary.failure_categories or {}
@@ -3135,6 +3148,16 @@ async def _enumerate_baseline(
         key[len(_FOLDER_LISTING_RESOURCE):] for key in restricted_roots
         if key.startswith(_FOLDER_LISTING_RESOURCE)
     }
+    if restricted_listings and state.open_traversal_folders(
+        namespace, generation, restricted_listings, snapshot_id=snapshot_id,
+    ):
+        # Name the standing minimum the build is waiting on (Fable R51 L4): once for the held listing —
+        # never per row, and nothing here says the baseline completed. Its rows are excluded below,
+        # so they are still open whichever way this enumeration returns.
+        summary.failure_categories = summary.failure_categories or {}
+        summary.failure_categories["provider_restricted_resource"] = max(
+            summary.failure_categories.get("provider_restricted_resource", 0), 1,
+        )
     while pages_read < page_budget:
         row = state.next_traversal(
             namespace, generation, snapshot_id=snapshot_id, exclude_folders=restricted_listings,

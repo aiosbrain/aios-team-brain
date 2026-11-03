@@ -2,9 +2,13 @@ import "server-only";
 
 import type { DbClient } from "@/lib/db/types";
 import { runSql, withTransaction } from "@/lib/db/pg/pool";
-import type { IdentityMap } from "@/lib/identity/resolve";
+import {
+  providerIdentityState,
+  type IdentityMap,
+  type ProviderIdentityState,
+} from "@/lib/identity/resolve";
 import { googleEmailKey } from "@/lib/identity/google-email-authority";
-import { resolveItemAuthorMember } from "@/lib/attribution/resolve-authors";
+import { parseAuthorRefs, resolveItemAuthorMember } from "@/lib/attribution/resolve-authors";
 import { syncGdriveContributionEvidence } from "@/lib/ingest/gdrive-contribution-store";
 import { purgeTeamLearningCachesStrict } from "@/lib/ingest/reconcile-attribution";
 import { advanceAuthorizationEpoch } from "@/lib/access/authorization-epoch";
@@ -37,6 +41,47 @@ function hasRetainedGdriveEvidence(frontmatter: Record<string, unknown>): boolea
     (Array.isArray(frontmatter.authors) && frontmatter.authors.length > 0) ||
     (Array.isArray(frontmatter.contributions) && frontmatter.contributions.length > 0)
   );
+}
+
+/**
+ * Whether an unresolved author is HELD by an ambiguous Google email history rather than decided
+ * (AIO-1167 PR743 R51): some ref's Google `author-email:` identity has several equivalent histories and
+ * no canonical decision, and no ref carries a definite unlink. That is the rule historical
+ * reattribution applies (`lib/ingest/reattribute.ts`): an ambiguity blocks new attribution but is not
+ * an unlink, so it never erases established credit. A definite unlink anywhere in the evidence still
+ * clears, and a remap resolves to its new owner before this is asked.
+ */
+function heldByGoogleEmailAmbiguity(map: IdentityMap, frontmatter: Record<string, unknown>): boolean {
+  let ambiguous = false;
+  for (const ref of parseAuthorRefs(frontmatter)) {
+    const states: (ProviderIdentityState | null)[] = [];
+    if (ref.provider && ref.externalId) states.push(providerIdentityState(map, ref.provider, ref.externalId));
+    const email = ref.email?.trim().toLowerCase();
+    if (email && ref.provider?.trim().toLowerCase() === "gdrive") {
+      states.push(providerIdentityState(map, "gdrive", `author-email:${email}`));
+    }
+    if (email) states.push(providerIdentityState(map, "email-alias", email));
+    if (states.includes("unlinked")) return false;
+    if (states.includes("ambiguous")) ambiguous = true;
+  }
+  return ambiguous;
+}
+
+/**
+ * The credit a row keeps when its evidence resolves to nobody. Drive evidence that names no member
+ * clears credit — the obligation exists because a mapping changed — except an established, non-connector
+ * owner held only by an ambiguous Google email history (above). Rows without retained Drive evidence
+ * keep what they have.
+ */
+function unresolvedCredit(
+  map: IdentityMap,
+  connectors: ReadonlySet<string>,
+  frontmatter: Record<string, unknown>,
+  current: string | null,
+): string | null {
+  if (!hasRetainedGdriveEvidence(frontmatter)) return current;
+  if (current && !connectors.has(current) && heldByGoogleEmailAmbiguity(map, frontmatter)) return current;
+  return null;
 }
 
 /**
@@ -131,7 +176,7 @@ async function repairOneItem(
   let versionUpdates = 0;
   if (!item.member_id_locked) {
     const resolved = resolveItemAuthorMember(map, item.frontmatter ?? {}, connectors);
-    const next = resolved ?? (hasRetainedGdriveEvidence(item.frontmatter ?? {}) ? null : item.member_id);
+    const next = resolved ?? unresolvedCredit(map, connectors, item.frontmatter ?? {}, item.member_id);
     if (next !== item.member_id) {
       const result = await runSql(
         `update items set member_id=$3,updated_at=now()
@@ -153,9 +198,8 @@ async function repairOneItem(
     );
     for (const version of versions) {
       const resolvedVersion = resolveItemAuthorMember(map, version.frontmatter ?? {}, connectors);
-      const nextVersion = resolvedVersion ?? (
-        hasRetainedGdriveEvidence(version.frontmatter ?? {}) ? null : version.member_id
-      );
+      const nextVersion = resolvedVersion
+        ?? unresolvedCredit(map, connectors, version.frontmatter ?? {}, version.member_id);
       if (nextVersion === version.member_id) continue;
       const result = await runSql(`update item_versions set member_id=$2 where id=$1`, [
         version.id, nextVersion,
@@ -304,6 +348,8 @@ export async function runIdentityRepairObligation(
         versionUpdates += result.versions;
         contributionUpdates += result.contributions;
       }
+      // Progress counts the whole scanned page — the span the cursor advances over — not the
+      // candidates in it: an email-key page with no match still advanced (Fable R51 L2).
       const last = scannedPage.at(-1)?.id ?? current.cursor_item_id;
       await runSql(
         `update identity_repair_obligations set cursor_item_id=$5,
@@ -312,11 +358,11 @@ export async function runIdentityRepairObligation(
                 updated_at=now()
           where team_id=$1 and provider=$2 and external_id=$3 and mapping_revision=$4`,
         [current.team_id, current.provider, current.external_id, current.mapping_revision,
-          last, candidates.length, itemUpdates, versionUpdates, contributionUpdates],
+          last, scannedPage.length, itemUpdates, versionUpdates, contributionUpdates],
       );
       return {
         status: "partial" as const,
-        scanned: candidates.length,
+        scanned: scannedPage.length,
         finished: scannedPage.length < batchSize,
       };
     });

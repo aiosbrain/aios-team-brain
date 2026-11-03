@@ -1,13 +1,15 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 
-import { getPool } from "@/lib/db/pg/pool";
+import { getPool, withTransaction } from "@/lib/db/pg/pool";
 import { db, driveFixture, seedTeam, type Seed } from "./helpers";
-import { removeMemberIdentity, setMemberIdentity } from "@/lib/identity/member-identities";
+import {
+  advanceIdentityMappingState, removeMemberIdentity, setMemberIdentity,
+} from "@/lib/identity/member-identities";
 import { buildIdentityMap, providerIdentityState, resolveByProviderId } from "@/lib/identity/resolve";
 import { parseAuthorRefs, resolveAuthors } from "@/lib/attribution/resolve-authors";
 import { googleDriveContributionEvidence } from "@/lib/dashboard/gdrive-contributions";
-import { drainIdentityRepairs } from "@/lib/ingest/identity-repair";
+import { drainIdentityRepairs, runIdentityRepairObligation } from "@/lib/ingest/identity-repair";
 import { reattributeItems } from "@/lib/ingest/reattribute";
 
 /**
@@ -19,7 +21,10 @@ import { reattributeItems } from "@/lib/ingest/reattribute";
  *  * A legacy unlink under another spelling blocks canonical connector evidence AND its roster-email
  *    fallback; an explicit, fenced canonical relink restores resolution while the old history stays.
  *  * Several equivalent histories (linked/linked, linked/unlinked) are ambiguous: no credit and no
- *    fallback — but, unlike a definite unlink, established item credit is not erased.
+ *    fallback — but, unlike a definite unlink, established item credit is not erased: neither by
+ *    historical reattribution nor by draining a CURRENT per-key repair obligation (R51), where a remap
+ *    still reassigns and a definite unlink still clears.
+ *  * An email-key repair batch counts its whole scanned page, even with no matching candidate (R51 L2).
  *  * A standing legacy owner resolves canonical evidence; a repair obligation nominates equivalent
  *    evidence with whitespace, prefix case and non-ASCII case, even without the optional email.
  *  * Opaque ids, other providers (Slack/Linear lookalikes) and other teams are unaffected.
@@ -232,4 +237,147 @@ describe("PR743 — Google email authority through the real readers", () => {
     await removeMemberIdentity(db(), other.teamId, { provider: "gdrive", externalId: `AUTHOR-EMAIL:${address}` });
     expect(await readers(seed, itemId)).toEqual({ author: eve, projection: [eve] });
   });
+
+  it.each([
+    {
+      name: "linked/linked",
+      // A legacy linked history, then a second equivalent spelling linked through the mapping owner
+      // itself (as a legacy seed did): that revision carries a current per-key obligation.
+      async ambiguate(seed: Seed, memberId: string, address: string) {
+        await rawState(seed, "gdrive", `Author-Email:${address.toUpperCase()}`, "linked", memberId);
+        const key = `author-email: ${address} `;
+        await rawLink(seed, memberId, "gdrive", key);
+        const revision = await withTransaction(() => advanceIdentityMappingState({
+          teamId: seed.teamId, provider: "gdrive", externalId: key, memberId, state: "linked",
+        }));
+        return { key, revision };
+      },
+    },
+    {
+      name: "linked/unlinked",
+      // A legacy linked history, and an explicit exact unlink of a second, live spelling.
+      async ambiguate(seed: Seed, memberId: string, address: string) {
+        await rawState(seed, "gdrive", `Author-Email:${address.toUpperCase()}`, "linked", memberId);
+        const key = `author-email: ${address} `;
+        await rawLink(seed, memberId, "gdrive", key);
+        const removed = await removeMemberIdentity(db(), seed.teamId, { provider: "gdrive", externalId: key });
+        if (removed.mappingRevision === undefined) throw new Error("the unlink recorded no mapping revision");
+        return { key, revision: removed.mappingRevision };
+      },
+    },
+  ])("the per-key repair under an ambiguous history ($name) keeps established credit and grants none", async ({ ambiguate }) => {
+    const seed = await seedTeam();
+    const address = `fay-${randomUUID().slice(0, 6)}@example.com`;
+    const fay = await member(seed, "Fay", address);
+    const canonical = `author-email:${address}`;
+    const established = await emailItem(seed, "established", canonical, address);
+    const uncredited = await emailItem(seed, "uncredited", canonical, address);
+    await establish(established, fay);
+
+    const { key, revision } = await ambiguate(seed, fay, address);
+    expect(providerIdentityState(await identityMap(seed), "gdrive", canonical)).toBe("ambiguous");
+    expect(await obligationStatus(seed, key, revision)).toEqual(["pending"]);
+
+    // The CURRENT obligation drains (it nominates both documents by the equivalence contract).
+    await drainIdentityRepairs(db(), { maxObligations: 10, batchSize: 10 });
+    expect(await obligationStatus(seed, key, revision)).toEqual(["complete"]);
+    const kept = await itemCredit(established);
+    expect(kept.item).toBe(fay);
+    expect(kept.versions.length).toBeGreaterThan(0);
+    expect(kept.versions.every((v) => v === fay)).toBe(true);
+    // No NEW attribution: the uncredited document stays uncredited, and recomputed evidence is unresolved.
+    const none = await itemCredit(uncredited);
+    expect(none.item).toBeNull();
+    expect(none.versions.every((v) => v === null)).toBe(true);
+    for (const credit of [kept, none]) {
+      expect(credit.evidence.length).toBeGreaterThan(0);
+      expect(credit.evidence.every((row) => row.member_id === null)).toBe(true);
+    }
+
+    // Replay: a second drain changes nothing.
+    await drainIdentityRepairs(db(), { maxObligations: 10, batchSize: 10 });
+    expect((await itemCredit(established)).item).toBe(fay);
+    expect((await itemCredit(uncredited)).item).toBeNull();
+  });
+
+  it("controls: through the per-key repair a remap reassigns established credit and a definite unlink clears it", async () => {
+    const seed = await seedTeam();
+    const address = `gus-${randomUUID().slice(0, 6)}@example.com`;
+    const gus = await member(seed, "Gus", address);
+    const hal = await member(seed, "Hal", `hal-${randomUUID().slice(0, 6)}@example.com`);
+    const canonical = `author-email:${address}`;
+    const itemId = await emailItem(seed, "definite", canonical, address);
+    const credited = async () => {
+      const credit = await itemCredit(itemId);
+      expect(credit.versions.length).toBeGreaterThan(0);
+      return { item: credit.item, versions: [...new Set(credit.versions)] };
+    };
+
+    await setMemberIdentity(db(), seed.teamId, gus, { provider: "gdrive", externalId: canonical });
+    await drainIdentityRepairs(db(), { maxObligations: 10, batchSize: 10 });
+    expect(await credited()).toEqual({ item: gus, versions: [gus] });
+
+    await setMemberIdentity(db(), seed.teamId, hal, { provider: "gdrive", externalId: canonical }, { force: true });
+    await drainIdentityRepairs(db(), { maxObligations: 10, batchSize: 10 });
+    expect(await credited()).toEqual({ item: hal, versions: [hal] });
+
+    await removeMemberIdentity(db(), seed.teamId, { provider: "gdrive", externalId: canonical });
+    await drainIdentityRepairs(db(), { maxObligations: 10, batchSize: 10 });
+    expect(await credited()).toEqual({ item: null, versions: [null] });
+  });
+
+  it("an email-key batch with no matching candidate still counts its whole scanned page (Fable R51 L2)", async () => {
+    const seed = await seedTeam();
+    const address = `ivy-${randomUUID().slice(0, 6)}@example.com`;
+    const ivy = await member(seed, "Ivy", address);
+    const others: string[] = [];
+    for (let i = 0; i < 3; i += 1) {
+      others.push(await emailItem(seed, `other-${i}`, `author-email:other-${i}-${randomUUID().slice(0, 6)}@example.com`));
+    }
+    const page = [...others].sort(); // the drain's `order by i.id` (uuid order is lower-case hex order)
+    const canonical = `author-email:${address}`;
+    const linked = await setMemberIdentity(db(), seed.teamId, ivy, { provider: "gdrive", externalId: canonical });
+    const revision = linked.mappingRevision;
+    if (revision === undefined) throw new Error("the Drive link recorded no mapping revision");
+    const { data } = await db().from("identity_repair_obligations")
+      .select("team_id,provider,external_id,mapping_revision,cursor_item_id,items_scanned,items_updated,versions_updated,contributions_updated")
+      .eq("team_id", seed.teamId).eq("provider", "gdrive").eq("external_id", canonical).eq("mapping_revision", revision)
+      .single();
+    const obligation = data as Parameters<typeof runIdentityRepairObligation>[1];
+
+    // A full page of two Drive documents, none naming the address: it advanced, so it counts two.
+    expect(await runIdentityRepairObligation(db(), obligation, { batchSize: 2 }))
+      .toEqual({ status: "partial", scanned: 2 });
+    expect(await progress(seed, canonical, revision))
+      .toEqual({ status: "running", cursor: page[1], scanned: 2, updated: 0 });
+    // The bounded cursor resumes past that page: the last document, a short page, completes.
+    expect(await runIdentityRepairObligation(db(), obligation, { batchSize: 2 }))
+      .toEqual({ status: "complete", scanned: 1 });
+    expect(await progress(seed, canonical, revision))
+      .toEqual({ status: "complete", cursor: page[2], scanned: 3, updated: 0 });
+  });
 });
+
+/** Credit an earlier link established, on the item AND every version. */
+async function establish(itemId: string, memberId: string) {
+  await db().from("items").update({ member_id: memberId }).eq("id", itemId);
+  await db().from("item_versions").update({ member_id: memberId }).eq("item_id", itemId);
+}
+
+async function obligationStatus(seed: Seed, externalId: string, revision: number): Promise<string[]> {
+  const { rows } = await getPool().query<{ status: string }>(
+    `select status from identity_repair_obligations
+      where team_id=$1 and provider='gdrive' and external_id=$2 and mapping_revision=$3`,
+    [seed.teamId, externalId, revision]);
+  return rows.map((row) => row.status);
+}
+
+async function progress(seed: Seed, externalId: string, revision: number) {
+  const { rows } = await getPool().query<{ status: string; cursor: string | null; scanned: number; updated: number }>(
+    `select status, cursor_item_id::text as cursor, items_scanned::int as scanned, items_updated::int as updated
+       from identity_repair_obligations
+      where team_id=$1 and provider='gdrive' and external_id=$2 and mapping_revision=$3`,
+    [seed.teamId, externalId, revision]);
+  if (rows.length !== 1) throw new Error(`expected one obligation, found ${rows.length}`);
+  return rows[0];
+}

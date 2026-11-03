@@ -2030,6 +2030,23 @@ class StateStore:
             (namespace, generation, selected, *excluded),
         ).fetchone()
 
+    def open_traversal_folders(
+        self, namespace: str, generation: int, folders: Collection[str],
+        *, snapshot_id: int | None = None,
+    ) -> set[str]:
+        """Which of ``folders`` still have an unfinished traversal entry in this snapshot (a listing
+        held behind a standing provider minimum, AIO-1167 Fable R51 L4)."""
+        selected = snapshot_id if snapshot_id is not None else self.snapshot_id(namespace)
+        wanted = sorted(set(folders))
+        if selected is None or not wanted:
+            return set()
+        rows = self._db.execute(
+            "SELECT DISTINCT folder_id FROM traversal_queue WHERE namespace=? AND generation=? "
+            f"AND snapshot_id=? AND completed_at IS NULL AND folder_id IN ({','.join('?' for _ in wanted)})",
+            (namespace, generation, selected, *wanted),
+        ).fetchall()
+        return {str(row[0]) for row in rows}
+
     def root_traversal_open(
         self, namespace: str, generation: int, root_id: str, *, snapshot_id: int | None = None,
     ) -> bool:

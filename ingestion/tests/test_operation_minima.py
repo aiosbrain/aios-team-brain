@@ -102,6 +102,41 @@ async def test_a_folder_listing_minimum_survives_a_generation_transition_and_fre
 
 
 @pytest.mark.asyncio
+async def test_a_held_folder_listing_is_named_once_while_its_rows_stay_open(tmp_path, monkeypatch, clock):
+    """Diagnostics (Fable R51 L4): while a standing `list-folder:` minimum leaves that folder's baseline
+    rows open, the run names it — `provider_restricted_resource`, once — and stays incomplete; the
+    independent folder is still listed. Once the minimum passes the folder is listed, the diagnostic is
+    gone and the baseline completes."""
+    world = _world(monkeypatch)
+    world.calls = _FailingCalls({("list", DRIVE, "folder-a"): [real_deferral(503, LONG)]})
+    state = StateStore(str(tmp_path / "held-listing.sqlite"))
+    await run(world, state)
+    assert _restricted(state, world, "list-folder:folder-a") is not None
+    state.close()
+
+    fresh = _transition(world, monkeypatch, tmp_path, "held-listing-transition")
+    world.calls = _FailingCalls({})
+    held = await run(world, fresh)
+    assert ("list", DRIVE, "folder-a") not in world.calls  # never read early
+    assert ("list", DRIVE, "folder-b") in world.calls  # the independent folder went on
+    assert held.authoritative_complete is False
+    assert (held.failure_categories or {}).get("provider_restricted_resource") == 1  # once, not per row
+    # Still open in the building snapshot: the diagnostic completes nothing.
+    assert fresh.open_traversal_folders(world.namespace(DRIVE), world.generation, {"folder-a"}) == {"folder-a"}
+
+    clock.at += timedelta(seconds=int(LONG) + 60)
+    world.calls = _FailingCalls({})
+    for _ in range(3):
+        outcome = await run(world, fresh)
+        if outcome.authoritative_complete:
+            break
+    assert ("list", DRIVE, "folder-a") in world.calls
+    assert outcome.authoritative_complete is True
+    assert "provider_restricted_resource" not in (outcome.failure_categories or {})
+    fresh.close()
+
+
+@pytest.mark.asyncio
 async def test_a_change_page_minimum_survives_a_generation_transition_and_fresh_store(
     tmp_path, monkeypatch, clock,
 ):
