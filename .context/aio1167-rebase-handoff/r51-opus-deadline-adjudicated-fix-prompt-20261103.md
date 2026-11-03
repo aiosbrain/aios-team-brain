@@ -15,3 +15,9 @@ Make only these two accepted corrections:
 Add the adjudicated production-manager regression: parameterize `MissingExtraError` and credential `ValueError` for old0, with three cleanup channels and two slots. Assert no old0 request execute; old0 state/resource/attempts unchanged in brain, every payload and local projection; old1 is successfully stopped; old2 is untouched. Keep existing deadline, authority-precedence, timely success/404, and provider-failure regressions intact.
 
 Do not run tests, lint, typecheck, git commands, commit, push, or start a review; the coordinator owns these. Make no unrelated changes. When complete, return `end_turn` with a concise file-by-file report, exact accepted behaviors, and any limitation. Continue this exact writer session only after the coordinator confirms fresh Claude.ai subscription `/usage` below 90% and API-key/token overrides unset. The source snapshot is being handled by one coordinator; no other writer is authorized.
+
+## Coordinator admission evidence — 2026-11-03
+
+The user-provided Claude `/usage` screenshot captured at 4:01:22 p.m. Asia/Kolkata shows current-week all-model usage **60%** and Fable usage **73%**, both resetting Nov 3 at 5:30 p.m. Asia/Kolkata. No session utilization percentage appears in the screenshot. Full-user `claude auth status` in this continuation confirms `loggedIn:true`, `authMethod=claude.ai`, `apiProvider=firstParty`, subscription Max; the command explicitly unset `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN`. The latest explicit usage display said credits are off, and no action has enabled them. The displayed applicable windows are below 90%; coordinator admits this existing Opus session for the bounded correction.
+
+Durable screenshot: `.context/aio1167-rebase-handoff/quota-evidence/claude-usage-20261103-160122.png`; SHA-256 `906eec88d75815cc9be6f8be8205f3258c7be88a99f97fd2ca157ad9864e2280`.
