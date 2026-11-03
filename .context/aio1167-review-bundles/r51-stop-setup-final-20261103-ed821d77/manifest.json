@@ -20,7 +20,8 @@
       "review.meta.json": "a402eb14b00a6e0663f5d98235e683e5eaf9ab9308b9f4611096fbb3b7e8073e",
       "review.activity.log": "888372d82941ba1cb845e52c5810048169d539ad1fdfa2addfdcdc709f19c90f",
       "review.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-      "review.exit": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+      "review.exit": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+      "astra-adjudication.md": "17bef0431ea88e0fecbc10121f7c40a24b4307a5502ddd10b7d8c34b773843fd"
     },
     "blind-final": {
       "AGENTS.md": "e4117721d454be48f881a878037a07353ea7b355741e366169746276466bdb72",
@@ -47,7 +48,22 @@
         "Glob",
         "Grep",
         "Read"
-      ]
+      ],
+      "usage": {
+        "uncached_input_tokens": 258,
+        "cache_read_input_tokens": 2543863,
+        "cache_creation_input_tokens": 250245,
+        "output_tokens": 23385,
+        "thinking_tokens": 15204
+      },
+      "repeated_hook_summaries_observed": true
+    },
+    "astra-adjudication": {
+      "model": "gpt-6-astra",
+      "reasoning_effort": "medium",
+      "verdict": "DEFER both LOW observations; no source change required before blind final review",
+      "scope": "only Fable correction-delta Lows; not a fresh overall review",
+      "report_sha256": "17bef0431ea88e0fecbc10121f7c40a24b4307a5502ddd10b7d8c34b773843fd"
     }
   }
 }
