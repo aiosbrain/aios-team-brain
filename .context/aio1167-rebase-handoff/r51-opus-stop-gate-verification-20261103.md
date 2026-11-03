@@ -21,5 +21,6 @@ Three production-manager interleaving regressions cover a late account quota hol
 - `git diff --check`: passed.
 - From `ingestion/`, using the repository environment `./.venv/bin/pytest -q tests/test_watch_late_quota.py tests/test_watch_operation_minima.py tests/test_watch_quota_hold.py tests/test_watch_lifecycle.py`: **77 passed in 2.15s**.
 - Two earlier collection attempts used the default Anaconda pytest and failed to import `aios_ingest`; these were environment/invocation errors, not test failures. The repository venv run above is the valid result.
-- The full ingestion suite and fresh blind final reviews of the combined source delta from `29676566a08280e12619b565711f9b0ff65271e0` remain pending.
+- First full-suite run under the restricted sandbox: **1,093 passed, 28 skipped**, but two existing `test_two_process_sidecars.py` cases could not bind their loopback fixture (`PermissionError`). Repeated the identical suite through the approved local test path with loopback access: **1,095 passed, 28 skipped, one existing Starlette/httpx deprecation warning, 33.57s**.
+- Fresh blind final reviews of the combined source delta from `29676566a08280e12619b565711f9b0ff65271e0` remain pending.
 
