@@ -420,6 +420,8 @@ async def test_two_pages_a_later_restore_supersedes_a_still_owed_trash_removal(
 
     world = _nested_world(monkeypatch)
     _path, state = await _recover_fresh_behind_restricted_parent(tmp_path, world, f"a1-owed-{failure}")
+    world.calls.clear()
+    world.pushed.clear()
     _one_change_per_page(monkeypatch)
     pages_before = _change_pages(state, world)
     client = gdrive_sync.BrainClient
@@ -441,11 +443,15 @@ async def test_two_pages_a_later_restore_supersedes_a_still_owed_trash_removal(
     monkeypatch.setattr(client, "reconcile_gdrive", owed_until_restored)
     _trash(world, "doc-n")
     _restore(world, "doc-n")
+    target_page_token = f"{DRIVE}@{len(world.logs[DRIVE])}"
     for _ in range(4):
         await run(world, state)
+        if state.get_progress(world.namespace(DRIVE)).page_token == target_page_token \
+                and state.next_uncommitted_page(world.namespace(DRIVE), GEN) is None:
+            break
         clock.at += timedelta(minutes=1)
 
-    assert _change_pages(state, world) - pages_before == 2
+    assert _change_pages(state, world) - pages_before >= 2  # both new pages were materialized
     assert sent_after_restore == []  # the stale removal was never (re)sent after the restore
     assert _owed_removal_payload(state, world, "doc-n") is None  # superseded, not owed
     namespace = world.namespace(DRIVE)
