@@ -50,7 +50,7 @@ import copy
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-from .state import ROOT_STATES, RootBinding
+from .state import ROOT_STATES, RootBinding, handoff_source_set
 
 ROOTS_KEY = "roots"
 # The coordinator's account-level provider hold (AIO-1167 R47 F5): ``{generation, credential,
@@ -134,6 +134,7 @@ def roots_section(
                 "drive_id": binding.drive_id or None,
                 "pending_drive_id": binding.pending_drive_id,
                 "detail": (binding.detail or "")[:_DETAIL_LIMIT] or None,
+                "handoff_sources": list(binding.handoff_sources),
             }
             for (kind, root_id), binding in sorted(obligations.items())
         ],
@@ -174,6 +175,8 @@ def parse_roots_section(document: dict[str, Any], generation: int) -> dict[tuple
             str(status),
             str(pending) if isinstance(pending, str) and pending else None,
             str(detail)[:_DETAIL_LIMIT] if isinstance(detail, str) else None,
+            # The predecessor streams; an older checkpoint's scalar ``handoff_from`` is a one-drive set.
+            handoff_source_set(item.get("handoff_sources"), item.get("handoff_from")),
         )
     return parsed
 

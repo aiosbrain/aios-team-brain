@@ -511,7 +511,8 @@ describe("OAuth publication: one transaction, canonical order", () => {
     ["a connection this publication creates starts enabled", { named: [null] as (string | null)[], secret: null }, "enabled"],
   ] as const)("RUN STATE: %s", async (_case, opts, expected) => {
     const c = use(new ScriptedConnection(database(opts)));
-    await expect(publish()).resolves.toEqual({ status: expected });
+    // PR743 returns `{ status, identity }`: the run state is the status; the identity is not under test here.
+    await expect(publish()).resolves.toMatchObject({ status: expected });
     const published = which(c.work, isPublication)[0];
     expect(published.params).toContain(expected);
     expect(published.params).not.toContain(expected === "enabled" ? "disabled" : "enabled");

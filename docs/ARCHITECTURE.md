@@ -1060,10 +1060,34 @@ The direct Drive/Docs adapter requests `includeTabsContent`, preserves ordered r
 headings, lists, tables, links, footnotes and Unicode, and refuses to overwrite a prior complete item
 when required extraction is incomplete. SQLite retains one namespaced opaque stream per selected
 Shared Drive and (when selected) My Drive. A selected file or folder that lives inside a Shared Drive is
-reported only by that drive's change log, so every selected root is first bound — durably, once per
-generation, by one provider read — to the drive that contains it, and is enumerated and drained through
-that drive's stream and cursor. A binding adds no drive root: the drive's other content stays
-unselected. Every selected file/folder root is a durable OBLIGATION (`selection_root_bindings`, one
+reported by that drive's change log to its members, so every selected root is first bound — durably, once
+per generation, by one provider read — to the change log that observes it, and is enumerated and drained
+through that stream and cursor. That is the containing drive, except (AIO-1167 R56) for an explicitly
+selected FILE individually shared with a provable NON-member of its Shared Drive (the drive's own
+`drives.get` answers 404): Google reports it in the user's change log, so it is bound to the `my-drive`
+stream, whose start token is captured before enumeration, and the drive it cannot open is never asked
+for one. The binding is the consumed log; the physical drive is re-read from metadata wherever a root
+is observed (`_consumed_drive`), so gaining or losing membership, or a move, is a relocation between
+streams. A 403 or any other inconclusive answer is never non-membership: a first binding keeps the
+containing drive (and its unavailable-stream handling), and a root the user log already consumes stays
+there until provider evidence moves it. A file root already bound to a Shared Drive whose stream is
+unstarted or waiting on a start token it cannot get (bound before routing, or by a member who lost
+membership) is reclassified each run on the same evidence (`_reclassify_nonmember_file_roots`): it is
+recorded relocating toward the user log and keeps its claims through the ordinary hand-over. Every
+hand-over UNIONS the drive it left into the root's generation-scoped predecessor set
+(`selection_root_bindings.handoff_sources`, a legacy scalar `handoff_from` read as a one-drive set;
+carried in the checkpoint's roots evidence and unioned back on restore without overwriting a newer local
+binding), so A→B→C keeps {A, B}. Each STARTED predecessor stream is retired (`_retire_handed_over_streams`,
+before the roster is read, locally and from the outgoing checkpoint) only once every root it ever handed
+over is held by that root's CURRENT destination's complete verified snapshot (a current owner — A→B→A —
+is never retired) — which the ACQUIRED remote record must name exactly (same
+snapshot, committed checkpoint page and drain observation, no build or recovery outstanding) — no
+configured Shared Drive, root obligation or unresolved root still needs it, and it owes no work. The
+source-removed stream map must be acknowledged by a fenced checkpoint before that run reconciles
+anything connection-wide; refused, or its acknowledgment lost, nothing reconciles and the next run
+retries from `handoff_from`. Its documents' absence is decided only by the ordinary complete-snapshot
+reconciliation. Folder roots are not routed this way. A binding adds no drive
+root: the drive's other content stays unselected. Every selected file/folder root is a durable OBLIGATION (`selection_root_bindings`, one
 row per connection/generation/kind/provider id): a root whose metadata cannot be read is `unresolved`
 with NO drive (never a guessed My Drive), opens no stream and is retried every run, while the roots and
 explicitly selected Shared Drives that are known still bind and run (AC-04; R41). Connection-wide

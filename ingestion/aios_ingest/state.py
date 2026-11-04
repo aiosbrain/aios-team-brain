@@ -212,6 +212,8 @@ CREATE TABLE IF NOT EXISTS selection_root_bindings (
   status TEXT NOT NULL DEFAULT 'bound',
   pending_drive_id TEXT,
   detail TEXT,
+  handoff_from TEXT,
+  handoff_sources TEXT,
   PRIMARY KEY (connection_id, generation, root_kind, root_id)
 );
 CREATE TABLE IF NOT EXISTS stream_hints (
@@ -288,6 +290,26 @@ class RootBinding:
     status: str = "bound"
     pending_drive_id: str | None = None
     detail: str | None = None
+    # Every drive whose stream handed this root over during the generation (AIO-1167 R56): kept after
+    # each hand-over — A→B→C keeps {A, B} — so each old stream is retired only once the root's CURRENT
+    # destination's verified snapshot holds it. Monotonic for the generation.
+    handoff_sources: tuple[str, ...] = ()
+
+
+def handoff_source_set(sources: Any = None, legacy: Any = None) -> tuple[str, ...]:
+    """The predecessor streams a binding records: its JSON list, plus a legacy scalar ``handoff_from``
+    read as a one-drive set. Sorted, deduplicated; anything malformed is ignored, never guessed."""
+    found: set[str] = set()
+    if isinstance(sources, str) and sources:
+        try:
+            sources = json.loads(sources)
+        except ValueError:
+            sources = None
+    if isinstance(sources, (list, tuple)):
+        found.update(str(value) for value in sources if isinstance(value, str) and value)
+    if isinstance(legacy, str) and legacy:
+        found.add(legacy)
+    return tuple(sorted(found))
 
 
 # The states a selected-root obligation can be in (see ``StateStore.bind_root``).
@@ -440,6 +462,10 @@ class StateStore:
             self._db.execute("ALTER TABLE selection_root_bindings ADD COLUMN pending_drive_id TEXT")
         if "detail" not in binding_columns:
             self._db.execute("ALTER TABLE selection_root_bindings ADD COLUMN detail TEXT")
+        if "handoff_from" not in binding_columns:
+            self._db.execute("ALTER TABLE selection_root_bindings ADD COLUMN handoff_from TEXT")
+        if "handoff_sources" not in binding_columns:
+            self._db.execute("ALTER TABLE selection_root_bindings ADD COLUMN handoff_sources TEXT")
         self._upgrade_observation_revisions()
         self._upgrade_legacy_channels()
         self._upgrade_watch_columns()
@@ -1000,13 +1026,14 @@ class StateStore:
     ) -> dict[tuple[str, str], RootBinding]:
         """Every selected-root obligation of a generation, in every state."""
         rows = self._db.execute(
-            "SELECT root_kind,root_id,drive_id,status,pending_drive_id,detail FROM selection_root_bindings "
-            "WHERE connection_id=? AND generation=? ORDER BY root_kind,root_id",
+            "SELECT root_kind,root_id,drive_id,status,pending_drive_id,detail,handoff_from,handoff_sources "
+            "FROM selection_root_bindings WHERE connection_id=? AND generation=? ORDER BY root_kind,root_id",
             (connection_id, generation),
         ).fetchall()
         return {
             (str(r["root_kind"]), str(r["root_id"])): RootBinding(
                 str(r["drive_id"]), str(r["status"]), r["pending_drive_id"], r["detail"],
+                handoff_source_set(r["handoff_sources"], r["handoff_from"]),
             )
             for r in rows
         }
@@ -1019,6 +1046,9 @@ class StateStore:
 
         Local evidence, where present, stands: this only fills in what a lost or older local state
         lacks. An obligation whose state is unknown, or a bound one with no drive, is not adopted.
+        The acknowledged predecessor streams (``handoff_sources``) are UNIONED into a local row that
+        exists, never replacing its binding: a newer local hand-over keeps its drive and state, and an
+        older local history gains every source the brain acknowledged (AIO-1167 R56).
         """
         if binding.status not in ROOT_STATES:
             return False
@@ -1026,16 +1056,38 @@ class StateStore:
             return False
         if binding.status == "relocating" and not binding.pending_drive_id:
             return False
-        cur = self._db.execute(
-            "INSERT OR IGNORE INTO selection_root_bindings"
-            "(connection_id,generation,root_kind,root_id,drive_id,status,pending_drive_id,detail) "
-            "VALUES(?,?,?,?,?,?,?,?)",
-            (connection_id, generation, root_kind, root_id,
-             "" if binding.status == "unresolved" else binding.drive_id, binding.status,
-             binding.pending_drive_id if binding.status == "relocating" else None, binding.detail),
-        )
-        self._db.commit()
-        return cur.rowcount == 1
+        sources = handoff_source_set(binding.handoff_sources) if binding.status != "unresolved" else ()
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            cur = self._db.execute(
+                "INSERT OR IGNORE INTO selection_root_bindings"
+                "(connection_id,generation,root_kind,root_id,drive_id,status,pending_drive_id,detail,handoff_sources) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (connection_id, generation, root_kind, root_id,
+                 "" if binding.status == "unresolved" else binding.drive_id, binding.status,
+                 binding.pending_drive_id if binding.status == "relocating" else None, binding.detail,
+                 json.dumps(list(sources)) if sources else None),
+            )
+            inserted = cur.rowcount == 1
+            if not inserted and sources:
+                row = self._db.execute(
+                    "SELECT handoff_sources,handoff_from FROM selection_root_bindings "
+                    "WHERE connection_id=? AND generation=? AND root_kind=? AND root_id=?",
+                    (connection_id, generation, root_kind, root_id),
+                ).fetchone()
+                local = handoff_source_set(row["handoff_sources"], row["handoff_from"])
+                merged = handoff_source_set(list(local) + list(sources))
+                if merged != local:
+                    self._db.execute(
+                        "UPDATE selection_root_bindings SET handoff_sources=?,handoff_from=NULL "
+                        "WHERE connection_id=? AND generation=? AND root_kind=? AND root_id=?",
+                        (json.dumps(list(merged)), connection_id, generation, root_kind, root_id),
+                    )
+            self._db.commit()
+        except BaseException:
+            self._db.rollback()
+            raise
+        return inserted
 
     def unknown_root_count(self, connection_id: str, generation: int) -> int:
         """Selected roots whose drive is unknown or unreadable now: either may hide a stream."""
@@ -1056,13 +1108,14 @@ class StateStore:
     ) -> dict[tuple[str, str], RootBinding]:
         """Every selected root that is unresolved, uncertain or on its way to another drive."""
         rows = self._db.execute(
-            "SELECT root_kind,root_id,drive_id,status,pending_drive_id,detail FROM selection_root_bindings "
-            "WHERE connection_id=? AND generation=? AND status<>'bound' ORDER BY root_kind,root_id",
+            "SELECT root_kind,root_id,drive_id,status,pending_drive_id,detail,handoff_from,handoff_sources "
+            "FROM selection_root_bindings WHERE connection_id=? AND generation=? AND status<>'bound' ORDER BY root_kind,root_id",
             (connection_id, generation),
         ).fetchall()
         return {
             (str(r["root_kind"]), str(r["root_id"])): RootBinding(
                 str(r["drive_id"]), str(r["status"]), r["pending_drive_id"], r["detail"],
+                handoff_source_set(r["handoff_sources"], r["handoff_from"]),
             )
             for r in rows
         }
@@ -1255,15 +1308,38 @@ class StateStore:
     def rebind_root(
         self, connection_id: str, generation: int, root_kind: str, root_id: str, destination: str,
     ) -> bool:
-        """Hand a relocating root to the stream of the drive it was read in, atomically."""
-        cur = self._db.execute(
-            "UPDATE selection_root_bindings SET drive_id=pending_drive_id,status='bound',"
-            "pending_drive_id=NULL,detail=NULL,bound_at=? WHERE connection_id=? AND generation=? "
-            "AND root_kind=? AND root_id=? AND status='relocating' AND pending_drive_id=?",
-            (_now_iso(), connection_id, generation, root_kind, root_id, destination),
-        )
-        self._db.commit()
-        return cur.rowcount == 1
+        """Hand a relocating root to the stream of the drive it was read in, atomically.
+
+        The drive it leaves is UNIONED into ``handoff_sources`` in the same transaction (AIO-1167 R56):
+        every old stream still holds claims for it until the root's current destination's verified
+        snapshot does, and only then may each retire. A→B→C keeps {A, B}; a repeated call changes
+        nothing (the root is no longer relocating to that destination)."""
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._db.execute(
+                "SELECT drive_id,handoff_sources,handoff_from FROM selection_root_bindings "
+                "WHERE connection_id=? AND generation=? AND root_kind=? AND root_id=? "
+                "AND status='relocating' AND pending_drive_id=?",
+                (connection_id, generation, root_kind, root_id, destination),
+            ).fetchone()
+            if row is None:
+                self._db.rollback()
+                return False
+            departing = [str(row["drive_id"])] if row["drive_id"] else []
+            sources = handoff_source_set(
+                list(handoff_source_set(row["handoff_sources"], row["handoff_from"])) + departing,
+            )
+            self._db.execute(
+                "UPDATE selection_root_bindings SET handoff_sources=?,handoff_from=NULL,drive_id=pending_drive_id,"
+                "status='bound',pending_drive_id=NULL,detail=NULL,bound_at=? WHERE connection_id=? AND generation=? "
+                "AND root_kind=? AND root_id=? AND status='relocating' AND pending_drive_id=?",
+                (json.dumps(list(sources)), _now_iso(), connection_id, generation, root_kind, root_id, destination),
+            )
+            self._db.commit()
+        except BaseException:
+            self._db.rollback()
+            raise
+        return True
 
     def cancel_relocation(
         self, connection_id: str, generation: int, root_kind: str, root_id: str,
@@ -1335,6 +1411,37 @@ class StateStore:
             "AND active_snapshot IS NULL AND building_snapshot IS NULL",
             (namespace,),
         )
+        self._db.commit()
+        return cur.rowcount == 1
+
+    def retire_handoff_source_stream(self, namespace: str, generation: int) -> bool:
+        """Retire ONE started stream whose roots were all handed to verified destinations (AIO-1167 R56).
+
+        Not a general deletion: the caller (``_retire_handed_over_streams``) has proven that no
+        configured Shared Drive, root obligation or incomplete hand-over still needs this drive, and
+        that every root it handed over is held by its destination's complete verified snapshot.
+        Refused — nothing removed — while the stream still owes work, holds an uncommitted page or a
+        removal barrier. Its claims stand on the brain until the ordinary complete-snapshot
+        reconciliation, which this stream no longer joins.
+        """
+        owed = self._db.execute(
+            "SELECT (SELECT count(*) FROM pending_work WHERE namespace=? AND generation=? "
+            "AND acknowledged_at IS NULL AND superseded_at IS NULL) "
+            "+ (SELECT count(*) FROM materialized_pages WHERE namespace=? AND generation=? AND committed_at IS NULL) "
+            "+ (SELECT count(*) FROM removal_barriers WHERE namespace=? AND generation=?) AS n",
+            (namespace, generation, namespace, generation, namespace, generation),
+        ).fetchone()
+        if int(owed["n"]):
+            return False
+        for table in (
+            "selection_snapshots", "selection_roots", "traversal_queue", "selected_membership",
+            "traversal_ancestry", "membership_ancestry", "materialized_pages", "pending_work",
+            "stream_observation_revisions", "item_observations", "page_obligation_outcomes",
+            "removal_barriers",
+        ):
+            self._db.execute(f"DELETE FROM {table} WHERE namespace=? AND generation=?", (namespace, generation))
+        self._db.execute("DELETE FROM stream_leases WHERE namespace=?", (namespace,))
+        cur = self._db.execute("DELETE FROM stream_progress WHERE namespace=?", (namespace,))
         self._db.commit()
         return cur.rowcount == 1
 

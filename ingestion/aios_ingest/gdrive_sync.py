@@ -702,6 +702,66 @@ def _capture_start_token(source: GoogleDriveSource, drive: Any, drive_id: str) -
         raise StreamStartUnavailable(drive_id, status) from exc
 
 
+_DRIVE_MEMBERSHIP_CACHE = "_aios_shared_drive_membership"
+
+
+def _shared_drive_membership(source: GoogleDriveSource, drive_id: str) -> str:
+    """Whether this credential is a MEMBER of one Shared Drive: ``member``, ``nonmember`` or ``unknown``.
+
+    Provider evidence only (AIO-1167 R56): the drive's own ``drives.get`` answering is membership,
+    and a definitive 404 for it is non-membership. Nothing else is: a 403, a 5xx, a source without a
+    drives API, or any other failure is ``unknown`` — never read as non-membership, so a drive stream
+    the account cannot open keeps its existing unavailable-stream handling. A quota or authority
+    answer is raised as is. One answer per drive per source (one run, one credential).
+    """
+    cache = getattr(source, _DRIVE_MEMBERSHIP_CACHE, None)
+    if not isinstance(cache, dict):
+        cache = {}
+        try:
+            setattr(source, _DRIVE_MEMBERSHIP_CACHE, cache)
+        except Exception:  # pragma: no cover - a provider-shaped object that refuses attributes
+            pass
+    if drive_id in cache:
+        return cache[drive_id]
+    verdict = "unknown"
+    try:
+        drive, _docs = source._services()
+        drives = getattr(drive, "drives", None)
+        if callable(drives):
+            source._execute(drives().get(driveId=drive_id, fields="id"))
+            verdict = "member"
+    except (BrainError, ProviderDeferred):
+        raise
+    except Exception as exc:
+        verdict = "nonmember" if _provider_status(exc) == 404 and not is_drive_rate_limit(exc) else "unknown"
+    cache[drive_id] = verdict
+    return verdict
+
+
+def _consumed_drive(
+    source: GoogleDriveSource, root_kind: str, meta: dict[str, Any], current: str | None = None,
+) -> str:
+    """The change log that observes a selected root — its STREAM identity, not where it physically is.
+
+    Google reports a file individually shared with a NON-member of its Shared Drive in the user's
+    change log, not that drive's (AIO-1167 R56). So an explicitly selected FILE root whose readable
+    metadata names a Shared Drive this credential is provably not a member of is consumed through
+    the user log (``my-drive``). A member's file, a folder root, a My Drive root and every root
+    whose membership is not proven keep the drive they are in, exactly as before. The physical drive
+    is always read fresh from the metadata, so a membership change or a move is a route transition
+    (a relocation between streams), never a guess: with ``current`` (the stream that consumes the
+    root now), an UNPROVEN membership keeps a root the user log already consumes there — only
+    provider evidence (membership) moves it to the drive's own stream.
+    """
+    physical = str(meta.get("driveId") or "my-drive")
+    if physical == "my-drive" or root_kind != "file":
+        return physical
+    membership = _shared_drive_membership(source, physical)
+    if membership == "nonmember" or (membership == "unknown" and current == "my-drive"):
+        return "my-drive"
+    return physical
+
+
 def _start_token_restricted(
     state: StateStore, execution: GdriveExecution, options: dict[str, Any], drive_id: str,
 ) -> bool:
@@ -756,7 +816,7 @@ def _deferred_root_admissible(
             continue
         probed.add((kind, root_id))
         try:
-            observed = _observe_root(source, root_id, drive_id, {})
+            observed = _observe_root(source, root_id, drive_id, {}, kind)
         except ProviderDeferred as exc:
             if exc.category == "rate_limited":
                 raise _account_hold(exc) from exc
@@ -817,7 +877,7 @@ _ROOT_UNAVAILABLE_DETAIL = "selected root unavailable: the provider reports it n
 
 def _restorable_file_root(
     state: StateStore, execution: GdriveExecution, namespace: str, generation: int,
-    work: PendingWork, meta: dict[str, Any],
+    work: PendingWork, meta: dict[str, Any], source: GoogleDriveSource | None = None,
 ) -> str | None:
     """The selected file root this document's ingestion would prove restored (R49 F3), or ``None``.
 
@@ -831,7 +891,10 @@ def _restorable_file_root(
     ):
         return None
     stream = state.get_progress(namespace)
-    actual_drive = str(meta.get("driveId") or "my-drive")
+    actual_drive = (
+        _consumed_drive(source, "file", meta, binding.drive_id)
+        if source is not None else str(meta.get("driveId") or "my-drive")
+    )
     if stream is None or actual_drive != binding.drive_id or actual_drive != stream.key.drive_id:
         return None
     if meta.get("trashed") or meta.get("mimeType") != GOOGLE_DOC_MIME or str(meta.get("id")) != work.item_key:
@@ -841,6 +904,7 @@ def _restorable_file_root(
 
 def _observe_root(
     source: GoogleDriveSource, root_id: str, drive_id: str, seen: dict[str, RootObservation],
+    root_kind: str = "folder",
 ) -> RootObservation:
     """Read a selected root's current metadata, under the run's own fence, once per ``seen``.
 
@@ -861,7 +925,8 @@ def _observe_root(
             "unverified", detail=f"root metadata unreadable ({status or type(exc).__name__})",
         )
     else:
-        actual = str(meta.get("driveId") or "my-drive")
+        # Compared by consumed change log (R56), so a non-member's file in the user log is "here".
+        actual = _consumed_drive(source, root_kind, meta, drive_id)
         observed = RootObservation("here" if actual == drive_id else "elsewhere", actual)
     seen[root_id] = observed
     return observed
@@ -909,7 +974,7 @@ def _reobserve_stalled_relocations(
                 deferred.append((root_id, None))
             continue
         try:
-            observed = _observe_root(source, root_id, binding.drive_id, seen)
+            observed = _observe_root(source, root_id, binding.drive_id, seen, root_kind)
         except ProviderDeferred as exc:
             if exc.category == "rate_limited" or exc.category in _LOCAL_DEADLINE_CATEGORIES:
                 raise
@@ -925,6 +990,153 @@ def _reobserve_stalled_relocations(
                 integration_id, generation, root_kind, root_id, binding.drive_id,
                 destination=str(observed.drive_id),
             )
+
+
+def _reclassify_nonmember_file_roots(
+    source: GoogleDriveSource, state: StateStore, integration_id: str, generation: int,
+    drive_blocked: Any,
+    *,
+    restricted: set[str] | frozenset[str] = frozenset(),
+    deferred: list[tuple[str, ProviderDeferred | None]] | None = None,
+    observe: Callable[[str, ProviderDeferred], None] | None = None,
+) -> None:
+    """Route an already-bound explicit FILE root to the user log once non-membership is proven (R56).
+
+    Binding reads a root once per generation, so a root bound to its Shared Drive before routing
+    existed — or by a member who has since lost membership — would keep asking that drive for a
+    start token it can never open. Each run, a ``bound`` FILE root whose Shared Drive stream is
+    unstarted or waiting on a start token it cannot get (``drive_blocked``) is reclassified, and only
+    on provider evidence: the drive's own ``drives.get`` answering 404 (``_shared_drive_membership``)
+    and the root's own readable metadata (``_observe_root``). It is then recorded as RELOCATING
+    toward the user log, the ordinary hand-over: it stays bound — its claims and the drive stream's
+    published snapshot standing — until the user log holds a start token captured before anything is
+    enumerated there, and the old claims stand until the replacement snapshot is verified and every
+    stream reconciles. A member, an unknown membership (a 403, a 5xx), an unreadable or absent root,
+    a folder and a root not blocked are left exactly as they are. Admission and deferral follow
+    ``_reobserve_stalled_relocations``.
+    """
+    seen: dict[str, RootObservation] = {}
+    for (root_kind, root_id), binding in state.root_obligations(integration_id, generation).items():
+        if root_kind != "file" or binding.status != "bound":
+            continue
+        bound_drive = str(binding.drive_id or "")
+        if not bound_drive or bound_drive == "my-drive" or not drive_blocked(bound_drive):
+            continue
+        if root_id in restricted:
+            if deferred is not None:
+                deferred.append((root_id, None))
+            continue
+        try:
+            if _shared_drive_membership(source, bound_drive) != "nonmember":
+                continue
+            observed = _observe_root(source, root_id, bound_drive, seen, root_kind)
+        except ProviderDeferred as exc:
+            if exc.category == "rate_limited" or exc.category in _LOCAL_DEADLINE_CATEGORIES:
+                raise
+            if observe is not None:
+                observe(root_id, exc)
+            if deferred is not None:
+                deferred.append((root_id, exc))
+            continue
+        if observed.state == "elsewhere" and observed.drive_id:
+            state.mark_root_relocating(
+                integration_id, generation, root_kind, root_id, bound_drive,
+                destination=str(observed.drive_id),
+            )
+
+
+def _handoff_verified(
+    state: StateStore, execution: GdriveExecution, team: str, integration_id: str, credential: str,
+    generation: int, root: tuple[str, str], destination: str,
+) -> bool:
+    """Whether ``destination``'s stream holds a COMPLETE verified snapshot that contains ``root`` — and
+    the brain's ACQUIRED record of that stream names exactly that snapshot (R56 checkpoint order).
+
+    Local state alone is not evidence here: retirement runs before any stream recovers, so an older
+    complete local snapshot could stand in for a newer acquired one that lacks the root or is still
+    being rebuilt. The acquired record must name the same published snapshot, under the same
+    committed checkpoint page and drain observation, with its listing complete and no build or
+    recovery outstanding. A missing or different acquired record certifies nothing.
+    """
+    progress = state.get_progress(StreamKey(team, integration_id, credential, destination).namespace(generation))
+    if progress is None or _unstarted(progress) or progress.active_snapshot is None:
+        return False
+    if (not progress.listing_complete or progress.recovery_required or progress.building_snapshot is not None
+            or not state.snapshot_complete(progress.namespace, generation, progress.active_snapshot)):
+        return False
+    remote = _remote_stream(execution.progress, destination)
+    try:
+        remote_active = int(remote.get("active_snapshot")) if remote.get("active_snapshot") is not None else None
+        remote_observation = int(remote.get("drain_observation") or 0)
+    except (TypeError, ValueError):
+        return False
+    remote_checkpoint = str(remote.get("checkpoint_id") or "")
+    if (not remote or remote.get("recovery_required") or remote.get("building_snapshot") is not None
+            or not remote.get("listing_complete") or remote_active != progress.active_snapshot
+            or not remote_checkpoint or remote_checkpoint != str(progress.checkpoint_id or "")
+            or remote_observation != progress.drain_observation
+            or not state.page_committed(progress.namespace, generation, remote_checkpoint)):
+        return False
+    return root in {
+        (str(row["root_kind"]), str(row["root_id"]))
+        for row in state.list_roots(progress.namespace, generation, snapshot_id=progress.active_snapshot)
+    }
+
+
+def _retire_handed_over_streams(
+    state: StateStore, execution: GdriveExecution, team: str, integration_id: str, generation: int,
+    options: dict[str, Any], required: set[str],
+) -> set[str]:
+    """Retire a STARTED stream every root of which was handed over and verified (AIO-1167 R56).
+
+    A root reclassified away from a drive (a member who lost membership, a move) is rebound once its
+    destination holds a token; the old stream keeps its cursor, published snapshot and claims. Left
+    in place it would block authoritative completion forever. It is retired — from local state and
+    from the outgoing remote checkpoint, before the roster is read — only when ALL of these hold:
+      · some root records it among its ``handoff_sources`` (durable, so this survives restarts);
+      · no configured Shared Drive selection names it, and no bound, uncertain or relocating root is
+        on it or on its way to it (``required`` and the obligations), and no root is unresolved —
+        an unread root could live there;
+      · every root it handed over is ``bound`` to a destination whose COMPLETE verified snapshot
+        contains it (``_handoff_verified``);
+      · the stream owes no work, page or removal barrier (``StateStore.retire_handoff_source_stream``).
+    Nothing is concluded about its documents here: absence is only the ordinary complete-snapshot
+    reconciliation, which the remaining streams submit, and its claims stand until that succeeds.
+    Returns the drives retired.
+    """
+    obligations = state.root_obligations(integration_id, generation)
+    sources = sorted({source for b in obligations.values() for source in b.handoff_sources})
+    if not sources or any(b.status == "unresolved" for b in obligations.values()):
+        return set()
+    configured = {str(value) for value in options.get("shared_drive_ids") or [] if value}
+    credential = credential_identity(options)
+    remote = execution.progress.get("streams")
+    retired: set[str] = set()
+    for source_drive in sources:
+        if source_drive in configured or source_drive in required:
+            continue
+        if any(b.drive_id == source_drive or b.pending_drive_id == source_drive for b in obligations.values()):
+            continue
+        # Every root this drive EVER handed over this generation (A→B→C: A and B), judged by where
+        # each root is now — its current destination must hold it verified.
+        handed = [(root, b) for root, b in obligations.items() if source_drive in b.handoff_sources]
+        if not all(
+            b.status == "bound" and b.drive_id != source_drive
+            and _handoff_verified(state, execution, team, integration_id, credential, generation, root, b.drive_id)
+            for root, b in handed
+        ):
+            continue
+        namespace = StreamKey(team, integration_id, credential, source_drive).namespace(generation)
+        local = state.get_progress(namespace) is not None
+        if local and not state.retire_handoff_source_stream(namespace, generation):
+            continue
+        # Removed from the outgoing map; the caller publishes it (acknowledged) before any
+        # connection-wide reconciliation. Until then the brain still holds the old stream, and this
+        # retirement is repeated by the next run from the durable ``handoff_sources``.
+        on_remote = isinstance(remote, dict) and remote.pop(source_drive, None) is not None
+        if local or on_remote:
+            retired.add(source_drive)
+    return retired
 
 
 def _retire_orphan_start_diagnostics(
@@ -1104,7 +1316,21 @@ def _bind_selected_roots(
                 ),
             )
             continue
-        drive_id = str(meta.get("driveId") or "my-drive")
+        # The stream that observes it (R56): a non-member's individually shared file is the user log's.
+        try:
+            drive_id = _consumed_drive(source, kind, meta)
+        except ProviderDeferred as exc:
+            if exc.category == "rate_limited" or exc.category in _LOCAL_DEADLINE_CATEGORIES:
+                raise
+            state.mark_root_unresolved(
+                integration_id, generation, kind, root_id,
+                detail=f"selected root drive membership deferred ({exc.category})",
+            )
+            if observe is not None:
+                observe(root_id, exc)
+            if deferred is not None:
+                deferred.append((root_id, exc))
+            continue
         state.bind_root(integration_id, generation, kind, root_id, drive_id)
         bindings[(kind, root_id)] = drive_id
     return bindings
@@ -1528,6 +1754,21 @@ async def run_gdrive_stream(
                 )
                 return started is not None and _unstarted(started)
 
+            def access_blocked(drive_id: str) -> bool:
+                """Unstarted, or started and waiting on a start token it cannot get (R56)."""
+                if start_blocked(drive_id):
+                    return True
+                local = state.get_progress(StreamKey(
+                    settings.team, integration_id, credential_identity(options), drive_id,
+                ).namespace(generation))
+                if local is not None:
+                    return _start_recovery_blocked(local)
+                remote = _remote_stream(execution.progress, drive_id)
+                return bool(
+                    remote and not _unstarted(remote) and remote.get("recovery_required")
+                    and str(remote.get("last_error") or "").startswith(_START_UNAVAILABLE)
+                )
+
             # Which streams exist depends on where each selected root lives, so every root is bound
             # before any start token is captured. An unreadable root is a durable UNRESOLVED
             # obligation with no stream: nothing is enumerated on a guess, its binding is retried on
@@ -1568,6 +1809,10 @@ async def run_gdrive_stream(
                 )
                 _reobserve_stalled_relocations(
                     source, state, integration_id, generation, start_blocked,
+                    restricted=restricted_now(), deferred=deferred_roots, observe=observe_root_minimum,
+                )
+                _reclassify_nonmember_file_roots(
+                    source, state, integration_id, generation, access_blocked,
                     restricted=restricted_now(), deferred=deferred_roots, observe=observe_root_minimum,
                 )
             except BrainError as exc:
@@ -1612,6 +1857,26 @@ async def run_gdrive_stream(
             # A drive no root lives in or is on its way to any more — the root moved on, or back —
             # is not a stream if it never started.
             _retire_orphan_start_diagnostics(state, execution, integration_id, generation, required)
+            # A started stream whose roots were all handed over to verified destinations (R56). Its
+            # removal is published by an ACKNOWLEDGED fenced checkpoint before anything else this run
+            # may reconcile connection-wide; refused, nothing reconciles, and the next run retries.
+            retirement_published = True
+            if _retire_handed_over_streams(
+                state, execution, settings.team, integration_id, generation, options, required,
+            ):
+                retirement_published = False
+                publishing = state.list_progress(integration_id, generation)
+                if publishing:
+                    try:
+                        await _checkpoint_progress(client, execution, state, publishing[0].namespace)
+                        retirement_published = True
+                    except BrainError as exc:
+                        total.failure_categories[exc.code] = total.failure_categories.get(exc.code, 0) + 1
+                        if _progress_uncertain(client, execution):
+                            # It may have committed: no further changed checkpoint under a guessed
+                            # revision. The next acquisition restores the brain's progress.
+                            total.failure_categories.setdefault("checkpoint_unacknowledged", 1)
+                            return total
             # The roster is read after that, from every source: a stream the brain's checkpoint
             # holds is consumed, and has to finish, even when this sidecar's local state lacks it.
             streams = _stream_roster(
@@ -1854,7 +2119,7 @@ async def run_gdrive_stream(
             # no obligation recorded at all — and a stream whose published snapshot is not of the
             # roots it enumerates now, are an incomplete connection: reconciling would turn what
             # has not been verified into absence.
-            verified = not stream_access_failed and not acknowledgment_uncertain and _root_coverage_complete(
+            verified = retirement_published and not stream_access_failed and not acknowledgment_uncertain and _root_coverage_complete(
                 state, integration_id, generation, options,
             ) and not any(
                 any(_bound_root_drift(
@@ -2502,7 +2767,7 @@ async def _run_gdrive_stream_unlocked(
                         held = True
                         continue
                     try:
-                        observed = _observe_root(source, root_id, drive_id, root_observations)
+                        observed = _observe_root(source, root_id, drive_id, root_observations, root_kind)
                     except ProviderDeferred as exc:
                         if exc.category == "rate_limited":
                             # The account's wait, not this stream's (R49 F2): the account-hold owner
@@ -2676,7 +2941,7 @@ async def _run_gdrive_stream_unlocked(
                 in_scope = bool(roots or direct or drive_root)
                 moved_out = bool(
                     direct and file_id in bound_root_kinds and file
-                    and str(file.get("driveId") or "my-drive") != drive_id
+                    and _consumed_drive(source, "file", file, drive_id) != drive_id
                 )
                 if selected and not in_scope and not removed and not moved_out and (
                     deferred_here & set(state.membership_roots(namespace, generation, file_id))
@@ -3097,14 +3362,14 @@ async def _enumerate_baseline(
                 pages_read += 1
             if meta is None:
                 pass
-            elif bound_drive is not None and str(meta.get("driveId") or "my-drive") != drive_id:
+            elif bound_drive is not None and _consumed_drive(source, "file", meta, drive_id) != drive_id:
                 # This stream's cursor can no longer observe the document. Reading it once here
                 # and then reporting the stream current would hide every later edit: the root is
                 # recorded as relocating toward the drive it was read in, and this baseline stops
                 # short of publishing. That drive's stream takes it over once it has a token.
                 state.mark_root_relocating(
                     integration_id, generation, "file", str(root["root_id"]), drive_id,
-                    destination=str(meta.get("driveId") or "my-drive"),
+                    destination=_consumed_drive(source, "file", meta, drive_id),
                 )
                 raise SelectedRootRelocated(
                     f"selected file {root['root_id']} is no longer in the drive it was bound to"
@@ -3620,7 +3885,7 @@ async def _drain_pending(
             doc = source._raw_doc(meta)
             if not state.work_membership_current(work):
                 continue
-            restored_root = _restorable_file_root(state, execution, namespace, generation, work, meta)
+            restored_root = _restorable_file_root(state, execution, namespace, generation, work, meta, source)
         except BrainError:
             raise
         except ProviderDeferred as exc:
