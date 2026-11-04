@@ -5097,9 +5097,13 @@ def test_root_obligation_transitions_never_guess_or_downgrade(tmp_path):
     assert state.root_bindings("c", 1) == {("file", "f"): "shared-x"}
     with pytest.raises(ValueError):
         state.bind_root("c", 1, "file", "g", "")
-    # Remote evidence fills in only what is missing locally, and never a malformed record.
-    from aios_ingest.state import RootBinding
-    assert state.restore_root_obligation("c", 1, "file", "f", RootBinding("other")) is False
+    # Remote (acknowledged) evidence is canonical (AIO-1167 R58): a local row it disagrees with and no
+    # acknowledged baseline vouches for is a CONFLICT, adopted conservatively — never kept as is, and
+    # never settled coverage. A malformed record changes nothing.
+    from aios_ingest.state import ROOT_AUTHORITY_CONFLICT_DETAIL, RootBinding
+    assert state.restore_root_obligation("c", 1, "file", "f", RootBinding("other")) is True
+    adopted = state.root_obligations("c", 1)[("file", "f")]
+    assert (adopted.drive_id, adopted.status, adopted.detail) == ("other", "uncertain", ROOT_AUTHORITY_CONFLICT_DETAIL)
     assert state.restore_root_obligation("c", 1, "file", "g", RootBinding("", "bound")) is False
     assert state.restore_root_obligation("c", 1, "file", "g", RootBinding("", "weird")) is False
     assert state.restore_root_obligation("c", 1, "file", "g", RootBinding("", "unresolved")) is True

@@ -20,6 +20,7 @@ containing (physical) drive and the consumed change log are therefore different 
 from __future__ import annotations
 
 import copy
+import json
 
 import pytest
 
@@ -233,13 +234,17 @@ def _client_class(file_ids, store, shared_drive_ids=(), folder_ids=()):
             store["checkpoint_attempts"] = store.get("checkpoint_attempts", 0) + 1
             if store.get("ack_lost"):
                 raise BrainError(504, "checkpoint_acknowledgment_lost", "no acknowledgment arrived")
-            if store.get("ack_lost_after_commit"):
+            def armed(flag):
+                value = store.get(flag)
+                return value(progress) if callable(value) else bool(value)
+
+            if armed("ack_lost_after_commit"):
                 # The brain COMMITTED it; only the acknowledgment never arrived.
                 store["revision"] = store.get("revision", 0) + 1
                 store["progress"] = copy.deepcopy(progress)
                 store["uncertain"] = True
                 raise BrainError(504, "checkpoint_acknowledgment_lost", "no acknowledgment arrived")
-            if store.get("checkpoint_error"):
+            if armed("checkpoint_error"):
                 raise BrainError(503, "checkpoint_unavailable", "the brain could not take the checkpoint")
             store["revision"] = store.get("revision", 0) + 1
             store["progress"] = progress
@@ -281,6 +286,10 @@ async def _run(
 
         def set_run_deadline(self, deadline):
             pass
+
+        def _metadata(self, file_id):
+            store["metadata_reads"] = store.get("metadata_reads", 0) + 1
+            return super()._metadata(file_id)
 
     async def capture(_settings, _conn, _state, **kwargs):
         runs.append((kwargs["drive_id"], list(starts)))
@@ -1010,14 +1019,30 @@ def test_a_legacy_scalar_is_a_one_drive_set_and_rebinding_unions_it_idempotently
     # Idempotent: a repeated rebind is refused and changes nothing.
     assert state.rebind_root("conn", 5, "file", "f", "b") is False
     assert state.root_obligations("conn", 5)[("file", "f")] == RootBinding("b", handoff_sources=("a", "z"))
-    # A→B→C keeps both ancestors.
+    # A→B→C keeps both ancestors. The brain ACKNOWLEDGED the relocation (b→c) before the rebind.
     state.mark_root_relocating("conn", 5, "file", "f", "b", destination="c")
     state.rebind_root("conn", 5, "file", "f", "c")
     assert state.root_obligations("conn", 5)[("file", "f")].handoff_sources == ("a", "b", "z")
-    # Restore unions the brain's history into a NEWER local transition without overwriting it.
-    state.restore_root_obligation("conn", 5, "file", "f", RootBinding("b", "relocating", "c", handoff_sources=("q",)))
+    # R58: the brain still holds that acknowledged baseline, so the rebind is an UNPUBLISHED local
+    # transition from it — it stands, and the brain's history is unioned into it.
+    from aios_ingest.state import root_current_state, transition_identity
+    relocating = RootBinding("b", "relocating", "c", "observed in drive c")
+    acknowledged_id = transition_identity(None, root_current_state(relocating))
+    # That relocation was acknowledged under its identity; the brain still holds exactly it.
+    state._db.execute(
+        "UPDATE selection_root_bindings SET ack_baseline=? WHERE root_id='f'",
+        (json.dumps({"state": root_current_state(relocating), "transition": acknowledged_id}, sort_keys=True),))
+    state._db.commit()
+    acknowledged = RootBinding("b", "relocating", "c", "observed in drive c", handoff_sources=("q",),
+                               transition=acknowledged_id)
+    assert state.reconcile_root_authority("conn", 5, "file", "f", acknowledged) == "unpublished"
     restored = state.root_obligations("conn", 5)[("file", "f")]
     assert (restored.drive_id, restored.status, restored.handoff_sources) == ("c", "bound", ("a", "b", "q", "z"))
+    # Authority that moved on from that baseline (another worker) conflicts: adopted conservatively.
+    assert state.reconcile_root_authority("conn", 5, "file", "f", RootBinding("d", handoff_sources=("w",))) == "conflict"
+    conflicted = state.root_obligations("conn", 5)[("file", "f")]
+    assert (conflicted.drive_id, conflicted.status) == ("d", "uncertain")
+    assert conflicted.handoff_sources == ("a", "b", "q", "w", "z")
     state.close()
 
 
@@ -1109,3 +1134,418 @@ async def test_a_refused_stream_without_definitive_evidence_is_never_rerouted(tm
     assert "sd-member" in store["progress"]["streams"]
     assert store["last_summary"].authoritative_complete is False
     state.close()
+
+
+# ── R58: the brain's acknowledged root document is canonical; SQLite is resumable work ─────────
+#
+# Two workers with SEPARATE SQLite stores alternate against one brain. Worker 1 holds an older
+# `bound(A)`; worker 2 publishes newer root evidence. Every run is a real stream run.
+
+MOVED = {**METAS, "member-file": _meta("member-file", "sd-next")}
+MEMBERS = {"sd-member": "member", "sd-next": "member"}
+
+
+def _root_item(store):
+    return store["progress"]["roots"]["items"][0]
+
+
+def _baseline(state):
+    """The acknowledged STATE part of the root's baseline (its transition identity is `_baseline_id`)."""
+    row = state._db.execute(
+        "SELECT ack_baseline FROM selection_root_bindings WHERE root_id='member-file'").fetchone()
+    return None if row is None or row[0] is None else json.loads(row[0]).get("state")
+
+
+def _baseline_id(state):
+    row = state._db.execute(
+        "SELECT ack_baseline FROM selection_root_bindings WHERE root_id='member-file'").fetchone()
+    return None if row is None or row[0] is None else json.loads(row[0]).get("transition")
+
+
+def _publish_as_other_worker(store, **changes):
+    """Another worker's acknowledged publication of a NEW root state: the brain's root document changes,
+    under the next transition identity in the chain — exactly as that worker's coordinator would name it."""
+    from aios_ingest.state import RootBinding, root_current_state, transition_identity
+    item = _root_item(store)
+    item.update(changes)
+    state = root_current_state(RootBinding(item["drive_id"], item["status"], item.get("pending_drive_id"), item.get("detail")))
+    item["transition"] = transition_identity(item.get("transition"), state)
+
+
+async def _worker_one(tmp_path, monkeypatch, store, name="w1.sqlite"):
+    """Worker 1: a complete member run on A=sd-member; its local row is acknowledged bound(A)."""
+    w1 = StateStore(str(tmp_path / name))
+    await _run(monkeypatch, w1, ["member-file"], METAS, MEMBERS, store, unopenable=(), real=True)
+    assert store["last_summary"].authoritative_complete
+    assert _baseline(w1) == {"status": "bound", "drive_id": "sd-member", "pending_drive_id": None, "detail": None}
+    return w1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("c_start", ["opens", "blocked"])
+async def test_a_stale_worker_adopts_newer_remote_relocation_and_never_republishes_its_old_binding(
+    tmp_path, monkeypatch, c_start,
+):
+    store: dict = {"reconciles": []}
+    w1 = await _worker_one(tmp_path, monkeypatch, store)
+    w1.close()
+    # Worker 2 (its own fresh store) reads the file in C=sd-next and publishes relocating(A→C).
+    w2 = StateStore(str(tmp_path / "w2.sqlite"))
+    await _run(monkeypatch, w2, ["member-file"], MOVED, MEMBERS, store, unopenable=("sd-next",), real=True)
+    assert _root_item(store)["status"] == "relocating" and _root_item(store)["pending_drive_id"] == "sd-next"
+    w2.close()
+    reconciled = _reconcile_count(store)
+
+    # Worker 1 returns with its OLDER bound(A).
+    w1 = StateStore(str(tmp_path / "w1.sqlite"))
+    unopenable = () if c_start == "opens" else ("sd-next",)
+    starts, runs, _ = await _run(monkeypatch, w1, ["member-file"], MOVED, MEMBERS, store, unopenable=unopenable, real=True)
+    item = _root_item(store)
+    # Never republished: the brain's root document is not regressed to bound(A).
+    assert not (item["status"] == "bound" and item["drive_id"] == "sd-member")
+    assert "sd-next" in starts, "C's start token is asked for"
+    binding = w1.root_obligations(INTEGRATION, 5)[("file", "member-file")]
+    if c_start == "opens":
+        # C's token before anything is enumerated there; the root handed over with A recorded, and the
+        # connection converges with C holding the document (A's readable stream re-enumerates without it).
+        assert "sd-next" in next(snapshot for drive, snapshot in runs if drive == "sd-next")
+        assert (binding.status, binding.drive_id, binding.handoff_sources) == ("bound", "sd-next", ("sd-member",))
+        assert (item["status"], item["drive_id"]) == ("bound", "sd-next")
+        assert store["reconciles"][-1] == ["member-file"]
+    else:
+        # Blocked start: the relocation is retained and NOTHING reconciles, so every claim the brain
+        # holds stands; the connection is not complete.
+        assert (binding.status, binding.drive_id, binding.pending_drive_id) == ("relocating", "sd-member", "sd-next")
+        assert (item["status"], item["pending_drive_id"]) == ("relocating", "sd-next")
+        assert store["last_summary"].authoritative_complete is False
+        assert _reconcile_count(store) == reconciled
+    w1.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("newer", ["uncertain", "deferred"])
+async def test_newer_remote_uncertain_or_deferred_evidence_survives_a_stale_worker(tmp_path, monkeypatch, newer):
+    store: dict = {"reconciles": []}
+    w1 = await _worker_one(tmp_path, monkeypatch, store)
+    w1.close()
+    if newer == "uncertain":
+        # Another worker could not read where the root is now: it published `uncertain`.
+        _publish_as_other_worker(store, status="uncertain", detail="root metadata unreadable (403)")
+    else:
+        # Another worker's enumeration was DEFERRED by a provider minimum: listing debt it published.
+        _publish_as_other_worker(store, status="uncertain", detail="selected root deferred (provider minimum)")
+    published = dict(_root_item(store))
+    assert published["status"] == "uncertain"
+    reconciled = _reconcile_count(store)
+    w1 = StateStore(str(tmp_path / "w1.sqlite"))
+    # Worker 1 cannot read the root now either: nothing it holds may stand in for a fresh observation.
+    unreadable = {k: v for k, v in METAS.items() if k != "member-file"}
+    for _ in range(2):
+        await _run(monkeypatch, w1, ["member-file"], unreadable, MEMBERS, store, unopenable=(), real=True)
+        assert _root_item(store)["status"] == "uncertain", "every outgoing checkpoint keeps the newer evidence"
+        assert store["last_summary"].authoritative_complete is False
+    if newer == "deferred":
+        # Metadata alone never discharges listing debt.
+        assert _root_item(store)["detail"] == published["detail"]
+    assert _reconcile_count(store) == reconciled
+    w1.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["rejected", "committed, response lost", "crash after acknowledgement", "acknowledged"])
+async def test_a_local_transition_and_its_acknowledgement_boundaries(tmp_path, monkeypatch, boundary):
+    """Worker 1 observes the move to C on A's change page; the publication of that relocation meets
+    each boundary. Its baseline advances ONLY on an acknowledged root document, and every path
+    converges without losing the local transition."""
+    store: dict = {"reconciles": []}
+    w1 = await _worker_one(tmp_path, monkeypatch, store)
+    acked = _baseline(w1)
+    move = {"sd-member": [{"fileId": "member-file", "file": _meta("member-file", "sd-next")}]}
+    publishes_relocation = lambda progress: any(  # noqa: E731
+        item.get("status") == "relocating" for item in (progress.get("roots") or {}).get("items", []))
+    if boundary == "rejected":
+        store["checkpoint_error"] = publishes_relocation
+    elif boundary == "committed, response lost":
+        store["ack_lost_after_commit"] = publishes_relocation
+    elif boundary == "crash after acknowledgement":
+        original = StateStore.acknowledge_roots
+
+        def crash(self, connection_id, generation, acknowledged, submitted=None):
+            if any(binding.status == "relocating" for binding in acknowledged.values()):
+                raise RuntimeError("process died after the brain acknowledged, before the local mirror")
+            return original(self, connection_id, generation, acknowledged, submitted)
+
+        monkeypatch.setattr(StateStore, "acknowledge_roots", crash)
+    with pytest.raises(RuntimeError) if boundary == "crash after acknowledgement" else _noop():
+        await _run(monkeypatch, w1, ["member-file"], MOVED, MEMBERS, store, unopenable=("sd-next",),
+                   real=True, changes_by_drive=move)
+    local = w1.root_obligations(INTEGRATION, 5)[("file", "member-file")]
+    assert (local.status, local.pending_drive_id) == ("relocating", "sd-next"), "the local transition stands"
+    if boundary == "acknowledged":
+        assert _baseline(w1)["status"] == "relocating", "advanced to exactly the acknowledged root document"
+    else:
+        assert _baseline(w1) == acked, "no acknowledgement, no advance"
+    if boundary == "crash after acknowledgement":
+        monkeypatch.setattr(StateStore, "acknowledge_roots", original)
+    for flag in ("checkpoint_error", "ack_lost_after_commit", "uncertain"):
+        store[flag] = False
+
+    # Reopened, the transition is either still unpublished from the same baseline or now in sync.
+    w1.close()
+    w1 = StateStore(str(tmp_path / "w1.sqlite"))
+    starts, _runs, _ = await _run(monkeypatch, w1, ["member-file"], MOVED, MEMBERS, store, unopenable=(), real=True)
+    binding = w1.root_obligations(INTEGRATION, 5)[("file", "member-file")]
+    assert (binding.status, binding.drive_id, binding.handoff_sources) == ("bound", "sd-next", ("sd-member",))
+    assert "sd-next" in starts
+    assert _root_item(store)["drive_id"] == "sd-next"
+    w1.close()
+
+
+class _noop:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+@pytest.mark.asyncio
+async def test_a_newer_conflicting_authority_overrides_an_unpublished_local_transition(tmp_path, monkeypatch):
+    store: dict = {"reconciles": []}
+    w1 = await _worker_one(tmp_path, monkeypatch, store)
+    store["checkpoint_error"] = lambda progress: any(
+        item.get("status") == "relocating" for item in (progress.get("roots") or {}).get("items", []))
+    await _run(monkeypatch, w1, ["member-file"], MOVED, MEMBERS, store, unopenable=("sd-next",), real=True,
+               changes_by_drive={"sd-member": [{"fileId": "member-file", "file": _meta("member-file", "sd-next")}]})
+    store["checkpoint_error"] = False
+    assert w1.root_obligations(INTEGRATION, 5)[("file", "member-file")].status == "relocating"
+    # Meanwhile another worker published DIFFERENT newer evidence from the same baseline.
+    _publish_as_other_worker(store, status="uncertain", detail="selected root metadata unreadable (403)")
+    reconciled = _reconcile_count(store)
+    # Worker 1 cannot read the root this run, so only the reconciliation decides what it holds.
+    unreadable = {k: v for k, v in MOVED.items() if k != "member-file"}
+    await _run(monkeypatch, w1, ["member-file"], unreadable, MEMBERS, store, unopenable=("sd-next",), real=True)
+    adopted = w1.root_obligations(INTEGRATION, 5)[("file", "member-file")]
+    assert adopted.status == "uncertain" and adopted.pending_drive_id is None
+    assert _root_item(store)["status"] == "uncertain"
+    assert _reconcile_count(store) == reconciled
+    assert store["last_summary"].authoritative_complete is False
+    w1.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("store_kind", ["legacy differs", "legacy agrees", "legacy same drive", "fresh"])
+async def test_legacy_and_fresh_stores_converge_conservatively(tmp_path, monkeypatch, store_kind):
+    store: dict = {"reconciles": []}
+    w1 = await _worker_one(tmp_path, monkeypatch, store)
+    if store_kind == "legacy same drive":
+        # A legacy local `uncertain` on the SAME drive the brain says is bound: a conflict, adopted
+        # conservatively. No stream needs to re-enumerate (its snapshot already holds the root), so
+        # only a fresh observation of the root where it is bound may settle it.
+        w1._db.execute(
+            "UPDATE selection_root_bindings SET ack_baseline=NULL,status='uncertain',detail='legacy unreadable'")
+        w1._db.commit()
+        await _run(monkeypatch, w1, ["member-file"], METAS, MEMBERS, store, unopenable=(), real=True)
+        settled = w1.root_obligations(INTEGRATION, 5)[("file", "member-file")]
+        assert (settled.status, settled.drive_id) == ("bound", "sd-member")
+        assert store["last_summary"].authoritative_complete is True
+        w1.close()
+        return
+    if store_kind == "fresh":
+        w1.close()
+        w1 = StateStore(str(tmp_path / "fresh.sqlite"))
+        await _run(monkeypatch, w1, ["member-file"], METAS, MEMBERS, store, unopenable=(), real=True)
+        assert _baseline(w1)["drive_id"] == "sd-member"
+        w1.close()
+        return
+    # A legacy row: no provenance recorded.
+    w1._db.execute("UPDATE selection_root_bindings SET ack_baseline=NULL")
+    w1._db.commit()
+    if store_kind == "legacy agrees":
+        await _run(monkeypatch, w1, ["member-file"], METAS, MEMBERS, store, unopenable=(), real=True)
+        assert _baseline(w1)["drive_id"] == "sd-member", "in sync: provenance recorded"
+        assert store["last_summary"].authoritative_complete is True
+        w1.close()
+        return
+    # The brain holds a different binding the legacy row cannot be proven older than: adopted
+    # conservatively (uncertain, no settled coverage) until the root is freshly observed there.
+    _publish_as_other_worker(store, drive_id="sd-next")
+    await _run(monkeypatch, w1, ["member-file"], MOVED, MEMBERS, store, unopenable=(), real=True)
+    binding = w1.root_obligations(INTEGRATION, 5)[("file", "member-file")]
+    assert binding.drive_id == "sd-next"
+    for _ in range(3):
+        await _run(monkeypatch, w1, ["member-file"], MOVED, MEMBERS, store, unopenable=(), real=True)
+        if store["last_summary"].authoritative_complete:
+            break
+    settled = w1.root_obligations(INTEGRATION, 5)[("file", "member-file")]
+    assert (settled.status, settled.drive_id) == ("bound", "sd-next")
+    assert store["last_summary"].authoritative_complete is True
+    w1.close()
+
+
+
+# ── R59: transition identity, and no root acknowledgement from a restriction-only publication ──
+
+def _future():
+    return "2099-01-01T00:00:00+00:00"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("newer", ["relocating", "uncertain", "deferred"])
+async def test_a_standing_hold_publication_never_acknowledges_the_canonical_roots_locally(
+    tmp_path, monkeypatch, newer,
+):
+    store: dict = {"reconciles": []}
+    w1 = await _worker_one(tmp_path, monkeypatch, store)
+    acked_state, acked_id = _baseline(w1), _baseline_id(w1)
+    w1.close()
+    if newer == "relocating":
+        w2 = StateStore(str(tmp_path / "w2.sqlite"))
+        await _run(monkeypatch, w2, ["member-file"], MOVED, MEMBERS, store, unopenable=("sd-next",), real=True)
+        w2.close()
+    else:
+        detail = "root metadata unreadable (403)" if newer == "uncertain" else "selected root deferred (provider minimum)"
+        _publish_as_other_worker(store, status="uncertain", detail=detail)
+    canonical = copy.deepcopy(_root_item(store))
+    assert canonical["status"] != "bound"
+
+    # Worker 1 holds a standing account hold only it knows: the run returns before root adoption,
+    # publishing just the hold — onto the acquired document, roots included.
+    w1 = StateStore(str(tmp_path / "w1.sqlite"))
+    w1.hold_connection(INTEGRATION, 5, "account", _future(), "rate_limited")
+    attempts, reads = store.get("checkpoint_attempts", 0), store.get("metadata_reads", 0)
+    starts, runs, drives = await _run(monkeypatch, w1, ["member-file"], METAS, MEMBERS, store, unopenable=(), real=True)
+    assert store["checkpoint_attempts"] == attempts + 1, "the hold was published"
+    assert (starts, runs, drives.asked, store.get("metadata_reads", 0)) == ([], [], [], reads), "no provider call"
+    assert _root_item(store) == canonical, "the canonical roots are unchanged"
+    assert (_baseline(w1), _baseline_id(w1)) == (acked_state, acked_id), "no false local acknowledgement"
+
+    # The hold passes; reopened, worker 1 adopts the newer evidence and never republishes bound(A).
+    w1._db.execute("DELETE FROM connection_holds")
+    w1._db.commit()
+    w1.close()
+    w1 = StateStore(str(tmp_path / "w1.sqlite"))
+    unreadable = {k: v for k, v in METAS.items() if k != "member-file"}
+    await _run(monkeypatch, w1, ["member-file"], unreadable, MEMBERS, store, unopenable=("sd-next",), real=True)
+    item = _root_item(store)
+    assert not (item["status"] == "bound" and item["drive_id"] == "sd-member")
+    assert item["status"] == canonical["status"] and item.get("detail") == canonical.get("detail")
+    assert store["last_summary"].authoritative_complete is False
+    w1.close()
+
+
+async def _w1_unpublished_a_to_b(tmp_path, monkeypatch, store):
+    """Worker 1: acknowledged bound(A), then a REJECTED publication of its local relocating(A→B)."""
+    w1 = await _worker_one(tmp_path, monkeypatch, store)
+    store["checkpoint_error"] = lambda progress: any(
+        item.get("status") == "relocating" for item in (progress.get("roots") or {}).get("items", []))
+    await _run(monkeypatch, w1, ["member-file"], MOVED, MEMBERS, store, unopenable=("sd-next",), real=True,
+               changes_by_drive={"sd-member": [{"fileId": "member-file", "file": _meta("member-file", "sd-next")}]})
+    store["checkpoint_error"] = False
+    local = w1.root_obligations(INTEGRATION, 5)[("file", "member-file")]
+    assert (local.status, local.pending_drive_id) == ("relocating", "sd-next")
+    assert _baseline(w1)["status"] == "bound", "unpublished: the baseline is still the acknowledged bound(A)"
+    return w1
+
+
+def _other_worker_cycle(store, end):
+    """Another worker completes A→B and then →``end`` (A→B→A or A→B→C), each step acknowledged."""
+    _publish_as_other_worker(store, status="relocating", pending_drive_id="sd-next", detail="observed in drive sd-next")
+    _publish_as_other_worker(store, status="bound", drive_id="sd-next", pending_drive_id=None, detail=None,
+                             handoff_sources=sorted({*_root_item(store).get("handoff_sources", []), "sd-member"}))
+    _publish_as_other_worker(store, status="relocating", pending_drive_id=end, detail=f"observed in drive {end}")
+    _publish_as_other_worker(store, status="bound", drive_id=end, pending_drive_id=None, detail=None,
+                             handoff_sources=sorted({*_root_item(store).get("handoff_sources", []), "sd-next"}))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cycles", [1, 2], ids=["A-B-A", "A-B-A twice (history already {A,B})"])
+async def test_a_stale_unpublished_a_to_b_never_overwrites_a_newer_a_to_b_to_a(tmp_path, monkeypatch, cycles):
+    store: dict = {"reconciles": []}
+    w1 = await _w1_unpublished_a_to_b(tmp_path, monkeypatch, store)
+    for _ in range(cycles):
+        _other_worker_cycle(store, "sd-member")
+    canonical = copy.deepcopy(_root_item(store))
+    assert (canonical["status"], canonical["drive_id"]) == ("bound", "sd-member")
+    assert canonical["transition"] != _baseline_id(w1), "the same state as the old baseline, a NEW transition"
+    reconciled, streams = _reconcile_count(store), set(store["progress"]["streams"])
+
+    # Worker 1 resumes unable to read the root, so no observation can mask the reconciliation.
+    unreadable = {k: v for k, v in MOVED.items() if k != "member-file"}
+    for _ in range(2):
+        await _run(monkeypatch, w1, ["member-file"], unreadable, MEMBERS, store, unopenable=("sd-next",), real=True)
+        item = _root_item(store)
+        assert item["status"] != "relocating", "the stale relocation is never published"
+        assert store["last_summary"].authoritative_complete is False
+        assert _reconcile_count(store) == reconciled
+        assert streams <= set(store["progress"]["streams"]), "nothing retired prematurely"
+    adopted = w1.root_obligations(INTEGRATION, 5)[("file", "member-file")]
+    assert (adopted.status, adopted.drive_id) == ("uncertain", "sd-member")
+    assert {"sd-member", "sd-next"} <= set(adopted.handoff_sources)
+    w1.close()
+
+
+@pytest.mark.asyncio
+async def test_a_stale_unpublished_a_to_b_against_a_newer_a_to_b_to_c_then_converges(tmp_path, monkeypatch):
+    store: dict = {"reconciles": []}
+    w1 = await _w1_unpublished_a_to_b(tmp_path, monkeypatch, store)
+    _other_worker_cycle(store, "sd-third")
+    reconciled = _reconcile_count(store)
+    third = {**METAS, "member-file": _meta("member-file", "sd-third")}
+    members = {**MEMBERS, "sd-third": "member"}
+    unreadable = {k: v for k, v in third.items() if k != "member-file"}
+    await _run(monkeypatch, w1, ["member-file"], unreadable, members, store, unopenable=("sd-next",), real=True)
+    assert _root_item(store)["status"] != "relocating" and _reconcile_count(store) == reconciled
+    adopted = w1.root_obligations(INTEGRATION, 5)[("file", "member-file")]
+    assert (adopted.status, adopted.drive_id) == ("uncertain", "sd-third")
+    # The root readable again: worker 1 observes it where the canonical binding says and converges.
+    for _ in range(4):
+        await _run(monkeypatch, w1, ["member-file"], third, members, store, unopenable=(), real=True)
+        if store["last_summary"].authoritative_complete:
+            break
+    settled = w1.root_obligations(INTEGRATION, 5)[("file", "member-file")]
+    assert (settled.status, settled.drive_id) == ("bound", "sd-third")
+    assert store["last_summary"].authoritative_complete is True
+    assert store["reconciles"][-1] == ["member-file"]
+    w1.close()
+
+
+@pytest.mark.asyncio
+async def test_unrelated_checkpoints_leave_the_root_identity_alone_and_valid_local_work_resumes(tmp_path, monkeypatch):
+    store: dict = {"reconciles": []}
+    w1 = await _worker_one(tmp_path, monkeypatch, store)
+    identity = _root_item(store)["transition"]
+    # Unrelated checkpoints: the revision moves, the root's transition identity does not.
+    for _ in range(2):
+        revision = store["revision"]
+        await _run(monkeypatch, w1, ["member-file"], METAS, MEMBERS, store, unopenable=(), real=True)
+        assert store["revision"] > revision and _root_item(store)["transition"] == identity
+    w1.close()
+    # A rejected local transition, then other workers' UNRELATED checkpoints (streams only).
+    store2: dict = {"reconciles": []}
+    w1 = await _w1_unpublished_a_to_b(tmp_path, monkeypatch, store2)
+    root_before = copy.deepcopy(_root_item(store2))
+    store2["revision"] += 5
+    store2["progress"]["streams"]["sd-member"]["last_attempt_at"] = "2026-11-05T00:00:00+00:00"
+    assert _root_item(store2) == root_before
+    # Valid same-predecessor local work resumes: the relocation is published and handed over.
+    starts, _runs, _ = await _run(monkeypatch, w1, ["member-file"], MOVED, MEMBERS, store2, unopenable=(), real=True)
+    assert "sd-next" in starts
+    binding = w1.root_obligations(INTEGRATION, 5)[("file", "member-file")]
+    assert (binding.status, binding.drive_id) == ("bound", "sd-next")
+    assert _root_item(store2)["drive_id"] == "sd-next" and _root_item(store2)["transition"] != root_before["transition"]
+    w1.close()
+
+
+@pytest.mark.asyncio
+async def test_a_canonical_root_without_identity_is_never_matched_by_unpublished_work(tmp_path, monkeypatch):
+    store: dict = {"reconciles": []}
+    w1 = await _w1_unpublished_a_to_b(tmp_path, monkeypatch, store)
+    _root_item(store).pop("transition", None)  # an older writer's root document: no identity
+    unreadable = {k: v for k, v in MOVED.items() if k != "member-file"}
+    await _run(monkeypatch, w1, ["member-file"], unreadable, MEMBERS, store, unopenable=("sd-next",), real=True)
+    adopted = w1.root_obligations(INTEGRATION, 5)[("file", "member-file")]
+    assert (adopted.status, adopted.drive_id) == ("uncertain", "sd-member"), "adopted conservatively"
+    assert _root_item(store)["status"] != "relocating"
+    assert store["last_summary"].authoritative_complete is False
+    w1.close()

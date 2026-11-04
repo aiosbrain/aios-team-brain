@@ -18,7 +18,7 @@ import hashlib
 import hmac
 import secrets
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Collection, Iterable
 
@@ -214,6 +214,7 @@ CREATE TABLE IF NOT EXISTS selection_root_bindings (
   detail TEXT,
   handoff_from TEXT,
   handoff_sources TEXT,
+  ack_baseline TEXT,
   PRIMARY KEY (connection_id, generation, root_kind, root_id)
 );
 CREATE TABLE IF NOT EXISTS stream_hints (
@@ -294,6 +295,68 @@ class RootBinding:
     # each hand-over — A→B→C keeps {A, B} — so each old stream is retired only once the root's CURRENT
     # destination's verified snapshot holds it. Monotonic for the generation.
     handoff_sources: tuple[str, ...] = ()
+    # The root's TRANSITION identity (AIO-1167 R59): which canonical transition this state is. Read
+    # from the fenced root document, or — for a local row — the identity it is published under (its
+    # acknowledged predecessor's, while unchanged). Not part of equality: it names, it does not state.
+    transition: str | None = field(default=None, compare=False)
+
+
+# The root detail as the fenced checkpoint carries it (`connector_state.roots_section`).
+ROOT_DETAIL_LIMIT = 200
+# A binding adopted from authority it CONFLICTED with (AIO-1167 R58): settled coverage is never
+# manufactured from it; it stays uncertain until its root is freshly observed where it is bound.
+ROOT_AUTHORITY_CONFLICT_DETAIL = "root authority conflict: re-observe before coverage"
+# ``ack_baseline`` of a row this store created that no acknowledged root document has named yet.
+_BASELINE_ABSENT = "absent"
+
+
+def root_current_state(binding: "RootBinding") -> dict[str, Any]:
+    """A root's CURRENT state as a fenced root document carries it — what acknowledgement and the
+    authority comparison are about. Its predecessor history is not part of it (that is unioned)."""
+    status = str(binding.status)
+    return {
+        "status": status,
+        "drive_id": "" if status == "unresolved" else str(binding.drive_id or ""),
+        "pending_drive_id": (str(binding.pending_drive_id) if binding.pending_drive_id else None)
+        if status == "relocating" else None,
+        "detail": (str(binding.detail)[:ROOT_DETAIL_LIMIT] or None) if binding.detail else None,
+    }
+
+
+def transition_identity(predecessor: str | None, state: dict[str, Any]) -> str:
+    """The identity of the canonical transition from ``predecessor`` to ``state`` (AIO-1167 R59).
+
+    Deterministic — a retry, a restart or another worker making the same transition from the same
+    predecessor names it identically — and chained, so returning to an earlier state (A→B→A) is a NEW
+    identity, never the older one. Never a revision, timestamp or random value."""
+    material = f"{predecessor or ''}\x1f{json.dumps(state, sort_keys=True)}"
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _parse_baseline(raw: Any) -> tuple[dict[str, Any] | None, str | None]:
+    """A row's acknowledged baseline as ``(state, transition)``: NULL (legacy) and ``"absent"`` (never
+    acknowledged) have no state; an R58-format state-only baseline has no transition identity."""
+    if not raw:
+        return None, None
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        return None, None
+    if isinstance(value, dict) and isinstance(value.get("state"), dict):
+        transition = value.get("transition")
+        return value["state"], transition if isinstance(transition, str) and transition else None
+    if isinstance(value, dict) and "status" in value:
+        return value, None
+    return None, None
+
+
+def local_transition(current: dict[str, Any], baseline_raw: Any) -> str:
+    """The transition identity a local row is published under: its acknowledged predecessor's while it
+    is unchanged, else the identity of the one transition from that predecessor to what it holds now."""
+    state, transition = _parse_baseline(baseline_raw)
+    if transition is not None and state == current:
+        return transition
+    return transition_identity(transition, current)
 
 
 def handoff_source_set(sources: Any = None, legacy: Any = None) -> tuple[str, ...]:
@@ -466,6 +529,9 @@ class StateStore:
             self._db.execute("ALTER TABLE selection_root_bindings ADD COLUMN handoff_from TEXT")
         if "handoff_sources" not in binding_columns:
             self._db.execute("ALTER TABLE selection_root_bindings ADD COLUMN handoff_sources TEXT")
+        if "ack_baseline" not in binding_columns:
+            # NULL on every row that existed before (AIO-1167 R58): LEGACY, no provenance known.
+            self._db.execute("ALTER TABLE selection_root_bindings ADD COLUMN ack_baseline TEXT")
         self._upgrade_observation_revisions()
         self._upgrade_legacy_channels()
         self._upgrade_watch_columns()
@@ -989,8 +1055,8 @@ class StateStore:
         if not drive_id:
             raise ValueError("a root binding needs the drive that was read for it")
         self._db.execute(
-            "INSERT INTO selection_root_bindings(connection_id,generation,root_kind,root_id,drive_id) "
-            "VALUES(?,?,?,?,?) ON CONFLICT(connection_id,generation,root_kind,root_id) DO UPDATE SET "
+            "INSERT INTO selection_root_bindings(connection_id,generation,root_kind,root_id,drive_id,ack_baseline) "
+            "VALUES(?,?,?,?,?,'\"absent\"') ON CONFLICT(connection_id,generation,root_kind,root_id) DO UPDATE SET "
             "drive_id=excluded.drive_id,status='bound',pending_drive_id=NULL,detail=NULL,bound_at=? "
             "WHERE selection_root_bindings.status='unresolved'",
             (connection_id, generation, root_kind, root_id, drive_id, _now_iso()),
@@ -1005,8 +1071,8 @@ class StateStore:
         A root already bound (in any state) is never downgraded: what was read about it stands.
         """
         self._db.execute(
-            "INSERT INTO selection_root_bindings(connection_id,generation,root_kind,root_id,drive_id,status,detail) "
-            "VALUES(?,?,?,?,'','unresolved',?) ON CONFLICT(connection_id,generation,root_kind,root_id) DO UPDATE SET "
+            "INSERT INTO selection_root_bindings(connection_id,generation,root_kind,root_id,drive_id,status,detail,ack_baseline) "
+            "VALUES(?,?,?,?,'','unresolved',?,'\"absent\"') ON CONFLICT(connection_id,generation,root_kind,root_id) DO UPDATE SET "
             "detail=excluded.detail WHERE selection_root_bindings.status='unresolved'",
             (connection_id, generation, root_kind, root_id, detail),
         )
@@ -1026,7 +1092,7 @@ class StateStore:
     ) -> dict[tuple[str, str], RootBinding]:
         """Every selected-root obligation of a generation, in every state."""
         rows = self._db.execute(
-            "SELECT root_kind,root_id,drive_id,status,pending_drive_id,detail,handoff_from,handoff_sources "
+            "SELECT root_kind,root_id,drive_id,status,pending_drive_id,detail,handoff_from,handoff_sources,ack_baseline "
             "FROM selection_root_bindings WHERE connection_id=? AND generation=? ORDER BY root_kind,root_id",
             (connection_id, generation),
         ).fetchall()
@@ -1034,6 +1100,9 @@ class StateStore:
             (str(r["root_kind"]), str(r["root_id"])): RootBinding(
                 str(r["drive_id"]), str(r["status"]), r["pending_drive_id"], r["detail"],
                 handoff_source_set(r["handoff_sources"], r["handoff_from"]),
+                local_transition(root_current_state(RootBinding(
+                    str(r["drive_id"]), str(r["status"]), r["pending_drive_id"], r["detail"],
+                )), r["ack_baseline"]),
             )
             for r in rows
         }
@@ -1042,52 +1111,131 @@ class StateStore:
         self, connection_id: str, generation: int, root_kind: str, root_id: str,
         binding: RootBinding,
     ) -> bool:
-        """Adopt one obligation the brain acknowledged, when this state holds none for that root.
+        """Reconcile one root with the brain's acknowledged evidence (``reconcile_root_authority``).
+        True when the local row was created or replaced by it; False when local state stands (or
+        the evidence is malformed)."""
+        return self.reconcile_root_authority(
+            connection_id, generation, root_kind, root_id, binding,
+        ) in ("inserted", "adopted", "conflict")
 
-        Local evidence, where present, stands: this only fills in what a lost or older local state
-        lacks. An obligation whose state is unknown, or a bound one with no drive, is not adopted.
-        The acknowledged predecessor streams (``handoff_sources``) are UNIONED into a local row that
-        exists, never replacing its binding: a newer local hand-over keeps its drive and state, and an
-        older local history gains every source the brain acknowledged (AIO-1167 R56).
+    def reconcile_root_authority(
+        self, connection_id: str, generation: int, root_kind: str, root_id: str,
+        authority: RootBinding,
+    ) -> str | None:
+        """Reconcile one local root obligation with the brain's ACQUIRED, acknowledged one (AIO-1167 R58).
+
+        The fenced root document is canonical; this store is resumable work. Each local row records
+        the root state AND transition identity the brain last ACKNOWLEDGED for it (``ack_baseline``):
+        NULL for a legacy row whose provenance is unknown, ``"absent"`` for one created here and never
+        acknowledged. Identity, not state, decides (R59): A→B→A returns to a state the baseline also
+        holds, under a NEW identity.
+          · no local row → the authority's, verbatim (``inserted``);
+          · local equals authority → in sync; the baseline becomes the authority (``synced``);
+          · the authority IS the local baseline's transition (identity equal) while local moved → an
+            UNPUBLISHED local transition from that exact predecessor: it stands (``unpublished``);
+          · local still equals its baseline's state while the authority is another transition →
+            local is stale: the authority's drive, state, destination and detail are adopted
+            (``adopted``);
+          · anything else — both moved, or no usable provenance — is a CONFLICT: the authority's
+            state is adopted conservatively. A settled ``bound`` becomes ``uncertain`` until the root is
+            freshly observed where it is bound, so coverage is never manufactured; a relocating,
+            uncertain (deferred listing debt included) or unresolved state is taken as is.
+        Predecessor history is the union of both, in every case; a stale CURRENT drive is never kept
+        as one. Malformed evidence is refused (``None``) and changes nothing.
         """
-        if binding.status not in ROOT_STATES:
-            return False
-        if binding.status != "unresolved" and not binding.drive_id:
-            return False
-        if binding.status == "relocating" and not binding.pending_drive_id:
-            return False
-        sources = handoff_source_set(binding.handoff_sources) if binding.status != "unresolved" else ()
+        if authority.status not in ROOT_STATES:
+            return None
+        if authority.status != "unresolved" and not authority.drive_id:
+            return None
+        if authority.status == "relocating" and not authority.pending_drive_id:
+            return None
+        remote = root_current_state(authority)
+        remote_transition = authority.transition if authority.transition else None
+        remote_sources = handoff_source_set(authority.handoff_sources) if authority.status != "unresolved" else ()
         self._db.execute("BEGIN IMMEDIATE")
         try:
-            cur = self._db.execute(
-                "INSERT OR IGNORE INTO selection_root_bindings"
-                "(connection_id,generation,root_kind,root_id,drive_id,status,pending_drive_id,detail,handoff_sources) "
-                "VALUES(?,?,?,?,?,?,?,?,?)",
-                (connection_id, generation, root_kind, root_id,
-                 "" if binding.status == "unresolved" else binding.drive_id, binding.status,
-                 binding.pending_drive_id if binding.status == "relocating" else None, binding.detail,
-                 json.dumps(list(sources)) if sources else None),
+            row = self._db.execute(
+                "SELECT drive_id,status,pending_drive_id,detail,handoff_sources,handoff_from,ack_baseline "
+                "FROM selection_root_bindings WHERE connection_id=? AND generation=? AND root_kind=? AND root_id=?",
+                (connection_id, generation, root_kind, root_id),
+            ).fetchone()
+            baseline_json = json.dumps({"state": remote, "transition": remote_transition}, sort_keys=True)
+            if row is None:
+                self._db.execute(
+                    "INSERT INTO selection_root_bindings"
+                    "(connection_id,generation,root_kind,root_id,drive_id,status,pending_drive_id,detail,"
+                    "handoff_sources,ack_baseline) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (connection_id, generation, root_kind, root_id, remote["drive_id"], remote["status"],
+                     remote["pending_drive_id"], remote["detail"],
+                     json.dumps(list(remote_sources)) if remote_sources else None, baseline_json),
+                )
+                self._db.commit()
+                return "inserted"
+            local = root_current_state(RootBinding(
+                str(row["drive_id"]), str(row["status"]), row["pending_drive_id"], row["detail"],
+            ))
+            sources = handoff_source_set(
+                list(handoff_source_set(row["handoff_sources"], row["handoff_from"])) + list(remote_sources),
             )
-            inserted = cur.rowcount == 1
-            if not inserted and sources:
-                row = self._db.execute(
-                    "SELECT handoff_sources,handoff_from FROM selection_root_bindings "
+            baseline_state, baseline_transition = _parse_baseline(row["ack_baseline"])
+            if local == remote:
+                outcome, adopt = "synced", None
+            elif (baseline_transition is not None and baseline_transition == remote_transition
+                  and baseline_state == remote):
+                outcome, adopt = "unpublished", None
+            elif baseline_state is not None and baseline_state == local:
+                outcome, adopt = "adopted", remote
+            else:
+                outcome = "conflict"
+                adopt = dict(remote)
+                if remote["status"] == "bound":
+                    adopt.update(status="uncertain", detail=ROOT_AUTHORITY_CONFLICT_DETAIL)
+            if adopt is None:
+                self._db.execute(
+                    "UPDATE selection_root_bindings SET handoff_sources=?,handoff_from=NULL,ack_baseline=? "
                     "WHERE connection_id=? AND generation=? AND root_kind=? AND root_id=?",
-                    (connection_id, generation, root_kind, root_id),
-                ).fetchone()
-                local = handoff_source_set(row["handoff_sources"], row["handoff_from"])
-                merged = handoff_source_set(list(local) + list(sources))
-                if merged != local:
-                    self._db.execute(
-                        "UPDATE selection_root_bindings SET handoff_sources=?,handoff_from=NULL "
-                        "WHERE connection_id=? AND generation=? AND root_kind=? AND root_id=?",
-                        (json.dumps(list(merged)), connection_id, generation, root_kind, root_id),
-                    )
+                    (json.dumps(list(sources)) if sources else None,
+                     baseline_json if outcome == "synced" else row["ack_baseline"],
+                     connection_id, generation, root_kind, root_id),
+                )
+            else:
+                self._db.execute(
+                    "UPDATE selection_root_bindings SET drive_id=?,status=?,pending_drive_id=?,detail=?,"
+                    "handoff_sources=?,handoff_from=NULL,ack_baseline=? "
+                    "WHERE connection_id=? AND generation=? AND root_kind=? AND root_id=?",
+                    (adopt["drive_id"], adopt["status"], adopt["pending_drive_id"], adopt["detail"],
+                     json.dumps(list(sources)) if sources else None, baseline_json,
+                     connection_id, generation, root_kind, root_id),
+                )
             self._db.commit()
         except BaseException:
             self._db.rollback()
             raise
-        return inserted
+        return outcome
+
+    def acknowledge_roots(
+        self, connection_id: str, generation: int, acknowledged: dict[tuple[str, str], RootBinding],
+        submitted: dict[tuple[str, str], RootBinding] | None = None,
+    ) -> None:
+        """Advance each root's ``ack_baseline`` to EXACTLY what an acknowledged checkpoint's root
+        document holds for it — state and transition identity (AIO-1167 R58/R59). Called only after
+        the acknowledgement of a root snapshot THIS coordinator submitted; with ``submitted``, only a
+        root acknowledged exactly as submitted advances. A refused or lost one advances nothing."""
+        for key, binding in acknowledged.items():
+            if submitted is not None:
+                sent = submitted.get(key)
+                if (sent is None or root_current_state(sent) != root_current_state(binding)
+                        or sent.transition != binding.transition):
+                    continue
+            root_kind, root_id = key
+            self._db.execute(
+                "UPDATE selection_root_bindings SET ack_baseline=? "
+                "WHERE connection_id=? AND generation=? AND root_kind=? AND root_id=?",
+                (json.dumps({"state": root_current_state(binding), "transition": binding.transition},
+                            sort_keys=True),
+                 connection_id, generation, root_kind, root_id),
+            )
+        self._db.commit()
 
     def unknown_root_count(self, connection_id: str, generation: int) -> int:
         """Selected roots whose drive is unknown or unreadable now: either may hide a stream."""
@@ -1108,7 +1256,7 @@ class StateStore:
     ) -> dict[tuple[str, str], RootBinding]:
         """Every selected root that is unresolved, uncertain or on its way to another drive."""
         rows = self._db.execute(
-            "SELECT root_kind,root_id,drive_id,status,pending_drive_id,detail,handoff_from,handoff_sources "
+            "SELECT root_kind,root_id,drive_id,status,pending_drive_id,detail,handoff_from,handoff_sources,ack_baseline "
             "FROM selection_root_bindings WHERE connection_id=? AND generation=? AND status<>'bound' ORDER BY root_kind,root_id",
             (connection_id, generation),
         ).fetchall()
@@ -1116,6 +1264,9 @@ class StateStore:
             (str(r["root_kind"]), str(r["root_id"])): RootBinding(
                 str(r["drive_id"]), str(r["status"]), r["pending_drive_id"], r["detail"],
                 handoff_source_set(r["handoff_sources"], r["handoff_from"]),
+                local_transition(root_current_state(RootBinding(
+                    str(r["drive_id"]), str(r["status"]), r["pending_drive_id"], r["detail"],
+                )), r["ack_baseline"]),
             )
             for r in rows
         }
@@ -1140,8 +1291,8 @@ class StateStore:
         """``mark_root_uncertain``'s statement, without committing (for a caller's transaction)."""
         deferred = f"{ROOT_DEFERRED_PREFIX}%"
         self._db.execute(
-            "INSERT INTO selection_root_bindings(connection_id,generation,root_kind,root_id,drive_id,status,detail) "
-            "VALUES(?,?,?,?,?,'uncertain',?) ON CONFLICT(connection_id,generation,root_kind,root_id) DO UPDATE SET "
+            "INSERT INTO selection_root_bindings(connection_id,generation,root_kind,root_id,drive_id,status,detail,ack_baseline) "
+            "VALUES(?,?,?,?,?,'uncertain',?,'\"absent\"') ON CONFLICT(connection_id,generation,root_kind,root_id) DO UPDATE SET "
             "status='uncertain',detail=CASE WHEN selection_root_bindings.status='uncertain' "
             "AND coalesce(selection_root_bindings.detail,'') LIKE ? "
             "AND coalesce(excluded.detail,'') NOT LIKE ? "
@@ -1159,8 +1310,8 @@ class StateStore:
         Only a root that was bound can relocate: an unresolved obligation is resolved by
         ``bind_root``, never by inventing the drive it supposedly left."""
         self._db.execute(
-            "INSERT INTO selection_root_bindings(connection_id,generation,root_kind,root_id,drive_id,status,pending_drive_id,detail) "
-            "VALUES(?,?,?,?,?,'relocating',?,?) ON CONFLICT(connection_id,generation,root_kind,root_id) DO UPDATE SET "
+            "INSERT INTO selection_root_bindings(connection_id,generation,root_kind,root_id,drive_id,status,pending_drive_id,detail,ack_baseline) "
+            "VALUES(?,?,?,?,?,'relocating',?,?,'\"absent\"') ON CONFLICT(connection_id,generation,root_kind,root_id) DO UPDATE SET "
             "status='relocating',pending_drive_id=excluded.pending_drive_id,detail=excluded.detail "
             "WHERE selection_root_bindings.status<>'unresolved'",
             (connection_id, generation, root_kind, root_id, drive_id, destination,

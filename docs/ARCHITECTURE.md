@@ -1105,8 +1105,20 @@ generation (`withGdriveExecutionCommit(..., { requireRootCoverage })` →
 `lib/integrations/gdrive-root-coverage.ts`, `409 root_coverage_incomplete`) — so no connector-key
 caller can assert completion past an unknown roster. Explicit provider-confirmed removals and
 non-final staged pages are not roster-gated. Root obligations ride
-every coordinator checkpoint as the brain-fenced `roots` section and are re-adopted by a sidecar that
-lost its SQLite state (`connector_state`, `_adopt_remote_root_evidence`). The selected root id stays the
+every coordinator checkpoint as the brain-fenced `roots` section, which is CANONICAL; SQLite is resumable
+work (AIO-1167 R58). Before binding, the roster, retirement or any publication, every local root is
+reconciled with the acquired section (`_adopt_remote_root_evidence` → `StateStore.reconcile_root_authority`)
+against its own acknowledged baseline (`selection_root_bindings.ack_baseline`: the root's state AND its
+TRANSITION identity, advanced only when a root snapshot this coordinator submitted is acknowledged — a
+restriction-only publication carrying the acquired roots advances nothing, R59). Each root in the fenced
+document carries `transition`, a deterministic chained hash of its predecessor's identity and its state
+(`transition_identity`): unchanged across unrelated checkpoints and retries, new on every canonical
+change, so A→B→A is not the older A. A stale local row adopts newer relocating/uncertain/deferred
+evidence; an unpublished local transition stands only while the acquired root IS its predecessor
+(identity equal; a missing identity never matches); and a conflict — or a legacy row
+without provenance — adopts the authority conservatively (a settled binding becomes `uncertain` until the
+root is freshly observed where it is bound, `_reobserve_conflicted_roots`); predecessor history is unioned.
+A worker holding an older binding therefore never republishes it. The selected root id stays the
 selection when the root is moved to another drive; only its binding changes, and never by inference.
 The old drive reports a moved root, and everything under it, as removed and lists it as empty, so a
 bound root's current metadata is read under the execution fence before a change page may retire a

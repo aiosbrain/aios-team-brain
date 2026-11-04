@@ -50,7 +50,7 @@ import copy
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-from .state import ROOT_STATES, RootBinding, handoff_source_set
+from .state import ROOT_DETAIL_LIMIT, ROOT_STATES, RootBinding, handoff_source_set
 
 ROOTS_KEY = "roots"
 # The coordinator's account-level provider hold (AIO-1167 R47 F5): ``{generation, credential,
@@ -71,7 +71,7 @@ WATCHES_KEY = "watches"
 RENEWAL_STREAM_PREFIX = "watch_"
 # A diagnostic is for people; it is bounded so a pathological provider message cannot bloat the
 # one authority document every run rewrites.
-_DETAIL_LIMIT = 200
+_DETAIL_LIMIT = ROOT_DETAIL_LIMIT
 
 
 def _streams(document: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -135,6 +135,8 @@ def roots_section(
                 "pending_drive_id": binding.pending_drive_id,
                 "detail": (binding.detail or "")[:_DETAIL_LIMIT] or None,
                 "handoff_sources": list(binding.handoff_sources),
+                # The root's canonical transition identity (AIO-1167 R59).
+                "transition": binding.transition,
             }
             for (kind, root_id), binding in sorted(obligations.items())
         ],
@@ -177,6 +179,7 @@ def parse_roots_section(document: dict[str, Any], generation: int) -> dict[tuple
             str(detail)[:_DETAIL_LIMIT] if isinstance(detail, str) else None,
             # The predecessor streams; an older checkpoint's scalar ``handoff_from`` is a one-drive set.
             handoff_source_set(item.get("handoff_sources"), item.get("handoff_from")),
+            str(item["transition"]) if isinstance(item.get("transition"), str) and item.get("transition") else None,
         )
     return parsed
 

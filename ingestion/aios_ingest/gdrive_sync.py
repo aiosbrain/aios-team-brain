@@ -40,7 +40,7 @@ from .sources.gdrive import (
     ProviderDeferred,
     is_drive_rate_limit,
 )
-from .state import StateStore, StreamKey, PendingWork, MaterializedPage
+from .state import ROOT_AUTHORITY_CONFLICT_DETAIL, StateStore, StreamKey, PendingWork, MaterializedPage
 from .selections import effective_gdrive_connection
 
 _TERMINAL_AUTHORITY_CODES = {
@@ -446,6 +446,8 @@ async def _publish_restriction_evidence(
     acknowledged = dict(ack.get("progress") or payload)
     execution.progress.clear()
     execution.progress.update(acknowledged)
+    # The roots it carried are the ACQUIRED canonical ones, not a root snapshot this coordinator
+    # submitted: this acknowledgement advances no local root baseline (R59).
     return True
 
 
@@ -995,6 +997,48 @@ def _reobserve_stalled_relocations(
             )
 
 
+def _reobserve_conflicted_roots(
+    source: GoogleDriveSource, state: StateStore, integration_id: str, generation: int,
+    *,
+    restricted: set[str] | frozenset[str] = frozenset(),
+    deferred: list[tuple[str, ProviderDeferred | None]] | None = None,
+    observe: Callable[[str, ProviderDeferred], None] | None = None,
+) -> None:
+    """Freshly observe each root whose binding was adopted from CONFLICTING authority (R58).
+
+    Such a root is ``uncertain`` with ``ROOT_AUTHORITY_CONFLICT_DETAIL``: nothing was settled on its
+    behalf. Its metadata is read where it is now bound — read there, it is settled (the ordinary
+    rule for a non-deferred uncertain root); read elsewhere, it relocates; unreadable or absent,
+    nothing is concluded and it stays uncertain. A deferred listing debt is never touched here.
+    Admission and deferral follow ``_reobserve_stalled_relocations``.
+    """
+    seen: dict[str, RootObservation] = {}
+    for (root_kind, root_id), binding in state.unsettled_roots(integration_id, generation).items():
+        if binding.status != "uncertain" or binding.detail != ROOT_AUTHORITY_CONFLICT_DETAIL or not binding.drive_id:
+            continue
+        if root_id in restricted:
+            if deferred is not None:
+                deferred.append((root_id, None))
+            continue
+        try:
+            observed = _observe_root(source, root_id, binding.drive_id, seen, root_kind)
+        except ProviderDeferred as exc:
+            if exc.category == "rate_limited" or exc.category in _LOCAL_DEADLINE_CATEGORIES:
+                raise
+            if observe is not None:
+                observe(root_id, exc)
+            if deferred is not None:
+                deferred.append((root_id, exc))
+            continue
+        if observed.state == "here":
+            state.settle_root(integration_id, generation, root_kind, root_id)
+        elif observed.state == "elsewhere" and observed.drive_id:
+            state.mark_root_relocating(
+                integration_id, generation, root_kind, root_id, binding.drive_id,
+                destination=str(observed.drive_id),
+            )
+
+
 def _reclassify_nonmember_file_roots(
     source: GoogleDriveSource, state: StateStore, integration_id: str, generation: int,
     drive_blocked: Any,
@@ -1342,12 +1386,14 @@ def _bind_selected_roots(
 def _adopt_remote_root_evidence(
     state: StateStore, execution: GdriveExecution, integration_id: str, generation: int,
 ) -> None:
-    """Recover root obligations the brain acknowledged that local state does not hold.
+    """Reconcile every local root obligation with the brain's ACQUIRED root document (AIO-1167 R58).
 
-    SQLite is resumable work storage, not authority: a sidecar that lost it (or never had it) must
-    not re-guess where a root lives, nor forget that one is unresolved, relocating or uncertain.
-    The fenced checkpoint carries every obligation of the generation (``connector_state``); this
-    fills in only roots with no local row, so newer local evidence stands.
+    The fenced root document is canonical and SQLite is resumable work storage, so a worker whose
+    local row is older than what another worker published must not keep — or republish — it: a stale
+    ``bound(A)`` adopts the newer ``relocating``, ``uncertain`` or deferred evidence. An unpublished
+    local transition made from the same acknowledged baseline stands; a conflict adopts the
+    authority conservatively (``StateStore.reconcile_root_authority``). Runs before binding, the
+    roster, retirement and any publication of this run.
     """
     for (kind, root_id), binding in parse_roots_section(execution.progress, generation).items():
         state.restore_root_obligation(integration_id, generation, kind, root_id, binding)
@@ -1822,6 +1868,10 @@ async def run_gdrive_stream(
                 )
                 _reobserve_stalled_relocations(
                     source, state, integration_id, generation, start_blocked,
+                    restricted=restricted_now(), deferred=deferred_roots, observe=observe_root_minimum,
+                )
+                _reobserve_conflicted_roots(
+                    source, state, integration_id, generation,
                     restricted=restricted_now(), deferred=deferred_roots, observe=observe_root_minimum,
                 )
                 _reclassify_nonmember_file_roots(
@@ -4308,6 +4358,14 @@ async def _checkpoint_progress(
     acknowledged = dict(ack.get("progress") or payload)
     execution.progress.clear()
     execution.progress.update(acknowledged)
+    # The root snapshot THIS coordinator submitted, as the brain acknowledged it, becomes each root's
+    # baseline — state and transition identity (R58/R59). A refused or lost acknowledgement raised
+    # above and advanced nothing.
+    state.acknowledge_roots(
+        execution.integration_id, execution.generation,
+        parse_roots_section(acknowledged, execution.generation),
+        submitted=parse_roots_section(payload, execution.generation),
+    )
     revision = int(ack.get("progress_revision") or progress.server_revision)
     state.update_progress(
         namespace,
