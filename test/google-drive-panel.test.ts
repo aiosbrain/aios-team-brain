@@ -286,3 +286,52 @@ describe("the parent's Drive actions use the connection the panel hands them", (
     expect(src).not.toContain("driveIntegration");
   });
 });
+
+/**
+ * AIO-1167 R56 — Picker never hides the per-file OAuth reconnect.
+ *
+ * Spec. The Picker selects Docs with a short-lived browser token; it cannot repair a missing or
+ * revoked server refresh credential. So for every EXISTING connection, with the Picker configured,
+ * both stay reachable: "Choose Google Docs" (bound to that connection) and the `mode=files` reconnect
+ * for exactly that connection's name — whether it is disconnected, needs reconnecting, or is healthy.
+ * The folder reconnect is a different grant mode and is not a substitute for it.
+ */
+describe("Picker and the per-file reconnect stay available together (R56)", () => {
+  const disconnected: IntegrationRow = { ...SECOND, status: "disabled", hasSecret: false };
+  const reconnectRequired: IntegrationRow = { ...SECOND, status: "enabled", hasSecret: false };
+  const healthy: IntegrationRow = { ...SECOND, status: "enabled", hasSecret: true };
+  const FILES = "/api/auth/gdrive/start?team=acme&name=client-docs&mode=files";
+
+  it.each([
+    ["disconnected (paused, no credential)", disconnected],
+    ["reconnect-required (no credential)", reconnectRequired],
+    ["healthy", healthy],
+  ] as const)("%s: Choose Google Docs and the exact per-file reconnect target are both offered", (_case, connection) => {
+    const p = panelProps([FIRST, connection], connection.id, { pickerConfigured: true });
+    click(button(p, "Choose Google Docs"));
+    expect(p.onChooseFiles.mock.calls.map(([c]) => c.id)).toEqual([connection.id]);
+    const links = tree(p).filter((el) => el.type === "a").map((el) => ({ href: el.props.href, label: text(el.props.children) }));
+    expect(links).toContainEqual({ href: FILES, label: "Reconnect file access" });
+    // The folder reconnect requests a broader grant: it is offered beside, never instead of, it.
+    expect(links.map((link) => link.href)).toContain("/api/auth/gdrive/start?team=acme&name=client-docs&mode=folders");
+    expect(links.map((link) => link.href).filter((href) => String(href).includes("name=team-docs"))).toEqual([]);
+  });
+
+  it("a connection without a credential is told the Picker cannot restore it; a healthy one is not", () => {
+    for (const connection of [disconnected, reconnectRequired]) {
+      expect(html(panelProps([FIRST, connection], connection.id, { pickerConfigured: true })))
+        .toContain("the Picker cannot restore a missing or revoked credential");
+    }
+    expect(html(panelProps([FIRST, healthy], healthy.id, { pickerConfigured: true })))
+      .not.toContain("the Picker cannot restore");
+  });
+
+  it("without the Picker, and with no connection yet, the existing file links are unchanged", () => {
+    const withoutPicker = tree(panelProps([FIRST, healthy], healthy.id));
+    expect(withoutPicker.some((el) => el.type === "button" && text(el.props.children).includes("Choose Google Docs"))).toBe(false);
+    expect(withoutPicker.filter((el) => el.type === "a").map((el) => el.props.href)).toContain(FILES);
+    const none = tree(panelProps([], null, { pickerConfigured: true }));
+    expect(none.some((el) => el.type === "button" && text(el.props.children).includes("Choose Google Docs"))).toBe(false);
+    expect(none.filter((el) => el.type === "a").map((el) => text(el.props.children))).toContain("Connect selected files");
+  });
+});

@@ -106,23 +106,30 @@ export function GoogleDrivePanel(props: GoogleDrivePanelProps) {
                 Uses Google&apos;s per-file <code>drive.file</code> scope. It cannot discover every child
                 of a folder unless those files were individually authorized.
               </p>
-              {drive && props.pickerConfigured ? (
-                <button
-                  type="button"
-                  onClick={() => props.onChooseFiles(drive)}
-                  disabled={pending}
-                  className="mt-3 inline-flex rounded-lg border border-violet/40 bg-violet/10 px-3 py-1.5 text-xs font-medium text-violet disabled:opacity-50"
-                >
-                  Choose Google Docs
-                </button>
-              ) : (
+              {/* Picker SELECTS Docs with a short-lived browser token; it cannot restore the server's
+                  refresh credential. The per-file reconnect therefore stays available for every
+                  existing connection, Picker or not (AIO-1167 R56). */}
+              <div className="mt-3 flex flex-wrap gap-2">
+                {drive && props.pickerConfigured ? (
+                  <button
+                    type="button"
+                    onClick={() => props.onChooseFiles(drive)}
+                    disabled={pending}
+                    className="inline-flex rounded-lg border border-violet/40 bg-violet/10 px-3 py-1.5 text-xs font-medium text-violet disabled:opacity-50"
+                  >
+                    Choose Google Docs
+                  </button>
+                ) : null}
                 <a
-                  className="mt-3 inline-flex rounded-lg border border-violet/40 bg-violet/10 px-3 py-1.5 text-xs font-medium text-violet"
+                  className="inline-flex rounded-lg border border-violet/40 bg-violet/10 px-3 py-1.5 text-xs font-medium text-violet"
                   href={`/api/auth/gdrive/start?team=${encodeURIComponent(teamSlug)}&name=${encodeURIComponent(authName)}&mode=files`}
                 >
                   {drive ? "Reconnect file access" : "Connect selected files"}
                 </a>
-              )}
+              </div>
+              {drive && props.pickerConfigured && drive.config.authMode !== "service_account" && !drive.hasSecret ? (
+                <p className="mt-2 text-xs text-amber-700">Reconnect file access before choosing Docs: the Picker cannot restore a missing or revoked credential.</p>
+              ) : null}
               {drive && !props.pickerConfigured ? (
                 <p className="mt-2 text-xs text-amber-700">Picker is not configured on this instance; reconnect remains available.</p>
               ) : null}

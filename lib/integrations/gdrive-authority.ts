@@ -9,7 +9,7 @@ import type { DbClient } from "@/lib/db/types";
 import { withBoundedLockWaits } from "@/lib/db/pg/bounded-lock";
 import { runSql, withTransaction } from "@/lib/db/pg/pool";
 import { lockIdentityAuthority, lockIdentityMutationAuthorities } from "@/lib/identity/authority";
-import { upsertIntegration } from "@/lib/integrations/manage";
+import { reserveGdriveIntegration, upsertIntegration } from "@/lib/integrations/manage";
 import { applyGdriveConnectionAudience } from "@/lib/projects/context/gdrive-claims";
 import { lockProjectRows } from "@/lib/projects/project-row-locks";
 import { decryptSecret } from "@/lib/secrets/crypto";
@@ -510,6 +510,13 @@ export async function publishGdriveVerifiedConfig(
  * It writes CONFIG only, never a credential (AIO-1167 R43 F1): a Drive credential enters only through
  * the verified OAuth publication (`publishGoogleDriveOAuthCredential`), which binds it to the account
  * it proved; service-account keys stay with the local sidecar and are never uploaded.
+ *
+ * The CREATE decision is made under the same authority as an OAuth publication (AIO-1167 R56): the
+ * identity mutation authority, then this connection NAME's lock, then create-or-read-winner
+ * (`reserveGdriveIntegration`), then the winner's connection rows. A connection another save or an
+ * OAuth publication created after this form was loaded is therefore the LOCKED row this save derives
+ * from — its credential fields, its status (a paused winner stays paused) and its claims' audience —
+ * never a row overwritten as if it were new. Only a reservation made by this transaction is new.
  */
 export async function saveGdriveConnectionConfig(
   db: DbClient,
@@ -517,11 +524,20 @@ export async function saveGdriveConnectionConfig(
   input: { name: string; config: Record<string, unknown> },
 ): Promise<{ id: string }> {
   return withTransaction(async () => {
+    await lockIdentityMutationAuthorities([auth.teamId]);
+    await runSql(`select pg_advisory_xact_lock(hashtextextended($1, 0))`, [
+      `${auth.teamId}:gdrive:${input.name}`,
+    ]);
     const { rows: named } = await runSql<{ id: string }>(
       `select id from integrations where team_id=$1 and type='gdrive' and name=$2`,
       [auth.teamId, input.name],
     );
-    const existing = named[0] ? await lockedAuthority(named[0].id, auth.teamId) : null;
+    // A reservation carries no caller-supplied credential field: it is provisional, never authority.
+    const target = named[0]
+      ? { id: named[0].id, reserved: false }
+      : await reserveGdriveIntegration(db, auth.teamId, input.name, mergeLockedGdriveCredentialFields(input.config, {}));
+    const held = await lockedAuthority(target.id, auth.teamId);
+    const existing = target.reserved ? null : held;
     const locked = existing?.config ?? {};
     if (unverifiedOauthRoots(input.config, locked).length > 0) {
       throw new GdriveAuthorityError(
