@@ -1019,3 +1019,93 @@ def test_a_legacy_scalar_is_a_one_drive_set_and_rebinding_unions_it_idempotently
     restored = state.root_obligations("conn", 5)[("file", "f")]
     assert (restored.drive_id, restored.status, restored.handoff_sources) == ("c", "bound", ("a", "b", "q", "z"))
     state.close()
+
+
+# ── R57: a started stream whose change log is REFUSED after membership is lost ─────────────────
+#
+# The real transition, nothing injected: a member's started stream with a valid cursor; then its
+# `changes.list` is refused (`stream_access_denied`) and only `drives.get` 404 proves non-membership,
+# while the file's metadata stays readable.
+
+REFUSED = dict(membership={"sd-member": "nonmember"}, unopenable=("sd-member",), real=True)
+
+
+async def _member_then_refused(tmp_path, monkeypatch, name, store, metas=METAS, **options):
+    state = StateStore(str(tmp_path / name))
+    await _run(monkeypatch, state, ["member-file"], metas, {"sd-member": "member"}, store, unopenable=(),
+               real=True, **options)
+    old = state.get_progress(_stream_namespace("sd-member"))
+    assert old is not None and old.page_token and store["last_summary"].authoritative_complete
+    # The refusal run: the started stream's change page is refused and persisted as such — not as a
+    # failed start-token request — with its cursor and claims intact.
+    await _run(monkeypatch, state, ["member-file"], metas, store=store, **REFUSED, **options)
+    refused = state.get_progress(_stream_namespace("sd-member"))
+    assert refused.last_error == "stream_access_denied" and not refused.recovery_required
+    assert refused.page_token == old.page_token and _old_claims(state) == ["member-file"]
+    return state
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restart", [None, "at refusal", "at pending publication"])
+async def test_a_refused_started_stream_reroutes_its_file_through_the_user_log(tmp_path, monkeypatch, restart):
+    store: dict = {"reconciles": []}
+    state = await _member_then_refused(tmp_path, monkeypatch, f"refused-{restart or 'same'}.sqlite", store)
+    reconciled = _reconcile_count(store)
+    if restart == "at refusal":
+        state.close()
+        state = StateStore(str(tmp_path / "refused-fresh.sqlite"))
+
+    journey = []
+    for _ in range(5):
+        starts, runs, drives = await _run(monkeypatch, state, ["member-file"], METAS, store=store, **REFUSED)
+        binding = state.root_obligations(INTEGRATION, 5).get(("file", "member-file"))
+        journey.append((binding, starts, runs, store["last_summary"].authoritative_complete))
+        if binding is not None and binding.drive_id == "my-drive" and restart == "at pending publication":
+            restart = "done"
+            state.close()
+            state = StateStore(str(tmp_path / "pending-fresh.sqlite"))
+            continue
+        if store["last_summary"].authoritative_complete:
+            break
+        # Until the destination is verified and the retirement acknowledged, nothing reconciles and
+        # the refused stream's claims stand on the brain.
+        assert _reconcile_count(store) == reconciled
+        assert "sd-member" in store["progress"]["streams"]
+
+    handed = next(entry for entry in journey if entry[0] is not None and entry[0].drive_id == "my-drive")
+    binding, starts, runs, _ = handed
+    assert binding.handoff_sources == ("sd-member",)
+    # The user log's token was captured before it enumerated anything.
+    assert "my-drive" in starts and "my-drive" in next(snapshot for drive, snapshot in runs if drive == "my-drive")
+    assert store["last_summary"].authoritative_complete is True
+    assert state.get_progress(_stream_namespace("sd-member")) is None
+    assert "sd-member" not in store["progress"]["streams"]
+    reconcile_events = [event for event in store["events"] if event[0] == "reconcile"]
+    assert len(reconcile_events) == reconciled + 1 and "sd-member" not in reconcile_events[-1][1]
+    assert store["reconciles"][-1] == ["member-file"]
+    state.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("control", ["unknown membership", "still a member", "unreadable metadata", "folder root"])
+async def test_a_refused_stream_without_definitive_evidence_is_never_rerouted(tmp_path, monkeypatch, control):
+    store: dict = {"reconciles": []}
+    folder = {"kept-folder": {**_meta("kept-folder", "sd-member"), "mimeType": "application/vnd.google-apps.folder"}}
+    metas = {**METAS, **folder}
+    options = {"folder_ids": ("kept-folder",)} if control == "folder root" else {}
+    files = [] if control == "folder root" else ["member-file"]
+    state = StateStore(str(tmp_path / f"refused-{control.replace(' ', '-')}.sqlite"))
+    await _run(monkeypatch, state, files, metas, {"sd-member": "member"}, store, unopenable=(), real=True, **options)
+    membership = {"unknown membership": "forbidden", "still a member": "member"}.get(control, "nonmember")
+    run_metas = {k: v for k, v in metas.items() if k != "member-file"} if control == "unreadable metadata" else metas
+    for _ in range(3):
+        await _run(monkeypatch, state, files, run_metas, store=store, membership={"sd-member": membership},
+                   unopenable=("sd-member",), real=True, **options)
+    obligations = state.root_obligations(INTEGRATION, 5)
+    assert all(b.drive_id == "sd-member" and b.status in ("bound", "uncertain") and not b.handoff_sources
+               for b in obligations.values()), obligations
+    old = state.get_progress(_stream_namespace("sd-member"))
+    assert old is not None and old.last_error == "stream_access_denied"
+    assert "sd-member" in store["progress"]["streams"]
+    assert store["last_summary"].authoritative_complete is False
+    state.close()

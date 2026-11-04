@@ -620,6 +620,9 @@ class SelectedRootUnverified(RuntimeError):
 # What a stream is told when its drive's change log could not be opened. The text is a diagnostic
 # for people; whether a stream has started is read from its tokens (``_unstarted``), never from it.
 _START_UNAVAILABLE = "start token unavailable"
+# What a STARTED stream is told when the provider refuses its change log (a 403/404 that is not a
+# quota answer). Its cursor and claims stand; for explicit file roots it is probe eligibility (R57).
+_STREAM_ACCESS_DENIED = "stream_access_denied"
 
 
 def _provider_status(exc: Exception) -> int | None:
@@ -1755,18 +1758,28 @@ async def run_gdrive_stream(
                 return started is not None and _unstarted(started)
 
             def access_blocked(drive_id: str) -> bool:
-                """Unstarted, or started and waiting on a start token it cannot get (R56)."""
+                """Unstarted, started and waiting on a start token it cannot get (R56), or started
+                with its change log REFUSED (``stream_access_denied``, R57): a member who lost
+                membership keeps a valid cursor the provider no longer serves. Any of these only
+                makes the drive's explicit file roots ELIGIBLE for the conservative non-member probe
+                (readable metadata and a definitive ``drives.get`` 404); it is never read as a failed
+                start-token request, and nothing else about the stream changes."""
                 if start_blocked(drive_id):
                     return True
                 local = state.get_progress(StreamKey(
                     settings.team, integration_id, credential_identity(options), drive_id,
                 ).namespace(generation))
                 if local is not None:
-                    return _start_recovery_blocked(local)
+                    return _start_recovery_blocked(local) or bool(
+                        not _unstarted(local) and local.last_error == _STREAM_ACCESS_DENIED
+                    )
                 remote = _remote_stream(execution.progress, drive_id)
                 return bool(
-                    remote and not _unstarted(remote) and remote.get("recovery_required")
-                    and str(remote.get("last_error") or "").startswith(_START_UNAVAILABLE)
+                    remote and not _unstarted(remote) and (
+                        (remote.get("recovery_required")
+                         and str(remote.get("last_error") or "").startswith(_START_UNAVAILABLE))
+                        or remote.get("last_error") == _STREAM_ACCESS_DENIED
+                    )
                 )
 
             # Which streams exist depends on where each selected root lives, so every root is bound
@@ -2090,7 +2103,7 @@ async def run_gdrive_stream(
                     namespace_now = key.namespace(generation)
                     if state.get_progress(namespace_now) is not None:
                         state.update_progress(
-                            namespace_now, last_error="stream_access_denied", last_attempt_at=_now(),
+                            namespace_now, last_error=_STREAM_ACCESS_DENIED, last_attempt_at=_now(),
                         )
                     part = IngestSummary(
                         conn.name, failed=1, failure_categories={"stream_access_denied": 1},

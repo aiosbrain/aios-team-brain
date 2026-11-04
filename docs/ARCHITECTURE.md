@@ -1071,8 +1071,9 @@ is observed (`_consumed_drive`), so gaining or losing membership, or a move, is 
 streams. A 403 or any other inconclusive answer is never non-membership: a first binding keeps the
 containing drive (and its unavailable-stream handling), and a root the user log already consumes stays
 there until provider evidence moves it. A file root already bound to a Shared Drive whose stream is
-unstarted or waiting on a start token it cannot get (bound before routing, or by a member who lost
-membership) is reclassified each run on the same evidence (`_reclassify_nonmember_file_roots`): it is
+unstarted, waiting on a start token it cannot get, or started with its change log refused
+(`stream_access_denied`, AIO-1167 R57 — a member who lost membership keeps a cursor the provider no longer
+serves) is reclassified each run on the same evidence (`_reclassify_nonmember_file_roots`): it is
 recorded relocating toward the user log and keeps its claims through the ordinary hand-over. Every
 hand-over UNIONS the drive it left into the root's generation-scoped predecessor set
 (`selection_root_bindings.handoff_sources`, a legacy scalar `handoff_from` read as a one-drive set;
