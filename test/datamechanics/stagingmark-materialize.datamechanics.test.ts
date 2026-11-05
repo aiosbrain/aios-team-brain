@@ -161,16 +161,18 @@ describe("STAGINGMARK-1 — the wedged fleet, against the real migration", () =>
     }
   });
 
-  it("AC11 — a reconcile that fails partway leaves the marker UNSTAMPED", async () => {
+  it("AC11 — a reconcile that refuses leaves the marker UNSTAMPED and, since STAGINGMARK-5, no partial writes", async () => {
     const seed = await seedTeam();
     await ensureBuiltins(db(), seed.teamId);
 
-    // Squat the SECOND builtin slug, not the first. The diff review caught that squatting
-    // `everyone` makes this vacuous: `ensureBuiltins` iterates [everyone, external]
-    // (lib/access/groups.ts:110-113) and refuses on the squatter BEFORE inserting anything, so no
-    // partial write exists and the absent marker proves nothing. Squatting `external` means
-    // `everyone` IS inserted — the convergent write — and the refusal lands after it, in either
-    // team-iteration order (the `select id from teams` at :213 has no ORDER BY).
+    // Squat the SECOND builtin slug of a second team. Under the retired autocommit TypeScript
+    // reconcile this let `everyone` land for that team before the refusal, and this test used to
+    // REQUIRE that partial write. STAGINGMARK-5 (AIO-1132) deliberately supersedes it: the runtime
+    // owner now runs the frozen SQL `materialize_builtin_membership_once()` in one owned
+    // transaction, whose squatter preflight refuses before any mutation — so NO group, edge,
+    // materialization audit or marker may change. Proof that atomicity also holds for a failure
+    // AFTER real writes is the separate late-fault case in
+    // stagingmark5-runtime-owner.datamechanics.test.ts (AC-06), not this preflight refusal.
     const { data: other, error } = await db()
       .from("teams")
       .insert({ slug: `t-${randomUUID().slice(0, 8)}`, name: "partial" })
@@ -180,10 +182,23 @@ describe("STAGINGMARK-1 — the wedged fleet, against the real migration", () =>
     const otherId = (other as { id: string }).id;
     await db().from("groups").insert({ team_id: otherId, slug: "external", name: "squatter", is_builtin: false });
 
-    const result = await materializeBuiltinMembershipOnce(db());
-    expect(result.ok, "a fleet with an unbuildable team must not report success").toBe(false);
+    const pool = getPool();
+    const snapshot = async () => ({
+      groups: (await pool.query("select * from groups order by id")).rows,
+      edges: (await pool.query("select * from group_members order by group_id, member_id")).rows,
+      audits: (await pool.query("select * from audit_log where action = 'access.builtin_materialized' order by id")).rows,
+      marker: (await pool.query("select * from migration_markers where name = $1", [MARKER])).rows,
+    });
+    const before = await snapshot();
+    expect(before.marker).toEqual([]);
 
-    // BOTH halves, per the spec: the partial write landed …
+    const result = await materializeBuiltinMembershipOnce(db());
+    expect(result, "a fleet with an unbuildable team must not report success").toEqual({
+      ok: false,
+      error: "transaction SQL failed: PRET-4 refused: a non-builtin group holds a reserved slug",
+    });
+
+    // No autocommit partial write: in particular the formerly-required `everyone` row is absent …
     const { data: partial } = await db()
       .from("groups")
       .select("id")
@@ -191,10 +206,9 @@ describe("STAGINGMARK-1 — the wedged fleet, against the real migration", () =>
       .eq("slug", "everyone")
       .eq("is_builtin", true)
       .maybeSingle();
-    expect(partial, "the convergent write must have landed — otherwise this proves nothing about ordering").not.toBeNull();
+    expect(partial, "STAGINGMARK-5: the SQL preflight refuses before any write").toBeNull();
 
-    // … and the marker did NOT.
-    const { data: marker } = await db().from("migration_markers").select("name").eq("name", MARKER).maybeSingle();
-    expect(marker, "a partial reconcile must NOT stamp the marker — a retry has to be able to finish").toBeNull();
+    // … nothing else changed, and the marker did NOT stamp — a retry has to be able to finish.
+    expect(await snapshot()).toEqual(before);
   });
 });

@@ -423,6 +423,17 @@ predates the entire PRET series, which is why `v0.11.0` exists as the step.
    same reason as before: the boot materialization is best-effort and its retry lives in the
    scheduler, which `instrumentation.ts` starts **only when `INGEST_POLL_ENABLED !== "false"`**.
 
+   STAGINGMARK-5 also routes runtime boot, scheduler and attended recovery through this same SQL
+   gate and marker transaction. Normal PRET-6 preDeploy repairs the marker before current boot;
+   markerless runtime recovery is chiefly a restore/marker-loss case. Boot remains best-effort, and
+   a listening server or successful health response alone does not prove materialization — read
+   back the marker and relevant state. Before attended markerless recovery, drain older materializer
+   owners and avoid concurrent deploy DDL; also quiesce destructive corpus writers if an at-COMMIT
+   substrate guarantee is required. Runtime limits are 120 s per statement and 2 s per lock
+   acquisition, not a total recovery deadline. An unknown COMMIT outcome requires a fresh readback,
+   not immediate replay. The query above remains a fleet-global substrate check; it does not prove
+   every team's partitioning is complete. Residuals and rollback behavior: `docs/OPS.md` §11.
+
 5. **Point the service back at `main`** and deploy the retirement release.
 
 Full detail, including what auto-flip will and will not do for you: `RELEASE-NOTES-pret6.md`.

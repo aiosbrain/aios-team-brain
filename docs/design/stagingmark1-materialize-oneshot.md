@@ -261,6 +261,14 @@ guard; the USAGE line; the runbook section.
   marker upsert. Assert **both** that the partial write landed **and** that `migration_markers` holds
   no `pret4_builtin_materialize` row. *Round 2 LOW, accepted: a failure induced before any write would
   leave the marker absent trivially and prove nothing about marker-last ordering.*
+
+  > **Superseded (2026-10-03, STAGINGMARK-5 / AIO-1132).** The partial-write expectation above is
+  > historical and kept as written. The runtime now runs the frozen
+  > `materialize_builtin_membership_once()` SQL inside one owned transaction
+  > (`docs/design/stagingmark5-runtime-owner.md`), so a failure after real writes rolls back groups,
+  > edges, audits and the marker together (its AC-06). This slice's AC11 case in
+  > `test/datamechanics/stagingmark-materialize.datamechanics.test.ts` now asserts that the squatter
+  > refusal leaves the marker unstamped and changes no group, edge, materialization audit or marker.
 - **AC12 — the runbook names the recovery, runnably (docs + unit guard):** `docs/OPS.md` §11 gains a
   subsection containing the refusal message **verbatim**, the command in `npm run admin -- …` form,
   where it is run from (a checked-out tree of the candidate release with `DATABASE_URL` set — **not**

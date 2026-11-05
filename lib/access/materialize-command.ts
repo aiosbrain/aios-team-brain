@@ -11,9 +11,11 @@ import { readStagingMarker } from "@/lib/env/staging-marker";
  * WHY THIS EXISTS. STAGINGMARK-1 provided attended recovery for the markerless fleet
  * observed on staging 2026-09-05 (deploy 2e67246e). STAGINGMARK-2 now reconciles such
  * fleets during PRET-6 preDeploy through the frozen SQL function in schema.sql.
- * The TypeScript materializer remains callable from boot, scheduler and this command;
- * both historical writers stamp only after reconciliation. This command remains useful
- * for an operator inspecting a fleet or recovering an older release.
+ * Since STAGINGMARK-5 boot, scheduler and this command reach that SAME function through one
+ * bounded service (`materializeBuiltinMembershipOnce`, lib/access/groups.ts) — there is no
+ * second TypeScript writer of the marker. This command remains useful for an operator
+ * inspecting a fleet or recovering an older release. Its `readState` pre-checks are ADVISORY:
+ * the function re-checks marker and substrate itself after taking its locks.
  *
  * WHY THE BEHAVIOUR LIVES HERE AND NOT IN `scripts/admin.ts`. That file USED TO call `main()` at
  * module scope, so a test importing it executed the CLI — the same reason `formatAccessHealth` was
@@ -43,7 +45,11 @@ export type FleetState = {
   contentWithoutSubstrate: boolean;
 };
 
-export type MaterializeResult = { ok: boolean; ran?: boolean; error?: string };
+/**
+ * `outcomeUnknown`: the COMMIT call did not complete with an acknowledgement (including a failure
+ * before COMMIT was transmitted); the transaction may or may not have committed the stamp.
+ */
+export type MaterializeResult = { ok: boolean; ran?: boolean; error?: string; outcomeUnknown?: true };
 
 export type MaterializeDeps = {
   readState: () => Promise<FleetState>;
@@ -143,8 +149,11 @@ const fleetLine = (state: FleetState): string =>
  *   • a failure cannot say "the marker is NOT stamped" — it is never re-read, and a concurrent boot
  *     or tick may have stamped it after our read. It says what this RUN did instead.
  *   • success cannot report `state.teams` as the number reconciled — that count came from the
- *     pre-write read, and the materializer re-reads teams itself (lib/access/groups.ts:213), so a
+ *     pre-write read, and the SQL materializer re-reads teams itself under its locks, so a
  *     team created in between is reconciled but uncounted. The count is labelled as of the check.
+ *   • (STAGINGMARK-5) a THROW or an unacknowledged COMMIT (`outcomeUnknown`) cannot say "this run
+ *     did not stamp" either — the stamp may have committed. Only a returned failure whose
+ *     transaction is known to have rolled back keeps that wording.
  *
  * Every reachable outcome has a contract. The ones that are easy to omit, and were: a failing
  * `readState`; a `materialize` that THROWS rather than returning `{ok:false}` (boot and tick both
@@ -217,9 +226,28 @@ export async function runMaterializeCommand(
   try {
     result = await deps.materialize();
   } catch (err) {
-    return { lines: [fleet, `✗ materialization threw: ${errText(err)} — this run did not stamp the marker.`], exitCode: 1 };
+    // An unclassified throw has no confirmed outcome (STAGINGMARK-5 spec step 7): nothing here
+    // knows whether a transaction reached COMMIT, so this must not claim the run did not stamp.
+    return {
+      lines: [
+        fleet,
+        `✗ materialization threw: ${errText(err)} — its outcome is unconfirmed; the marker may or may not have been stamped.`,
+        `  Re-run this command without --confirm to check the marker before acting.`,
+      ],
+      exitCode: 1,
+    };
   }
 
+  if (!result.ok && result.outcomeUnknown) {
+    return {
+      lines: [
+        fleet,
+        `✗ materialization outcome unknown: ${result.error ?? "unknown error"} — the marker and builtin membership may already have been committed.`,
+        `  Re-run this command without --confirm to check the marker before acting.`,
+      ],
+      exitCode: 1,
+    };
+  }
   if (!result.ok) {
     return {
       lines: [fleet, `✗ materialization failed: ${result.error ?? "unknown error"} — this run did not stamp the marker.`],

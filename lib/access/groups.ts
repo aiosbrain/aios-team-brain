@@ -1,5 +1,7 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
+import { isTransactionCapableDbClient } from "@/lib/db/types";
+import { TransactionExecutionError } from "@/lib/db/pg/tx";
 import { audit } from "@/lib/api/audit";
 import { isBuiltinEligible, isPrincipal } from "@/lib/access/eligibility";
 import {
@@ -190,92 +192,79 @@ export async function writeInviteDefaultMembership(
   return { ok: true };
 }
 
+/** STAGINGMARK-5 per-statement and per-lock caps, transaction-local to the owned transaction. */
+const MATERIALIZE_STATEMENT_TIMEOUT = "120000ms";
+const MATERIALIZE_LOCK_TIMEOUT = "2000ms";
+
+export type MaterializeOnceResult = WriteResult & {
+  ran?: boolean;
+  /**
+   * The COMMIT call did not complete with an acknowledgement (including a failure before COMMIT was
+   * transmitted); the transaction may or may not have committed the marker and membership.
+   */
+  outcomeUnknown?: true;
+};
+
+function describeRows(rows: unknown[]): string {
+  const text = JSON.stringify(rows) ?? String(rows);
+  return text.length > 200 ? `${text.slice(0, 200)}…` : text;
+}
+
 /**
- * PRET-4's ONE-TIME fleet materialization (spec §3.2): freeze the tier-derived builtin
- * membership as explicit state. Per team: ADD the rows the retired recompute's predicate
- * implies — for every member kind, per their pre-cutover tier (posture parity, cold-read H1;
- * invited members included, inert until active) — and DROP builtin rows the tier predicate
- * refutes (the LAST legal tier-derived delete, closing the stale-row class the oracle's
- * retiring conjunct kept inert). Marker discipline (SR14, deliberately NOT the PRET-3
- * claim-first pattern): the reconcile runs FIRST and the marker is written LAST, only after
- * every team succeeded — idempotent per team, so a crash retries in full and racing replicas
- * repeat converging statements; a permanently-suppressed half-materialization is impossible.
+ * PRET-4's ONE-TIME fleet materialization — STAGINGMARK-5's single bounded runtime owner
+ * (spec docs/design/stagingmark5-runtime-owner.md v2.2). The algorithm is NOT here: it is the
+ * frozen SQL function `materialize_builtin_membership_once()` (postgres/schema.sql), which the
+ * PRET-6 migration already calls. It reads the marker, takes its table locks, refuses squatters
+ * and a content-without-substrate fleet AFTER the final lock, reconciles every team's builtin
+ * rows per tier, audits best-effort, and stamps `pret4_builtin_materialize` LAST. The duplicate
+ * autocommit TypeScript reconcile that used to live here could stamp over a fleet the SQL gate
+ * refuses (STAGINGMARK-5 AC-01/02) and is retired.
+ *
+ * This service owns only the transaction around that one statement:
+ *  - a client without transaction capability is refused, and a transaction-bound client is refused
+ *    by the engine's existing nested guard — there is no global-pool or bare-RPC fallback;
+ *  - engine BEGIN → READ COMMITTED (before any snapshot-creating statement, so the function's
+ *    post-lock check sees a cascade that committed while it waited; a caller's repeatable-read
+ *    default is never inherited) → local 120000ms statement / 2000ms lock caps → the one SELECT;
+ *  - exactly one boolean row, validated INSIDE the callback so a malformed result rolls back
+ *    rather than committing; `ran` is reported only after the engine's COMMIT is acknowledged;
+ *  - failures are converted OUTSIDE the transaction: the engine rethrows a recorded SQL failure
+ *    even if a callback catches it, prefixed `transaction SQL failed: ` with SQLSTATE on `code`.
+ *    An unacknowledged COMMIT is `outcomeUnknown:true` — never replayed, never reported as rolled
+ *    back. Every path ends the owned transaction, so the local caps never outlive it.
  */
-export async function materializeBuiltinMembershipOnce(db: DbClient): Promise<WriteResult & { ran?: boolean }> {
-  const { data: marker, error: mkErr } = await db
-    .from("migration_markers")
-    .select("name")
-    .eq("name", PRET4_MATERIALIZE_MARKER)
-    .maybeSingle();
-  if (mkErr) return { ok: false, error: `marker read failed: ${mkErr.message}` };
-  if (marker) return { ok: true, ran: false }; // already materialized (any replica, any boot)
-
-  const { data: teams, error: tErr } = await db.from("teams").select("id");
-  if (tErr) return { ok: false, error: `teams read failed: ${tErr.message}` };
-
-  for (const t of (teams ?? []) as { id: string }[]) {
-    const ensured = await ensureBuiltins(db, t.id);
-    if (!ensured.ok) return { ok: false, error: `team ${t.id}: ${ensured.error}` };
-
-    const { data: groups, error: gErr } = await db
-      .from("groups")
-      .select("id, slug")
-      .eq("team_id", t.id)
-      .eq("is_builtin", true)
-      .in("slug", [EVERYONE_SLUG, EXTERNAL_SLUG]);
-    if (gErr) return { ok: false, error: `team ${t.id}: ${gErr.message}` };
-    const bySlug = new Map((groups ?? []).map((g: { id: string; slug: string }) => [g.slug, g.id]));
-
-    const { data: members, error: memErr } = await db
-      .from("members")
-      .select("id, kind, is_connector, status, tier, display_name")
-      .eq("team_id", t.id);
-    if (memErr) return { ok: false, error: `team ${t.id}: ${memErr.message}` };
-
-    for (const slug of [EVERYONE_SLUG, EXTERNAL_SLUG]) {
-      const groupId = bySlug.get(slug);
-      if (!groupId) return { ok: false, error: `team ${t.id}: builtin ${slug} missing after ensure` };
-      const tier = slug === EVERYONE_SLUG ? "team" : "external";
-      // EVERY member kind, per tier — the posture source. Grant-inertness for non-humans is
-      // the oracle's read-side eligibility, unchanged and dm-pinned.
-      const want = new Set(((members ?? []) as MemberRow[]).filter((m) => m.tier === tier).map((m) => m.id));
-      const { data: current, error: cErr } = await db
-        .from("group_members")
-        .select("member_id")
-        .eq("team_id", t.id)
-        .eq("group_id", groupId);
-      if (cErr) return { ok: false, error: `team ${t.id}: ${cErr.message}` };
-      const have = new Set(((current ?? []) as { member_id: string }[]).map((r) => r.member_id));
-
-      const toAdd = [...want].filter((id) => !have.has(id));
-      if (toAdd.length > 0) {
-        const { error } = await db
-          .from("group_members")
-          .upsert(toAdd.map((member_id) => ({ team_id: t.id, group_id: groupId, member_id })), { onConflict: "group_id,member_id" });
-        if (error) return { ok: false, error: `team ${t.id}: ${error.message}` };
-      }
-      const toDrop = [...have].filter((id) => !want.has(id));
-      if (toDrop.length > 0) {
-        const { error } = await db
-          .from("group_members")
-          .delete()
-          .eq("team_id", t.id)
-          .eq("group_id", groupId)
-          .in("member_id", toDrop);
-        if (error) return { ok: false, error: `team ${t.id}: ${error.message}` };
-      }
-      if (toAdd.length > 0 || toDrop.length > 0) {
-        await auditWrite(db, t.id, null, "access.builtin_materialized", groupId, { slug, added: toAdd, removed: toDrop });
-      }
-    }
+export async function materializeBuiltinMembershipOnce(db: DbClient): Promise<MaterializeOnceResult> {
+  if (!isTransactionCapableDbClient(db)) {
+    return { ok: false, error: "pret4 builtin materialization refused: transaction-capability-required" };
   }
-
-  // Marker LAST — only a fully-succeeded fleet reconcile claims it.
-  const { error: stampErr } = await db
-    .from("migration_markers")
-    .upsert({ name: PRET4_MATERIALIZE_MARKER }, { onConflict: "name" });
-  if (stampErr) return { ok: false, error: `marker write failed: ${stampErr.message}` };
-  return { ok: true, ran: true };
+  try {
+    const ran = await db.transaction(async (session) => {
+      await session.executeSql("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
+      await session.executeSql("SELECT set_config('statement_timeout', $1, true)", [MATERIALIZE_STATEMENT_TIMEOUT]);
+      await session.executeSql("SELECT set_config('lock_timeout', $1, true)", [MATERIALIZE_LOCK_TIMEOUT]);
+      const { rows } = await session.executeSql<{ result?: unknown }>(
+        "SELECT materialize_builtin_membership_once() AS result"
+      );
+      const result = rows.length === 1 ? rows[0]?.result : undefined;
+      if (typeof result !== "boolean") {
+        throw new Error(
+          `materialize_builtin_membership_once() returned a malformed result: expected exactly one row ` +
+            `with a boolean result, got ${describeRows(rows)}`
+        );
+      }
+      return result;
+    });
+    return { ok: true, ran };
+  } catch (error) {
+    if (error instanceof TransactionExecutionError && error.unknownCommit) {
+      return {
+        ok: false,
+        outcomeUnknown: true,
+        error: `${error.message} — the marker and builtin membership may already be committed; re-read the marker before acting`,
+      };
+    }
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
 }
 
 /** Create an ordinary (non-builtin, non-singleton) group. */

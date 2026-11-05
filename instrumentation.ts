@@ -44,9 +44,11 @@ export async function register() {
 
   // PRET-4 one-time builtin materialization (spec §3.2, cold-read H2/L1): run at BOOT, awaited
   // BEFORE the scheduler starts, so on a healthy boot the fleet's builtin posture rows are
-  // explicit before any tick assesses or serves against them. Failure is loud but never fails
-  // boot — the marker stays unclaimed, the oracle/posture legacy conjunct keeps the window
-  // fail-closed, and the scheduler-tick slot retries until it succeeds.
+  // explicit before any tick assesses or serves against them. The service runs the frozen SQL
+  // owner in one bounded transaction (STAGINGMARK-5); its post-lock checks refuse a squatter or a
+  // content-without-substrate fleet and roll back. Failure is loud but never fails boot: on a known
+  // rollback the marker stays unclaimed; on an unacknowledged COMMIT (`outcomeUnknown`) it may
+  // already be stamped. Either way the scheduler-tick slot retries the same marker-aware owner.
   try {
     const { adminClient } = await import("@/lib/db/admin");
     const { materializeBuiltinMembershipOnce } = await import("@/lib/access/groups");

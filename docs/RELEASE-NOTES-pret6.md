@@ -50,19 +50,26 @@ membership edits. The single frozen SQL definition lives in `postgres/schema.sql
 migration only calls it. The attended `npm run admin -- materialize-builtins` command remains
 available for inspecting a target and older-release recovery (dry-run first; `docs/OPS.md` §11).
 
+STAGINGMARK-5 makes boot, scheduler retry and attended recovery invoke that same frozen SQL
+through one READ COMMITTED transaction. Runtime membership and marker changes are atomic; no public
+RPC, schema change or duplicate reconciliation algorithm is added. Work is reported only after an
+acknowledged COMMIT; a lost acknowledgement remains an unknown outcome requiring readback.
+
 A reserved-slug squatter or a reconcile/drop error fails the deploy. The PRET-6 statement rolls
 back membership, marker and drops together; earlier schema and migrations have already committed
 because the loader replays files without a wrapping transaction. Correct the reported error and
 retry. Never delete a materialization marker to trigger repair: replay could restore deliberately
 removed memberships.
 
-On a marker miss, five ordered SHARE ROW EXCLUSIVE locks serialize new callers, with a marker
-re-read after waiting. Waiting is bounded **per statement** by the loader's `lock_timeout`
-(`PG_MIGRATION_LOCK_TIMEOUT_MS`, default 15 s); the number of waiting statements is data-dependent,
-so there is no total bound across
-those locks and the column-drop lock upgrade, with no total-runtime or fleet-size guarantee.
-This relies on no application transaction spanning two locked tables today; old multi-statement
-TypeScript materializers remain outside that serialization protocol. Details: `docs/OPS.md` §11.
+On a marker miss, the five ordered SHARE ROW EXCLUSIVE locks serialize participating callers and
+the function rechecks the marker and substrate after locking. Existing governed SHARE transactions
+follow the same relative order and can contend; older TypeScript materializers remain outside the
+protocol and must be drained before attended markerless recovery. PRET-6 inherits the loader's
+per-lock wait limit (`PG_MIGRATION_LOCK_TIMEOUT_MS`, default 15 s). Runtime calls use
+transaction-local 120 s per-statement and 2 s per-lock limits. Neither is a total deadline. A
+queued deploy DDL request can stall later readers, so avoid concurrent deploys during recovery.
+`docs/OPS.md` §11 covers orphan/idle limits, unknown COMMIT, destructive-purge and
+best-effort-audit residuals.
 
 ## What changes for operators
 

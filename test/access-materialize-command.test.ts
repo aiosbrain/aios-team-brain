@@ -160,9 +160,46 @@ describe("STAGINGMARK-1 — materialize-builtins handler", () => {
       );
       expect(out.exitCode).not.toBe(0);
       expect(out.lines.join("\n")).toContain("pool exhausted");
-      expect(out.lines.join("\n")).toMatch(/this run did not stamp the marker/i);
+      // STAGINGMARK-5 spec step 7: an unclassified throw has no confirmed outcome, so it must not
+      // claim this run did not stamp — it reports the uncertainty and asks for a marker recheck.
+      expect(out.lines.join("\n")).not.toMatch(/did not stamp/i);
+      expect(out.lines.join("\n")).toMatch(/outcome is unconfirmed/i);
+      expect(out.lines.join("\n")).toMatch(/check the marker/i);
       // …and it must NOT assert the marker is absent, which this run never re-read.
       expect(out.lines.join("\n")).not.toMatch(/marker is NOT stamped/i);
+    });
+  });
+
+  describe("STAGINGMARK-5 — an uncertain outcome is never reported as a known rollback", () => {
+    it("a returned outcomeUnknown failure exits non-zero, says the marker may be committed, and asks for a recheck", async () => {
+      const out = await runMaterializeCommand(
+        {
+          readState: staging(),
+          materialize: async () => ({
+            ok: false,
+            outcomeUnknown: true,
+            error: "COMMIT failed; outcome unknown and will not be replayed: socket hang up",
+          }),
+        },
+        { confirm: true, confirmProduction: true }
+      );
+      const text = out.lines.join("\n");
+      expect(out.exitCode).not.toBe(0);
+      expect(text).toContain("socket hang up");
+      expect(text).toMatch(/may already have been committed/i);
+      expect(text).toMatch(/check the marker/i);
+      expect(text).not.toMatch(/did not stamp/i);
+      expect(text).not.toMatch(/materialization ran|already completed/i);
+    });
+
+    it("a returned failure WITHOUT outcomeUnknown keeps the known-rollback wording (AC4 unchanged)", async () => {
+      const out = await runMaterializeCommand(
+        { readState: staging(), materialize: async () => ({ ok: false, error: "transaction SQL failed: boom" }) },
+        { confirm: true, confirmProduction: true }
+      );
+      expect(out.exitCode).not.toBe(0);
+      expect(out.lines.join("\n")).toMatch(/this run did not stamp the marker/i);
+      expect(out.lines.join("\n")).not.toMatch(/may already have been committed/i);
     });
   });
 
