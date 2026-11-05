@@ -504,6 +504,23 @@ async function peopleActivityDigest(db: DbClient, teamId: string): Promise<strin
   return ["", `## Activity by person (Slack/issues/docs, last ${PEOPLE_WINDOW_DAYS}d)`, ...lines].join("\n");
 }
 
+/** A settled outcome: the exact value, or the original rejection reason. */
+type Settled<T> = { ok: true; value: T } | { ok: false; error: unknown };
+
+/** Observe a started operation NOW (it never rejects), keeping its outcome for a later consumer. */
+function settle<T>(operation: Promise<T>): Promise<Settled<T>> {
+  return operation.then(
+    (value): Settled<T> => ({ ok: true, value }),
+    (error: unknown): Settled<T> => ({ ok: false, error }),
+  );
+}
+
+/** The value, or the ORIGINAL error rethrown unchanged — never translated into an empty result. */
+function unwrapSettled<T>(outcome: Settled<T>): T {
+  if (!outcome.ok) throw outcome.error;
+  return outcome.value;
+}
+
 /**
  * Tier-filtered retrieval: recall-friendly FTS + always-include structured context
  * (recent decisions, open/blocked tasks, projects, compact graph digest, Graphiti temporal facts,
@@ -565,7 +582,10 @@ async function nativeRetrieve(
   let graphScope: { covered: number; total: number } | undefined;
   // AIO-1167 R76: the items behind the graph facts admitted to the model (output provenance).
   let graphItems: { itemIds: string[]; complete: boolean } = { itemIds: [], complete: true };
-  const graphFactsP = (async (): Promise<GraphFact[]> => {
+  // OWNED from creation: unrelated retrieval legs are awaited before this one is consumed, and a
+  // rejection settling in between would be an unhandled rejection. `settle` observes it at once and
+  // carries the exact value or the ORIGINAL error to the consumption point below, where it is rethrown.
+  const graphFactsP = settle((async (): Promise<GraphFact[]> => {
     // Configured check FIRST (review Medium 8): a default no-Graphiti install must not pay team,
     // project, arming, or aggregate reads — let alone latch WRITES — for a leg that cannot run.
     if (!new GraphitiClient().configured) return [];
@@ -586,7 +606,7 @@ async function nativeRetrieve(
       );
       return [];
     }
-  })();
+  })());
   // Optional dense (semantic) passage search — pgvector. Runs concurrently; resolves to [] unless
   // EMBEDDINGS_URL is set AND the pgvector schema is loaded (default installs stay pure-FTS).
   // Enforcement is IN-QUERY (visArr), like the FTS leg — see denseSearch (Codex B3 Medium).
@@ -874,7 +894,7 @@ async function nativeRetrieve(
   // 2c. Semantic expansion via Graphiti (the graph search ran in parallel above). Use the facts'
   // entity/relationship terms to expand the FTS and surface items the literal keyword search missed.
   // No-op when Graphiti is unconfigured / returned nothing → pure keyword behavior, no regression.
-  const graphFacts = await graphFactsP;
+  const graphFacts = unwrapSettled(await graphFactsP);
   const expansion = graphExpansionQuery(graphFacts);
   if (expansion) {
     const semHits = await rankedFtsSearch(teamId, tier, expansion, 10, channel, visArr);

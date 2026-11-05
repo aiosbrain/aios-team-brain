@@ -37,6 +37,10 @@ const G = "https://www.googleapis.com/auth/";
 const FILE = `${G}drive.file`;
 const READONLY = `${G}drive.readonly`;
 
+// These fixtures publish with `email: null, emailVerified: false`: no Google identity can be linked, so
+// the publication's identity outcome is `unresolved` for both the subject and the email.
+const UNRESOLVED_IDENTITY = { subject: "unresolved", email: "unresolved" } as const;
+
 const admin = vi.hoisted(() => ({ teamId: "", memberId: "" }));
 vi.mock("@/lib/auth/guard", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/auth/guard")>()),
@@ -293,7 +297,7 @@ describe("the publisher reuses a stored credential only within its recorded gran
     const seed = await seedTeam();
     await connection(seed, "reuse-ok", credential("files", [FILE]));
     await expect(publishGoogleDriveOAuthCredential(publication(seed, "reuse-ok", { scopes: ["openid", FILE] })))
-      .resolves.toEqual({ status: "enabled" });
+      .resolves.toEqual({ status: "enabled", identity: UNRESOLVED_IDENTITY });
     const after = await snapshot(seed.teamId, "reuse-ok");
     const secret = JSON.parse(decryptSecret(after.integration.secret_ciphertext)) as Record<string, unknown>;
     expect(secret).toMatchObject({ refresh_token: "stored-refresh", grant_mode: "files", scopes: [FILE] });

@@ -28,6 +28,10 @@ import { approvedAudienceProject, db, seedTeam, type Seed } from "./helpers";
  */
 
 const DRIVE_FILE = "https://www.googleapis.com/auth/drive.file";
+
+// These fixtures publish with `email: null, emailVerified: false`: no Google identity can be linked, so
+// the publication's identity outcome is `unresolved` for both the subject and the email.
+const UNRESOLVED_IDENTITY = { subject: "unresolved", email: "unresolved" } as const;
 const STORED = {
   client_id: "oauth-client", client_secret: "client-secret", refresh_token: "old-refresh",
   token_uri: "https://oauth2.googleapis.com/token", scopes: [DRIVE_FILE], grant_mode: "files",
@@ -120,7 +124,7 @@ describe("publication status matrix (R43 F2, real Postgres)", () => {
   it("a connection the publication creates starts enabled", async () => {
     const seed = await seedTeam();
     await admin(seed);
-    await expect(reconnect(seed, "brand-new")).resolves.toEqual({ status: "enabled" });
+    await expect(reconnect(seed, "brand-new")).resolves.toEqual({ status: "enabled", identity: UNRESOLVED_IDENTITY });
     expect((await row(seed, "brand-new"))?.status).toBe("enabled");
   });
 
@@ -133,7 +137,7 @@ describe("publication status matrix (R43 F2, real Postgres)", () => {
     const conn = await connection(seed, "matrix", opts);
     const before = await row(seed, "matrix");
 
-    await expect(reconnect(seed, "matrix")).resolves.toEqual({ status: expected });
+    await expect(reconnect(seed, "matrix")).resolves.toEqual({ status: expected, identity: UNRESOLVED_IDENTITY });
 
     const after = await row(seed, "matrix");
     expect(after?.status).toBe(expected);
@@ -155,7 +159,7 @@ describe("a reconnected paused connection reads nothing until Resume (R43 F2)", 
       access_token: "broker-access", expires_in: 600, scope: DRIVE_FILE,
     }), { status: 200, headers: { "content-type": "application/json" } }));
 
-    await expect(reconnect(seed, "paused-reconnect")).resolves.toEqual({ status: "disabled" });
+    await expect(reconnect(seed, "paused-reconnect")).resolves.toEqual({ status: "disabled", identity: UNRESOLVED_IDENTITY });
 
     const refused = await acquire(key, seed, conn.id);
     expect(refused.response.status).toBe(409);
@@ -196,7 +200,7 @@ describe("pause × reconnect, both orders, under the connection lock (R43 F2)", 
       await holder.query("rollback").catch(() => undefined);
       holder.release();
     }
-    await expect(publishing).resolves.toEqual({ status: "disabled" });
+    await expect(publishing).resolves.toEqual({ status: "disabled", identity: UNRESOLVED_IDENTITY });
     expect((await row(seed, "pause-first"))?.status).toBe("disabled");
   }, 30_000);
 
@@ -213,7 +217,7 @@ describe("pause × reconnect, both orders, under the connection lock (R43 F2)", 
     } finally {
       held.release();
     }
-    await expect(publishing).resolves.toEqual({ status: "enabled" });
+    await expect(publishing).resolves.toEqual({ status: "enabled", identity: UNRESOLVED_IDENTITY });
     await pausing;
     expect((await row(seed, "publish-first"))?.status).toBe("disabled");
   }, 30_000);
@@ -231,7 +235,7 @@ describe("pause × reconnect, both orders, under the connection lock (R43 F2)", 
     } finally {
       held.release();
     }
-    await expect(publishing).resolves.toEqual({ status: "disabled" });
+    await expect(publishing).resolves.toEqual({ status: "disabled", identity: UNRESOLVED_IDENTITY });
     await resuming;
     expect((await row(seed, "resume-after"))?.status).toBe("enabled");
   }, 30_000);
