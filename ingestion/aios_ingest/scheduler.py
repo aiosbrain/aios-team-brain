@@ -20,7 +20,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from .config import BrainSettings, Connection
 from .engine import run_connection
 from .state import Channel, StateStore
-from .gdrive_sync import run_gdrive_stream
+from .gdrive_sync import raised_execution, run_gdrive_stream
 from .selections import bind_local_gdrive, merge_selections
 
 log = logging.getLogger(__name__)
@@ -163,13 +163,21 @@ def _gdrive_exception_summary(conn: Connection, row: dict, exc: Exception):
     connection — never invented: a row without an id yields none, and the run stays a local
     diagnostic. Nothing was acknowledged, so backlog stays unknown and no completion is claimed;
     the coordinator's own cleanup already released the lease and left progress and hints pending.
+
+    A run that raised AFTER acquiring keeps the execution it ran under (AIO-1167 R84): the resolved
+    integration id and the frozen ``{generation, fence, owner}`` carried by the exception — never a
+    lookup of the current authority — so the brain judges this failure against the authority that
+    produced it. A failure before acquisition names none and stays an unbound diagnostic.
     """
     from .engine import IngestSummary
     log.warning("Drive poll for %s raised %s; reporting it as %s",
                 conn.name, type(exc).__name__, _COORDINATOR_ERROR)
+    raised = raised_execution(exc)
     return IngestSummary(
         conn.name, failed=1, failure_categories={_COORDINATOR_ERROR: 1},
-        backlog=None, integration_id=str(row.get("id") or "") or None,
+        backlog=None,
+        integration_id=raised.integration_id if raised else (str(row.get("id") or "") or None),
+        execution=dict(raised.execution) if raised else None,
     )
 
 
@@ -317,7 +325,13 @@ async def _manual_gdrive_job(
         # never reach the brain; only the class is logged here, for the operator.
         log.warning("manual Drive run for %s raised %s; reporting it as %s",
                     connection.name, type(exc).__name__, _COORDINATOR_ERROR)
-        summary = IngestSummary(connection.name, failed=1, failure_categories={_COORDINATOR_ERROR: 1})
+        # The execution the run had acquired, if any (AIO-1167 R84) — never looked up now.
+        raised = raised_execution(exc)
+        summary = IngestSummary(
+            connection.name, failed=1, failure_categories={_COORDINATOR_ERROR: 1},
+            integration_id=raised.integration_id if raised else None,
+            execution=dict(raised.execution) if raised else None,
+        )
         status = "failed"
         error = _COORDINATOR_ERROR
     async with BrainClient(settings.base_url, settings.api_key, settings.team) as client:

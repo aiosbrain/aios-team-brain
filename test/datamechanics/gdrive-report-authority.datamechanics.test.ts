@@ -364,3 +364,55 @@ describe("no execution identity: truthful diagnostics, never success or progress
     expect(await gdriveHealthy(c)).toBe(false);
   });
 });
+
+/**
+ * AIO-1167 R84 — a run that RAISED after acquiring is reported as a sanitized `coordinator_error` failure
+ * naming the execution it ran under (the sidecar carries it through the exception). Delivered after the
+ * authority moved on, that bound failure is refused and changes neither the current success nor the
+ * failure streak; with no transition it is an ordinary, observable failure.
+ */
+describe("a bound exceptional failure is judged against the authority that produced it", () => {
+  const CRASH = { status: "failed", failed: 1, error: "coordinator_error", backlog: null, authoritativeComplete: false };
+  const MOVES: Record<string, (c: C) => Promise<void>> = {
+    "scope change": TRANSITIONS["scope change"],
+    reconnect: TRANSITIONS.reconnect,
+    "pause→resume": async (c) => {
+      const admin = { teamId: c.seed.teamId, memberId: c.seed.memberId };
+      await setIntegrationStatus(db(), admin, c.integrationId, "disabled");
+      await setIntegrationStatus(db(), admin, c.integrationId, "enabled");
+    },
+  };
+
+  it.each(Object.keys(MOVES))("after a %s: refused for scheduled and manual, current success and streak untouched", async (name) => {
+    const c = await connection();
+    const raised = await ran(c); // the execution the raising run held, released by its cleanup
+    await MOVES[name](c);
+    const current = await ran(c);
+    expect((await scheduled(c, COMPLETE, current)).status).toBe(200);
+    expect(await ledger(c)).toEqual([true]);
+    const claim = await claimManual(c);
+
+    expect(await scheduled(c, CRASH, raised)).toMatchObject({ status: 409, code: "stale_execution" });
+    expect(await manual(c, claim, CRASH, raised)).toMatchObject({ status: 409, code: "stale_execution" });
+
+    expect(await ledger(c)).toEqual([true]);
+    expect(await gdriveHealthy(c)).toBe(true);
+    const after = await status(c);
+    expect(after.latestReport).toMatchObject({ status: "complete" });
+    expect(after.latestSuccess).toMatchObject({ status: "complete" });
+    const { rows } = await getPool().query<{ status: string }>(
+      `select status from gdrive_run_requests where id=$1`, [claim.requestId]);
+    expect(rows[0].status).toBe("running");
+  });
+
+  it("with no transition the bound exceptional failure stays observable (scheduled and manual)", async () => {
+    const c = await connection();
+    expect((await scheduled(c, CRASH, await ran(c))).status).toBe(200);
+    expect(await ledger(c)).toEqual([false]);
+    expect((await status(c)).latestReport).toMatchObject({ status: "failed", error: "coordinator_error" });
+    const claim = await claimManual(c);
+    expect((await manual(c, claim, CRASH, await ran(c))).status).toBe(200);
+    expect(await ledger(c)).toEqual([false, false]);
+    expect(await gdriveHealthy(c)).toBe(false);
+  });
+});

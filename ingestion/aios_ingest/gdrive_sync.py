@@ -1685,6 +1685,25 @@ def read_change_page(
     )
 
 
+@dataclass(frozen=True)
+class RaisedExecution:
+    """The execution a RAISING run had acquired (AIO-1167 R84): its resolved integration id and the
+    frozen ``{generation, fence, owner}`` — exactly what a returned summary would have named."""
+
+    integration_id: str
+    execution: dict[str, Any]
+
+
+_RAISED_EXECUTION = "_aios_gdrive_raised_execution"
+
+
+def raised_execution(exc: BaseException) -> RaisedExecution | None:
+    """The execution ``exc`` escaped from, when ``run_gdrive_stream`` had acquired one; ``None`` for a
+    failure before acquisition (it ran under no execution and reports none)."""
+    value = getattr(exc, _RAISED_EXECUTION, None)
+    return value if isinstance(value, RaisedExecution) else None
+
+
 async def run_gdrive_stream(
     settings: BrainSettings,
     conn: Connection,
@@ -1696,10 +1715,21 @@ async def run_gdrive_stream(
 
     The identity is captured once, from THIS run's acquisition, and attached to whatever summary the
     run returns — never looked up again when the outcome is reported, so a report delivered after a
-    scope, reconnect or fence transition still names the authority it actually ran under."""
-    acquired: list[dict[str, Any]] = []
-    summary = await _run_gdrive_stream_acquired(settings, conn, state, max_work=max_work, acquired=acquired)
-    return dataclasses.replace(summary, execution=dict(acquired[0]) if acquired else None)
+    scope, reconnect or fence transition still names the authority it actually ran under.
+
+    A run that RAISES after acquiring (provider setup, any coordinator error) keeps that identity too
+    (R84): it travels on the propagating exception itself — same type, same traceback, the lease
+    already released by the run's own cleanup — and the reporting handlers read it with
+    ``raised_execution``. Cancellation is a ``BaseException`` and is never tagged: it propagates
+    unchanged and is never reported."""
+    acquired: list[RaisedExecution] = []
+    try:
+        summary = await _run_gdrive_stream_acquired(settings, conn, state, max_work=max_work, acquired=acquired)
+    except Exception as exc:
+        if acquired:
+            setattr(exc, _RAISED_EXECUTION, acquired[0])
+        raise
+    return dataclasses.replace(summary, execution=dict(acquired[0].execution) if acquired else None)
 
 
 async def _run_gdrive_stream_acquired(
@@ -1708,7 +1738,7 @@ async def _run_gdrive_stream_acquired(
     state: StateStore,
     *,
     max_work: int,
-    acquired: list[dict[str, Any]],
+    acquired: list[RaisedExecution],
 ) -> IngestSummary:
     # Set only by the scheduler for an explicit Admin run (Run now / Retry) — R44 C7.
     rearm_exhausted = bool(conn.options.get("rearm_exhausted"))
@@ -1738,9 +1768,9 @@ async def _run_gdrive_stream_acquired(
                 conn.name, skipped=1, failed=0 if busy else 1, failure_categories={exc.code: 1},
                 deferred=busy, backlog=None, integration_id=integration_id,
             )
-        acquired.append({
+        acquired.append(RaisedExecution(integration_id, {
             "generation": int(execution.generation), "fence": int(execution.fence), "owner": str(execution.owner),
-        })
+        }))
         # One absolute deadline for the whole run. It travels with the execution so every sink and
         # reconcile call — limiter wait, request and retry — is bounded by the same instant.
         run_deadline = time.monotonic() + _RUN_DEADLINE_SECONDS
