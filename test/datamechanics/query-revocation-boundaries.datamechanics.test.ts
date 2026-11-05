@@ -1,4 +1,3 @@
-
 import { randomUUID } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getPool } from "@/lib/db/pg/pool";
@@ -354,4 +353,3 @@ async function settledRunOrNone(route: "v1" | "dashboard", teamId: string): Prom
   if (route === "dashboard") await settledRun(teamId);
   else await new Promise((resolve) => setTimeout(resolve, 50));
 }
-
