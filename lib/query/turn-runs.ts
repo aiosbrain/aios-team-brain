@@ -218,14 +218,14 @@ const RUN_COLUMNS =
 type StoredRun = TurnRun & { context_authorization_epoch?: unknown };
 
 /**
- * What a reader may see of one stored run (AIO-1167 R76). A run whose output provenance is obsolete,
- * unverifiable or malformed — or a historical (NULL) run still marked streaming — is reported as a
- * finished, retryable failure with NO partial text and NO final pointer, whatever its worker is doing.
+ * What a reader may see of one stored run (AIO-1167 R76, R86 F1). A run whose output provenance is
+ * historical (NULL — uncertified, completed or streaming), obsolete, unverifiable or malformed is reported
+ * as a finished, retryable failure with NO partial text and NO final pointer, whatever its worker is
+ * doing. The member's own question and the run's structural fields stay.
  */
 function projectRun(run: StoredRun, current: number | null): TurnRun {
   const { context_authorization_epoch: stored, ...visible } = run;
-  const kind = run.status === "streaming" ? "partial" : "completed";
-  if (outputReadable(stored, current, kind)) return visible;
+  if (outputReadable(stored, current)) return visible;
   return {
     ...visible,
     status: "error",

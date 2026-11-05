@@ -1,6 +1,8 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { audit } from "@/lib/api/audit";
+import { advanceAuthorizationEpoch } from "@/lib/access/authorization-epoch";
+import { runSql, withTransaction } from "@/lib/db/pg/pool";
 import { isBuiltinEligible, isPrincipal } from "@/lib/access/eligibility";
 import {
   EVERYONE_SLUG,
@@ -80,6 +82,49 @@ async function getGroup(db: DbClient, teamId: string, groupId: string): Promise<
     .eq("id", groupId)
     .maybeSingle();
   return (data as GroupRow) ?? null;
+}
+
+/** A narrowing writer's failure found INSIDE its transaction: thrown to roll back, reported as-is. */
+class NarrowingRolledBack extends Error {
+  constructor(readonly result: { ok: false; error: string }) {
+    super(result.error);
+  }
+}
+
+/**
+ * AIO-1167 R86 F2 — every successful application-owned audience NARROWING advances the team's durable
+ * revocation barrier (`team_authorization_epochs`) in the SAME transaction as the edge deletion, before
+ * success is reported. A protected answer or stream captured at the old epoch then stops being readable
+ * or publishable everywhere (`lib/query/output-provenance`), whichever process serves it, even when
+ * fresh retrieval would merely deny the item. The barrier is conservative: it advances on any removed
+ * edge, even where another grant keeps the member's direct access.
+ *
+ * `mutate` reports whether an edge was actually removed: a refusal or a no-op advances nothing. An epoch
+ * write that fails rolls the edge deletion back with it, and a failed mutation never publishes an
+ * epoch. Lock order: the narrowing's own rows (member row `for no key update` — compatible with the key
+ * share an output publication's foreign keys take — then the edge), then the epoch row; an output
+ * publication holds the epoch share lock and touches neither, so the two queue, never deadlock. Audits
+ * run AFTER the transaction, as before: best-effort trail, never able to abort the act.
+ */
+async function withAudienceNarrowing<T>(
+  teamId: string,
+  mutate: () => Promise<{ narrowed: boolean; result: T }>,
+): Promise<T | { ok: false; error: string }> {
+  try {
+    return await withTransaction(async () => {
+      const { narrowed, result } = await mutate();
+      if (narrowed) await advanceAuthorizationEpoch(teamId);
+      return result;
+    });
+  } catch (error) {
+    if (error instanceof NarrowingRolledBack) return error.result;
+    return { ok: false, error: `access narrowing rolled back: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
+/** Serialize a membership narrowing against the member's own Admin/posture checks (R86 F2/F4). */
+async function lockMemberForNarrowing(teamId: string, memberId: string): Promise<void> {
+  await runSql(`select id from members where id=$1 and team_id=$2 for no key update`, [memberId, teamId]);
 }
 
 function auditWrite(
@@ -173,21 +218,36 @@ export async function writeInviteDefaultMembership(
   const targetId = bySlug.get(targetSlug);
   if (!targetId) return { ok: false, error: `builtin ${targetSlug} missing — bootstrap has not run for this team` };
 
-  if (opts.reconcile) {
-    const allIds = [...bySlug.values()];
+  const place = async (): Promise<void> => {
     const { error } = await db
+      .from("group_members")
+      .upsert({ team_id: teamId, group_id: targetId, member_id: memberId }, { onConflict: "group_id,member_id" });
+    if (error) throw new NarrowingRolledBack({ ok: false, error: error.message });
+  };
+  if (!opts.reconcile) {
+    const { error } = await db
+      .from("group_members")
+      .upsert({ team_id: teamId, group_id: targetId, member_id: memberId }, { onConflict: "group_id,member_id" });
+    if (error) return { ok: false, error: error.message };
+    return { ok: true };
+  }
+  // A deliberate posture move (R86 F2): dropping the OTHER builtin is a narrowing — the barrier advances
+  // with it, atomically.
+  const allIds = [...bySlug.values()];
+  return withAudienceNarrowing(teamId, async () => {
+    await lockMemberForNarrowing(teamId, memberId);
+    const { data: removed, error } = await db
       .from("group_members")
       .delete()
       .eq("team_id", teamId)
       .eq("member_id", memberId)
-      .in("group_id", allIds);
-    if (error) return { ok: false, error: error.message };
-  }
-  const { error } = await db
-    .from("group_members")
-    .upsert({ team_id: teamId, group_id: targetId, member_id: memberId }, { onConflict: "group_id,member_id" });
-  if (error) return { ok: false, error: error.message };
-  return { ok: true };
+      .in("group_id", allIds)
+      .select("group_id");
+    if (error) throw new NarrowingRolledBack({ ok: false, error: error.message });
+    await place();
+    const narrowed = ((removed ?? []) as { group_id: string }[]).some((row) => row.group_id !== targetId);
+    return { narrowed, result: { ok: true } as WriteResult };
+  });
 }
 
 /**
@@ -387,18 +447,28 @@ export async function removeMemberFromGroup(
       return { ok: false, error: "built-in groups admit humans only — non-human posture is set by the invite default at creation" };
     }
   }
-  const { error } = await db
-    .from("group_members")
-    .delete()
-    .eq("team_id", teamId)
-    .eq("group_id", groupId)
-    .eq("member_id", memberId);
-  if (error) return { ok: false, error: error.message };
+  // The deletion, the tier mirror and the revocation barrier commit together (R86 F2): a mirror or
+  // epoch failure rolls the removal back rather than leaving it half-applied.
+  const outcome = await withAudienceNarrowing(teamId, async () => {
+    await lockMemberForNarrowing(teamId, memberId);
+    const { data: removed, error } = await db
+      .from("group_members")
+      .delete()
+      .eq("team_id", teamId)
+      .eq("group_id", groupId)
+      .eq("member_id", memberId)
+      .select("member_id");
+    if (error) throw new NarrowingRolledBack({ ok: false, error: error.message });
+    if (group.is_builtin) {
+      const mirror = await mirrorTierToPosture(db, teamId, memberId);
+      if (!mirror.ok) {
+        throw new NarrowingRolledBack({ ok: false, error: `membership not removed: tier mirror failed: ${mirror.error}` });
+      }
+    }
+    return { narrowed: ((removed ?? []) as unknown[]).length > 0, result: { ok: true } as WriteResult };
+  });
+  if (!outcome.ok) return outcome;
   await auditWrite(db, teamId, actorMemberId, "access.member_removed", groupId, { memberId });
-  if (group.is_builtin) {
-    const mirror = await mirrorTierToPosture(db, teamId, memberId);
-    if (!mirror.ok) return { ok: false, error: `membership removed but tier mirror failed: ${mirror.error}` };
-  }
   return { ok: true };
 }
 
@@ -457,13 +527,19 @@ export async function ensurePersonSingleton(
     .from("group_members")
     .upsert({ team_id: teamId, group_id: groupId, member_id: memberId, added_by: actorMemberId }, { onConflict: "group_id,member_id" });
   if (upErr) return { ok: false, error: upErr.message };
-  const { error: prErr } = await db
-    .from("group_members")
-    .delete()
-    .eq("team_id", teamId)
-    .eq("group_id", groupId)
-    .neq("member_id", memberId);
-  if (prErr) return { ok: false, error: prErr.message };
+  // Dropping a stray member from the singleton narrows THAT member's access: barrier with it (R86 F2).
+  const pruned = await withAudienceNarrowing(teamId, async () => {
+    const { data: strays, error: prErr } = await db
+      .from("group_members")
+      .delete()
+      .eq("team_id", teamId)
+      .eq("group_id", groupId)
+      .neq("member_id", memberId)
+      .select("member_id");
+    if (prErr) throw new NarrowingRolledBack({ ok: false, error: prErr.message });
+    return { narrowed: ((strays ?? []) as unknown[]).length > 0, result: { ok: true } as WriteResult };
+  });
+  if (!pruned.ok) return pruned;
   return { ok: true, groupId };
 }
 
@@ -853,17 +929,21 @@ export async function revokeUnsanctionedSystemEdge(
     };
   }
 
-  // (4) Delete with RETURNING — the row is the evidence that anything happened.
-  const { data: removed, error: delErr } = await db
-    .from("project_groups")
-    .delete()
-    .eq("team_id", teamId)
-    .eq("project_id", edge.projectId)
-    .eq("group_id", edge.groupId)
-    .select("project_id");
-  if (delErr) return { ok: false, error: delErr.message };
-  const deleted = ((removed ?? []) as unknown[]).length > 0;
-  if (!deleted) return { ok: true, revoked: false };
+  // (4) Delete with RETURNING — the row is the evidence that anything happened — and advance the
+  // revocation barrier with it (R86 F2).
+  const outcome = await withAudienceNarrowing(teamId, async () => {
+    const { data: removed, error: delErr } = await db
+      .from("project_groups")
+      .delete()
+      .eq("team_id", teamId)
+      .eq("project_id", edge.projectId)
+      .eq("group_id", edge.groupId)
+      .select("project_id");
+    if (delErr) throw new NarrowingRolledBack({ ok: false, error: delErr.message });
+    const deleted = ((removed ?? []) as unknown[]).length > 0;
+    return { narrowed: deleted, result: { ok: true as const, revoked: deleted } };
+  });
+  if (!outcome.ok || !outcome.revoked) return outcome;
 
   // (5) Audit only a real deletion (D3), with the same actor discipline as the general writer.
   if (actor.kind === "member") {
@@ -972,15 +1052,21 @@ export async function revokeProjectFromGroup(
   //
   // BOTH audit branches sit inside the guard. Moving only one is a real implementation an earlier
   // criterion could not tell from the correct one — a raced MEMBER revoke would still phantom.
-  const { data: removed, error } = await db
-    .from("project_groups")
-    .delete()
-    .eq("team_id", teamId)
-    .eq("project_id", projectId)
-    .eq("group_id", groupId)
-    .select("project_id");
-  if (error) return { ok: false, error: error.message };
-  if (((removed ?? []) as unknown[]).length === 0) {
+  // R86 F2: the deletion and the revocation barrier commit together, before success is reported.
+  const outcome = await withAudienceNarrowing(teamId, async () => {
+    const { data: removed, error } = await db
+      .from("project_groups")
+      .delete()
+      .eq("team_id", teamId)
+      .eq("project_id", projectId)
+      .eq("group_id", groupId)
+      .select("project_id");
+    if (error) throw new NarrowingRolledBack({ ok: false, error: error.message });
+    const deleted = ((removed ?? []) as unknown[]).length > 0;
+    return { narrowed: deleted, result: { ok: true as const, revoked: deleted } };
+  });
+  if (!outcome.ok) return outcome;
+  if (!outcome.revoked) {
     // Someone else got there first. The truth is that this call revoked nothing (D3: no audit).
     return { ok: true, revoked: false };
   }

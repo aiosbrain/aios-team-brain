@@ -121,7 +121,12 @@ const isIdentityLock = (e: Entry) => advisoryKey(e) === `${TEAM}:identity-author
 const isNamedLock = (e: Entry) => advisoryKey(e) === `${TEAM}:gdrive:${NAME}`;
 const isConnectionLock = (e: Entry) => e.sql.includes("from integrations i") && e.sql.endsWith("for update of i, a");
 const isAdminLock = (e: Entry) => e.sql === "select role,status from members where id=$1 and team_id=$2 for update";
+/** AIO-1167 R86 F4: the Admin's ACTUAL builtin Everyone membership, share-locked after the member row. */
+const isEveryoneLock = (e: Entry) => e.sql.includes("from group_members gm") && e.sql.endsWith("for share of gm");
 const isPrincipalLock = (e: Entry) => e.sql.includes("from api_keys k") && e.sql.endsWith("for update of k, m");
+/** AIO-1167 R87: the canonical live predicate, evaluated by its OWN statement after the row lock. */
+const isPrincipalCheck = (e: Entry) =>
+  e.sql.includes("from api_keys k") && e.sql.includes(") as valid ") && !e.sql.includes(" for update");
 const isIdRead = (e: Entry) => e.sql === "select id from integrations where team_id=$1 and type='gdrive' and name=$2";
 const isReservation = (e: Entry) => e.sql.startsWith("insert into integrations (") && e.sql.includes(" do nothing");
 const isWinnerRead = (e: Entry) => e.sql.startsWith("select id from integrations where team_id = $1");
@@ -178,7 +183,9 @@ function database(opts: {
       }];
     }
     if (isAdminLock(e)) return opts.admin === null ? [] : [opts.admin ?? { role: "admin", status: "active" }];
-    if (isPrincipalLock(e)) return [{ valid: true }];
+    if (isEveryoneLock(e)) return [{ member_id: params[1] }];
+    if (isPrincipalLock(e)) return [{ id: "key" }];
+    if (isPrincipalCheck(e)) return [{ valid: true }];
     if (isPublication(e)) return [{ id: INTEGRATION, status: "enabled" }];
     if (/^select id, slug from projects /.test(sql)) return (params[1] as string[]).map((id) => ({ id, slug: "docs" }));
     if (sql.includes("exists(select 1 from project_groups")) return (params[1] as string[]).map((id) => ({ id, granted: true }));
@@ -226,6 +233,8 @@ describe("Drive connection paths: identity authority → connection rows → mem
     await expect(acquireGdriveAdminTestAuthority({ teamId: TEAM, memberId: ADMIN, integrationName: NAME }))
       .resolves.toMatchObject({ integrationId: INTEGRATION, credential: { refreshToken: "stored-refresh" } });
     expectCanonicalOrder(acquired, isAdminLock);
+    // R86 F4: the Admin gate's Everyone row is locked right after the member row — never before it.
+    expect(indexOf(acquired.work, isEveryoneLock)).toBe(indexOf(acquired.work, isAdminLock) + 1);
     // The by-name lookup that precedes the boundary is a plain read.
     expect(isIdRead(acquired.work[0])).toBe(true);
 
@@ -271,6 +280,8 @@ describe("Drive connection paths: identity authority → connection rows → mem
     const c = use(new ScriptedConnection(database()));
     await call();
     expectCanonicalOrder(c, isPrincipalLock);
+    // R87: the live predicate is its own statement, right AFTER the key/member lock (a fresh snapshot).
+    expect(indexOf(c.work, isPrincipalCheck)).toBe(indexOf(c.work, isPrincipalLock) + 1);
     expect(isIdentityLock(c.work[0])).toBe(true);
     // The lease/progress write is below the whole prefix.
     expect(indexOf(c.work, isWrite)).toBeGreaterThan(indexOf(c.work, isPrincipalLock));

@@ -125,20 +125,6 @@ type ScheduledReportInput = {
   publish?: GdriveReportLedgerPublication;
 };
 
-async function assertScheduledReportAuthority(input: ScheduledReportInput): Promise<void> {
-  const { rows } = await runSql<{ ok: boolean }>(
-    `select true as ok from integrations i
-     join gdrive_connection_authority a on a.integration_id=i.id and a.team_id=i.team_id
-     join api_keys k on k.id=a.connector_api_key_id and k.member_id=a.connector_member_id
-     join members m on m.id=a.connector_member_id and m.team_id=a.team_id
-     where i.id=$1 and i.team_id=$2 and i.type='gdrive'
-       and a.connector_api_key_id=$3 and a.connector_member_id=$4
-       and k.revoked_at is null and m.status='active' and m.is_connector=true`,
-    [input.integrationId, input.teamId, input.apiKeyId, input.memberId],
-  );
-  if (!rows[0]) throw new GdriveScheduledReportRefused("stale_authority", "Google Drive scheduled report authority is stale");
-}
-
 /**
  * The stored report under `input.reportId`, accepted only as an exact replay: the same team,
  * connection and scheduler trigger (identity) and the same status, summary and error (content).
@@ -170,10 +156,10 @@ export async function recordScheduledGdriveRun(
   input: ScheduledReportInput,
 ): Promise<{ newly_completed: boolean; started_at: string }> {
   return withTransaction(async () => {
-    // Connection authority first, in the established lock order, held to commit (R83 F1).
-    const authority = await lockGdriveReportAuthority(input.teamId, input.integrationId);
+    // Connection authority and the LIVE bound connector first, in the established lock order, held to
+    // commit (R83 F1, R86 F3) — the same predicate as the manual path.
+    const authority = await lockGdriveReportAuthority(input.teamId, input.integrationId, input);
     if (!authority) throw new GdriveScheduledReportRefused("stale_authority", "Google Drive scheduled report authority is stale");
-    await assertScheduledReportAuthority(input);
     // An EXACT replay of a stored report writes nothing, so it is answered whatever the authority has
     // become since: it can neither publish nor clear anything.
     const replay = await storedScheduledReplay(input);
@@ -204,8 +190,7 @@ export async function recordScheduledGdriveRun(
       return { newly_completed: true, started_at: input.startedAt };
     }
     // Lost the race: the winner's row is committed and visible to this new statement. It counts only
-    // as an exact replay, and only while this connector still holds the authority — re-read both.
-    await assertScheduledReportAuthority(input);
+    // as an exact replay; this connector's live authority is still held under the locks taken above.
     const raced = await storedScheduledReplay(input);
     if (raced) return raced;
     // The conflicting row was gone again by the re-read (deleted with its connection): unexplained,
@@ -270,7 +255,9 @@ export async function completeGdriveRun(input: {
       [input.requestId, input.teamId],
     );
     if (!target[0]) return null;
-    const authority = await lockGdriveReportAuthority(input.teamId, target[0].integration_id);
+    // R86 F3: the reporter must be the connection's LIVE bound connector now — the scheduled path's
+    // predicate, under the same locks — not merely the IDs this request was authenticated with.
+    const authority = await lockGdriveReportAuthority(input.teamId, target[0].integration_id, input);
     if (!authority) return null;
     const summary = reportSummary(input.summary, input.execution);
     const { rows } = await runSql<{

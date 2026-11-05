@@ -1,7 +1,7 @@
 import "server-only";
 
 import { createHash, randomBytes } from "node:crypto";
-import { ensureBuiltins, writeInviteDefaultMembership } from "@/lib/access/groups";
+import { ensureBuiltins, EVERYONE_SLUG, writeInviteDefaultMembership } from "@/lib/access/groups";
 import { audit, auditRequiredInTransaction } from "@/lib/api/audit";
 import type { ApiAuth } from "@/lib/api/auth";
 import { adminClient } from "@/lib/db/admin";
@@ -302,7 +302,18 @@ export async function lockGdriveConnection(teamId: string, integrationId: string
 }
 
 /**
- * Lock the acting member's row and say whether they are, right now, an active Admin of this team.
+ * Lock the acting member's row and say whether they are, right now, an active Admin of this team —
+ * the SAME predicate as the established Admin gate (`requireTeamAdmin` → `resolveIntegrationsAdmin`:
+ * role `admin`, status `active`, AND actual membership of the team's builtin Everyone group — never
+ * the `members.tier` mirror). AIO-1167 R86 F4: checked at every Drive Admin publication boundary, so
+ * an Admin removed from Everyone during an OAuth exchange, a provider refresh/preview, a verified
+ * selection or an ordinary save publishes nothing.
+ *
+ * Both rows are LOCKED through the caller's publication: the member row `for update`, then its Everyone
+ * membership row `for share`. A sanctioned narrowing (`removeMemberFromGroup`, a posture move) locks
+ * the member row first too and only then deletes the membership (lib/access/groups), so a removal
+ * either commits before this check and is seen, or waits until the publication commits — never
+ * member-row/membership-row inverted. A read failure throws: the publication fails closed.
  * Always AFTER the connection rows (and so after the identity authority): see `lockedAuthority`.
  */
 export async function lockActiveTeamAdmin(teamId: string, memberId: string): Promise<boolean> {
@@ -310,7 +321,15 @@ export async function lockActiveTeamAdmin(teamId: string, memberId: string): Pro
     `select role,status from members where id=$1 and team_id=$2 for update`,
     [memberId, teamId],
   );
-  return rows[0]?.role === "admin" && rows[0]?.status === "active";
+  if (rows[0]?.role !== "admin" || rows[0]?.status !== "active") return false;
+  const { rows: everyone } = await runSql<{ member_id: string }>(
+    `select gm.member_id from group_members gm
+       join groups g on g.id = gm.group_id and g.team_id = gm.team_id
+      where gm.team_id = $1 and gm.member_id = $2 and g.slug = $3 and g.is_builtin is true
+      for share of gm`,
+    [teamId, memberId, EVERYONE_SLUG],
+  );
+  return everyone.length > 0;
 }
 
 async function assertLiveAdminConnection(
@@ -537,6 +556,11 @@ export async function saveGdriveConnectionConfig(
       ? { id: named[0].id, reserved: false }
       : await reserveGdriveIntegration(db, auth.teamId, input.name, mergeLockedGdriveCredentialFields(input.config, {}));
     const held = await lockedAuthority(target.id, auth.teamId);
+    // R86 F4: the saving member must still be an Admin NOW, under lock — the same live predicate as
+    // every other Drive Admin publication. A refusal rolls back a reservation made above with it.
+    if (!await lockActiveTeamAdmin(auth.teamId, auth.memberId)) {
+      throw new GdriveAuthorityError("admin_authority_changed", "Google Drive Admin authority changed; nothing was saved", 403);
+    }
     const existing = target.reserved ? null : held;
     const locked = existing?.config ?? {};
     if (unverifiedOauthRoots(input.config, locked).length > 0) {
@@ -573,19 +597,35 @@ export const LIVE_GDRIVE_CONNECTOR_SQL = `k.revoked_at is null and m.status = 'a
                  and g.slug = 'everyone' and g.is_builtin is true
              )`;
 
-async function assertLiveBoundPrincipal(row: AuthorityRow, auth: ApiAuth): Promise<void> {
+async function assertLiveBoundPrincipal(
+  row: AuthorityRow,
+  auth: Pick<ApiAuth, "teamId" | "apiKeyId" | "memberId">,
+): Promise<void> {
   if (!row.connector_api_key_id || !row.connector_member_id
       || row.connector_api_key_id !== auth.apiKeyId || row.connector_member_id !== auth.memberId) {
     throw new GdriveAuthorityError("wrong_connection", "Google Drive connection is not bound to this connector principal", 403);
   }
-  const { rows } = await runSql<{ valid: boolean }>(
-    `select (${LIVE_GDRIVE_CONNECTOR_SQL}) as valid
+  // TWO statements (AIO-1167 R87). The first only LOCKS the bound key and member rows. The canonical
+  // predicate is evaluated by a SECOND statement, which under READ COMMITTED takes a fresh snapshot after
+  // any wait for those locks: a sanctioned posture narrowing that holds the member row (`for no key
+  // update`), deletes the Everyone membership and commits WITHOUT updating the member tuple is seen.
+  // Evaluated in the locking statement itself, Everyone's `exists` would read the snapshot taken BEFORE
+  // the wait and still report the removed membership.
+  const { rows: locked } = await runSql<{ id: string }>(
+    `select k.id
        from api_keys k
        join members m on m.id = k.member_id and m.team_id = k.team_id
       where k.id = $2 and k.team_id = $1 and k.member_id = $3
       for update of k, m`,
     [auth.teamId, auth.apiKeyId, auth.memberId],
   );
+  const { rows } = locked[0] ? await runSql<{ valid: boolean }>(
+    `select (${LIVE_GDRIVE_CONNECTOR_SQL}) as valid
+       from api_keys k
+       join members m on m.id = k.member_id and m.team_id = k.team_id
+      where k.id = $2 and k.team_id = $1 and k.member_id = $3`,
+    [auth.teamId, auth.apiKeyId, auth.memberId],
+  ) : { rows: [] as { valid: boolean }[] };
   if (!rows[0]?.valid) {
     throw new GdriveAuthorityError("connector_principal_required", "trusted Google Drive connector principal is no longer active", 403);
   }
@@ -1037,22 +1077,33 @@ export function gdriveTerminalReportVerdict(
 
 /**
  * Lock a connection's authority for a terminal run report, in the established connection lock order
- * (`lockedAuthority`: team identity authority → integration + connection-authority rows), and return
- * the authority the report is judged against. Must run inside the report's transaction, which holds
- * these locks through the report write AND the run-ledger append: a scope, credential or status
- * transition (`sync_gdrive_connection_authority`, fired by the integration row it must lock) or a new
- * acquisition queues behind them, so it cannot land between validation and success publication.
- * `null` when the connection no longer exists.
+ * (`lockedAuthority`: team identity authority → integration + connection-authority rows → the bound
+ * key and member rows), and return the authority the report is judged against. Must run inside the
+ * report's transaction, which holds these locks through the report write AND the run-ledger append: a
+ * scope, credential or status transition (`sync_gdrive_connection_authority`, fired by the integration
+ * row it must lock) or a new acquisition queues behind them, so it cannot land between validation and
+ * success publication.
+ *
+ * The reporting principal must be the connection's LIVE bound connector NOW (AIO-1167 R86 F3) — the ONE
+ * canonical predicate every fenced Drive call uses (`assertLiveBoundPrincipal` over
+ * `LIVE_GDRIVE_CONNECTOR_SQL`: the exact bound key and member, the key unrevoked, an active connector
+ * member acting as `gdrive-sync`, with Everyone-derived team posture), not just the IDs a request was
+ * authenticated with. The key and member rows are locked, so a key revocation, a deactivation or a
+ * sanctioned posture change (which locks the member row first) queues behind the report, or is seen by
+ * it. `null` when the connection no longer exists or the principal is not its live connector.
  */
 export async function lockGdriveReportAuthority(
   teamId: string,
   integrationId: string,
+  principal: { apiKeyId: string; memberId: string },
 ): Promise<{ generation: number; fence: number; leaseOwner: string | null } | null> {
   try {
     const row = await lockedAuthority(integrationId, teamId);
+    await assertLiveBoundPrincipal(row, { teamId, ...principal });
     return { generation: Number(row.generation), fence: Number(row.fence), leaseOwner: row.lease_owner };
   } catch (error) {
-    if (error instanceof GdriveAuthorityError && error.code === "wrong_connection") return null;
+    if (error instanceof GdriveAuthorityError
+        && ["wrong_connection", "connector_principal_required"].includes(error.code)) return null;
     throw error;
   }
 }

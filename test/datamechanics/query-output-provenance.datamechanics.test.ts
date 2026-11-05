@@ -21,8 +21,9 @@ import { twoClaimFixture } from "./query-revocation-fixture";
 //
 // Every reader decides from the STORED provenance and the team's current revocation epoch, read at a
 // revocation-linearized point — never from whether a worker is alive, heartbeating, or cleaned up:
-// NULL = historical (completed readable, a streaming partial never replayed), 0 = non-Google
-// (readable), positive = the original capture (readable only while current and verifiable).
+// NULL = historical GENERATED output, uncertified and never readable since R86 F1 (the member's own
+// questions stay), 0 = non-Google (readable), positive = the original capture (readable only while
+// current and verifiable).
 
 const probe = vi.hoisted(() => ({ epochReadFails: false }));
 vi.mock("@/lib/access/authorization-epoch", async (importOriginal) => {
@@ -130,23 +131,27 @@ describe("AIO-1167 R76 durable query-output readers (real Postgres)", () => {
       { question: "first question", answer: "quasarvellum protected answer" },
       { question: "second question", answer: "nebulith public answer" },
     ]);
-    expect(await recentTurns(db(), owner, legacy), "historical answers are readable but never reused as model input").toEqual([]);
+    expect(await recentTurns(db(), owner, legacy), "historical answers are never reused as model input").toEqual([]);
+    // R86 F1: historical (NULL) generated output is uncertified — hidden, completed or streaming; the
+    // member's own historical question stays.
+    expect(await roles(legacy)).toEqual(["old question"]);
+    expect(await found("hexaprism")).toEqual([]);
     expect(await latestRun(db(), owner, nullStreaming)).toMatchObject({ status: "error", partial_text: "" });
-    expect(await latestRun(db(), owner, nullDone)).toMatchObject({ status: "done" });
+    expect(await latestRun(db(), owner, nullDone)).toMatchObject({ status: "error", final_message_id: null });
     expect(await latestRun(db(), owner, zeroStreaming)).toMatchObject({ status: "streaming", partial_text: "public partial" });
 
     await advanceAuthorizationEpoch(seed.teamId);
 
     expect(await roles(thread)).toEqual(["first question", "second question", "nebulith public answer"]);
-    expect(await roles(legacy)).toEqual(["old question", "hexaprism legacy answer"]);
+    expect(await roles(legacy)).toEqual(["old question"]);
     expect(await found("quasarvellum")).toEqual([]);
     expect(await found("nebulith")).toEqual([thread]);
-    expect(await found("hexaprism")).toEqual([legacy]);
+    expect(await found("hexaprism")).toEqual([]);
     expect(await recentTurns(db(), owner, thread)).toEqual([{ question: "second question", answer: "nebulith public answer" }]);
     expect(await latestRun(db(), owner, zeroStreaming)).toMatchObject({ status: "streaming", partial_text: "public partial" });
   });
 
-  it("an unreadable revocation epoch hides protected output only — 0 and completed historical stay readable", async () => {
+  it("an unreadable revocation epoch hides protected output — 0 stays readable, historical stays hidden", async () => {
     const seed = await seedTeam();
     const owner = ownerOf(seed);
     const epoch = await revocationEpoch(db(), seed.teamId);
@@ -163,7 +168,7 @@ describe("AIO-1167 R76 durable query-output readers (real Postgres)", () => {
     probe.epochReadFails = true;
 
     expect((await getConversation(db(), owner, thread))?.messages.map((m) => m.content))
-      .toEqual(["question", "nebulith public", "hexaprism legacy"]);
+      .toEqual(["question", "nebulith public"]);
     expect(await searchConversations(db(), owner, "quasarvellum")).toEqual([]);
     expect((await searchConversations(db(), owner, "nebulith")).map((c) => c.id)).toEqual([thread]);
     expect(await latestRun(db(), owner, protectedRun)).toMatchObject({ status: "error", partial_text: "" });

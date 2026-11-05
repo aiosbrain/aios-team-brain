@@ -4,6 +4,7 @@ import type { ChatTurn } from "@/lib/query/claude";
 import { runSql } from "@/lib/db/pg/pool";
 import {
   outputReadable,
+  readableOutputSql,
   outputReusable,
   withOutputRead,
   type OutputProvenance,
@@ -129,6 +130,40 @@ export async function appendMessage(
   return insertedId;
 }
 
+/**
+ * AIO-1167 R88 — the ONE fail-closed title projection, shared by list, detail and search.
+ *
+ * Titles carry no provenance of their own, and before R76 an automatic title was generated from the
+ * question AND the answer, after the answer was stored. So a conversation holding ANY historical
+ * assistant message (NULL provenance — uncertified generated output, R86 F1) may hold a title derived
+ * from text that is no longer readable. Its stored title is therefore uncertified too, and is projected
+ * as the title derived from the member's own FIRST question (`"New chat"` when there is none). Later
+ * modern messages never re-certify it. A conversation with no historical answer keeps its stored title
+ * (modern automatic titles are question-derived for protected answers and certified for source-free
+ * ones; manual titles are the member's own). The classification does not depend on the revocation
+ * epoch; when it cannot be read the reader throws — it never falls back to a raw title.
+ */
+async function projectTitles<T extends { id: string; title: string }>(owner: Owner, rows: T[]): Promise<T[]> {
+  if (rows.length === 0) return rows;
+  const { rows: facts } = await runSql<{ id: string; uncertified: boolean; first_question: string | null }>(
+    `select c.id::text as id,
+            exists(select 1 from chat_messages m
+                    where m.conversation_id = c.id and m.team_id = $2 and m.member_id = $3
+                      and m.role = 'assistant' and m.context_authorization_epoch is null) as uncertified,
+            (select m.content from chat_messages m
+              where m.conversation_id = c.id and m.team_id = $2 and m.member_id = $3 and m.role = 'user'
+              order by m.created_at asc, m.id asc limit 1) as first_question
+       from unnest($1::uuid[]) as c(id)`,
+    [rows.map((row) => row.id), owner.teamId, owner.memberId],
+  );
+  const byId = new Map(facts.map((fact) => [fact.id, fact]));
+  return rows.map((row) => {
+    const fact = byId.get(row.id);
+    if (!fact) throw new Error("conversation title classification is incomplete");
+    return fact.uncertified ? { ...row, title: deriveTitle(fact.first_question ?? "") } : row;
+  });
+}
+
 /** The member's conversations, newest-active first, excluding archived. */
 export async function listConversations(
   db: DbClient,
@@ -143,7 +178,7 @@ export async function listConversations(
     .is("archived_at", null)
     .order("updated_at", { ascending: false })
     .limit(limit);
-  return (data ?? []) as Conversation[];
+  return projectTitles(owner, (data ?? []) as Conversation[]);
 }
 
 /**
@@ -160,13 +195,12 @@ export async function searchConversations(
   const q = query.trim();
   if (!q) return listConversations(db, owner, limit);
   // Content matches: message bodies via FTS → the conversations they belong to (owner-scoped). AIO-1167
-  // R76: a match inside protected output whose authorization is obsolete or unverifiable is no match —
-  // only historical (NULL), 0 and current-epoch messages are searched.
+  // R76/R86 F1: a match inside generated output that is not certified now is no match — the member's own
+  // questions always match; an answer only at 0 or the current epoch (historical NULL never).
   const hits = await withOutputRead(owner.teamId, async (current) => (await runSql<{ conversation_id: string }>(
     `select distinct conversation_id from chat_messages
       where team_id=$1 and member_id=$2 and search @@ websearch_to_tsquery('english', $3)
-        and (context_authorization_epoch is null or context_authorization_epoch = 0
-             or context_authorization_epoch = $4)
+        and (role = 'user' or ${readableOutputSql("context_authorization_epoch", "$4")})
       limit 1000`,
     [owner.teamId, owner.memberId, q, current ?? -1],
   )).rows);
@@ -181,9 +215,15 @@ export async function searchConversations(
     .order("updated_at", { ascending: false })
     .limit(500);
   const ql = q.toLowerCase();
-  return ((data ?? []) as Conversation[])
+  // R88: titles are matched AFTER projection — text only an uncertified stored title holds never matches.
+  return (await projectTitles(owner, (data ?? []) as Conversation[]))
     .filter((c) => (c.title || "").toLowerCase().includes(ql) || contentIds.has(c.id))
     .slice(0, limit);
+}
+
+/** User-authored text is not generated output and stays readable; an answer follows `outputReadable`. */
+function messageReadable(role: string, stored: unknown, current: number | null): boolean {
+  return role === "user" || outputReadable(stored, current);
 }
 
 /** A conversation's full message thread — owner-checked; null if not owned/absent. */
@@ -202,8 +242,8 @@ export async function getConversation(
     .maybeSingle();
   const c = convo as { id: string; title: string } | null;
   if (!c) return null;
-  // AIO-1167 R76: an assistant message whose protected provenance is obsolete or unverifiable is
-  // omitted (text and citations); user and permitted messages are kept.
+  // AIO-1167 R76/R86 F1: the member's own questions are always kept; an answer (text and citations) only
+  // when its output is certified now — historical (NULL), obsolete or unverifiable answers are omitted.
   const messages = await withOutputRead(owner.teamId, async (current) => {
     const { data: msgs } = await db
       .from("chat_messages")
@@ -211,10 +251,11 @@ export async function getConversation(
       .eq("conversation_id", conversationId)
       .order("created_at", { ascending: true });
     return ((msgs ?? []) as (ChatMessage & { context_authorization_epoch?: unknown })[])
-      .filter((m) => outputReadable(m.context_authorization_epoch, current, "completed"))
+      .filter((m) => messageReadable(m.role, m.context_authorization_epoch, current))
       .map(({ context_authorization_epoch: _stored, ...message }) => message);
   });
-  return { id: c.id, title: c.title, messages };
+  const [projected] = await projectTitles(owner, [c]);
+  return { id: c.id, title: projected.title, messages };
 }
 
 /**

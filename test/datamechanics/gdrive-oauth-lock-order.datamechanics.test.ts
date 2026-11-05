@@ -15,7 +15,7 @@ import {
   publishGoogleDriveOAuthCredential,
 } from "@/lib/integrations/gdrive-oauth";
 import { getIntegrationWithSecret, setIntegrationSecret, upsertIntegration } from "@/lib/integrations/manage";
-import { db, seedTeam, type Seed } from "./helpers";
+import { db, placeMemberByTier, seedTeam, type Seed } from "./helpers";
 
 /**
  * The Google Drive CONNECTION acquisition order against real PostgreSQL (AIO-1167) — the
@@ -62,6 +62,9 @@ async function world(): Promise<World> {
     actor_handle: `other-${randomUUID().slice(0, 8)}`, role: "admin", tier: "team", status: "active",
   }).select("id").single();
   if (error || !other) throw new Error(`second admin fixture failed: ${error?.message}`);
+  // An Admin is role + actual Everyone membership (the established gate; R86 F4) — production writes
+  // this row with the member (`createMember` → `writeInviteDefaultMembership`).
+  await placeMemberByTier(seed.teamId, (other as { id: string }).id, "team");
   return {
     seed,
     initiator: { id: seed.memberId, email: (self as { email: string }).email },

@@ -104,7 +104,7 @@ export async function withOutputPublication<T>(
  * A durable read at a revocation-linearized epoch: `fn` runs inside a short transaction holding the
  * epoch share lock and receives the current epoch, so what it projects is validated against the state
  * it reads. When the epoch itself cannot be read, `fn` runs with `null` — protected output must then be
- * suppressed, while 0 and completed historical rows stay readable.
+ * suppressed, while source-free (0) output stays readable.
  */
 export async function withOutputRead<T>(teamId: string, fn: (current: number | null) => Promise<T>): Promise<T> {
   let reached = false;
@@ -121,16 +121,15 @@ export async function withOutputRead<T>(teamId: string, fn: (current: number | n
 }
 
 /**
- * Whether stored output may be projected now. `completed` output with NULL (historical) provenance stays
- * readable; a NULL streaming partial does not. 0 is readable. A positive epoch is readable only when it
- * equals the current, verifiable revocation epoch. Anything malformed is not readable.
+ * Whether stored GENERATED output (an answer, its citations, a partial, a run's projection) may be
+ * projected now. Fail closed (AIO-1167 R86 F1): NULL — historical output written before provenance
+ * existed — is UNCERTIFIED and never readable, completed or partial: it is not stamped with today's
+ * epoch, and an absent citation list proves nothing. 0 is readable source-free output. A positive epoch
+ * is readable only when it equals the current, verifiable revocation epoch. Anything malformed is not
+ * readable. User-authored text is not generated output; its readers decide by role.
  */
-export function outputReadable(
-  stored: unknown,
-  current: number | null,
-  kind: "completed" | "partial",
-): boolean {
-  if (stored === null || stored === undefined) return kind === "completed";
+export function outputReadable(stored: unknown, current: number | null): boolean {
+  if (stored === null || stored === undefined) return false;
   const epoch = typeof stored === "string" ? Number(stored) : stored;
   if (typeof epoch !== "number" || !Number.isSafeInteger(epoch) || epoch < 0) return false;
   if (epoch === 0) return true;
@@ -139,6 +138,14 @@ export function outputReadable(
 
 /** Whether stored output is certified for reuse as model input (history): 0, or the current epoch. */
 export function outputReusable(stored: unknown, current: number | null): boolean {
-  if (stored === null || stored === undefined) return false;
-  return outputReadable(stored, current, "completed");
+  return outputReadable(stored, current);
+}
+
+/**
+ * The SQL twin of `outputReadable` for a row's `context_authorization_epoch`, for readers that filter
+ * in the database: 0, or exactly the current epoch (bound as `$n`; pass -1 when it is unreadable). NULL
+ * never matches. One spelling for every SQL reader, so no predicate keeps the historical exemption.
+ */
+export function readableOutputSql(column: string, currentParam: string): string {
+  return `(${column} = 0 or ${column} = ${currentParam})`;
 }
