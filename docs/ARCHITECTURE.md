@@ -1937,6 +1937,14 @@ resolve to a canonical item, and every dependency must remain visible in that ex
 one authorization epoch. Event titles/participants additionally require the event episode's item to
 remain visible. Legacy/unproven/mixed/revoked facts are excluded; graph/provenance/visibility failure
 or a repeatedly changing epoch returns retryable unavailable rather than a healthy empty result.
+**The PRINCIPAL's scope is part of the epoch-bound attempt (R94):** a partition's own checks prove only
+that its contents are valid, not that the caller still holds the grant that selected it. So events and
+graph-query capture the epoch FIRST, then resolve the member's oracle projects → stored partitions (→ item
+visibility) inside each bounded attempt, and a changed epoch restarts the whole attempt; the Layer-1 facts
+feed captures the epoch before its scope and fails closed (empty, `degraded`) on any change, in one
+attempt. `readAuthorizedGraphFactsResult({ expectedEpoch })` binds a caller-owned scope to the caller's
+epoch and throws `GraphScopeEpochChangedError` instead of re-certifying those groups under a newer one;
+without it (retrieval) it keeps its own retry and returns the epoch it read under for the caller to compare.
 
 Pause/disable stops scheduled reads while retaining cursor state and ingested data. Disconnect stops
 credential use but is not an implicit purge; provider-confirmed revocation still follows the removal

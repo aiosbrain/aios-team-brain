@@ -60,8 +60,11 @@ vi.mock("@/lib/access/oracle", () => ({ visibleProjects: async () => ({ projectI
 vi.mock("@/lib/graph/partition-read", () => ({ selectEnforcedGraphPartitions: async () => ({ groups: h.groups }) }));
 vi.mock("@/lib/graph/provenance-read", async () => {
   class GraphProvenanceUnavailableError extends Error {}
+  // R94: the module's scope-epoch signal (the route retries its whole scope on it).
+  class GraphScopeEpochChangedError extends Error {}
   return {
     GraphProvenanceUnavailableError,
+    GraphScopeEpochChangedError,
     readAuthorizedGraphFactsResult: async () => h.read!(),
   };
 });

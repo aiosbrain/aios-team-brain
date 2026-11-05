@@ -20,6 +20,22 @@ export class GraphProvenanceUnavailableError extends Error {
   }
 }
 
+/**
+ * AIO-1167 R94 — the caller's PRINCIPAL scope (its projects → partitions) was resolved under an epoch
+ * that is no longer current. Thrown only for a caller that passed `expectedEpoch`: the helper never
+ * re-certifies caller-owned groups under a newer epoch, because its own checks prove only that the
+ * partition's contents are valid — not that the caller still holds the grants that selected it. The
+ * caller restarts its WHOLE attempt (capture → principal scope → read), or fails closed.
+ */
+export class GraphScopeEpochChangedError extends Error {
+  readonly retryable = true;
+
+  constructor() {
+    super("graph scope authorization changed; the principal's scope must be resolved again");
+    this.name = "GraphScopeEpochChangedError";
+  }
+}
+
 function queryTerms(query: string): string[] {
   return [...new Set(
     (query.toLowerCase().match(/[a-z0-9][a-z0-9'-]{2,}/g) ?? [])
@@ -95,6 +111,8 @@ export async function readAuthorizedGraphFacts(
     query?: string;
     limit?: number;
     sinceISO?: string | null;
+    /** R94: see `readAuthorizedGraphFactsResult` — binds the read to the caller's scope epoch. */
+    expectedEpoch?: number;
   },
 ): Promise<AtomicFact[]> {
   return (await readAuthorizedGraphFactsResult(db, args)).facts;
@@ -110,6 +128,14 @@ export async function readAuthorizedGraphFactsResult(
     sinceISO?: string | null;
     offset?: number;
     discoveryLimit?: number;
+    /**
+     * R94: the epoch the CALLER captured before resolving the principal scope that produced
+     * `groupIds`. When set, the read is bound to exactly that epoch: a different epoch at its start or
+     * end throws `GraphScopeEpochChangedError` (no internal retry, no newer epoch minted for fixed
+     * groups). Omitted, the helper keeps its own bounded retry and returns the epoch it read under for
+     * the caller to compare (`lib/query/retrieve.ts`).
+     */
+    expectedEpoch?: number;
   },
 ): Promise<AuthorizedGraphFactsResult> {
   const groups = [...new Set(args.groupIds.filter(Boolean))];
@@ -129,6 +155,7 @@ export async function readAuthorizedGraphFactsResult(
     // Graph facts carry no person attribution, so a pending attribution repair does not gate them;
     // the revocation barrier still binds read, provenance resolution and publication.
     const epoch = await revocationEpoch(db, args.teamId);
+    if (args.expectedEpoch !== undefined && epoch !== args.expectedEpoch) throw new GraphScopeEpochChangedError();
     try {
       const authorized: PositionedFact[] = [];
       const episodeItem = new Map<string, string | undefined>();
@@ -188,6 +215,10 @@ export async function readAuthorizedGraphFactsResult(
         : false;
       return { facts, incomplete: nextOffset !== null, nextOffset, checked, epoch, itemIds, itemsComplete };
     } catch (error) {
+      // A caller-owned scope is never re-read under a newer epoch here: the caller re-resolves it.
+      if (error instanceof ArcSynthesisAuthorizationChangedError && args.expectedEpoch !== undefined) {
+        throw new GraphScopeEpochChangedError();
+      }
       if (error instanceof ArcSynthesisAuthorizationChangedError && attempt === 0) continue;
       if (
         error instanceof ArcSynthesisAuthorizationChangedError

@@ -53,6 +53,11 @@ export async function GET(req: NextRequest) {
   // unbootstrapped fallback (stored path = one owner), assertDirection (PRET-4 ruling 2:
   // grants ARE the scope), assertNoForeignHistory (pointer-only resolution never reaches the
   // slug-reuse state).
+  // AIO-1167 R94 — the revocation epoch is captured BEFORE the member's oracle scope is resolved, so
+  // the scope below is certified only under the epoch it was read after: a revocation landing anywhere
+  // from here to the final check fails the response closed (empty, degraded) — never the member's old
+  // projects served under a newer epoch. One attempt, as before.
+  const epoch = await revocationEpoch(adminClient(), team.id);
   const { visibleProjectsWithError } = await import("@/lib/access/oracle");
   const { selectEnforcedGraphPartitions } = await import("@/lib/graph/partition-read");
   const oracle = await visibleProjectsWithError(adminClient(), { teamId: team.id, memberId: (me as { id: string }).id });
@@ -94,8 +99,7 @@ export async function GET(req: NextRequest) {
 
   const admin = adminClient();
   // Facts publish no person attribution, so a pending attribution repair does not gate them; the
-  // revocation barrier still brackets the provenance read.
-  const epoch = await revocationEpoch(admin, team.id);
+  // revocation barrier (captured above, before the scope) still brackets the provenance read.
   const since = new Date(Date.now() - WINDOW_HOURS * 3600 * 1000).toISOString();
   const { facts, ok } = await recentFacts(groups, since, LIMIT);
   const episodes = await resolveEpisodeItems(groups, facts.flatMap((fact) => fact.episodeUuids), LIMIT * 8);
