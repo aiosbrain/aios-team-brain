@@ -12,6 +12,15 @@ import { join } from "node:path";
 const ROOT = join(import.meta.dirname, "..", "..");
 const read = (rel: string) => readFileSync(join(ROOT, rel), "utf8");
 
+/**
+ * The ONE shape both query routes must call `retrieve` with: the enforcement view, then the query's
+ * authorization captured BEFORE that view (AIO-1167 R67) — in that order, ending the call. `enforce`
+ * absent or `null` is the unfiltered permissive form; `authorization` absent makes retrieve capture
+ * an epoch AFTER the view was accepted; swapped, the view would be read as the capture.
+ */
+const RETRIEVE_CALL_TAIL = /\bretrieve\([^;]*?,\s*project\s*,\s*enforce\s*,\s*authorization\s*\)/;
+const passesEnforceAndAuthorization = (src: string): boolean => RETRIEVE_CALL_TAIL.test(src);
+
 for (const route of ["app/api/v1/query/route.ts", "app/api/dashboard/query/route.ts"]) {
   describe(`enforcement wired in ${route}`, () => {
     const src = read(route);
@@ -45,10 +54,26 @@ for (const route of ["app/api/v1/query/route.ts", "app/api/dashboard/query/route
       const adm = read("lib/access/admission.ts");
       expect(adm).not.toMatch(/process\.env|teamEnforcesAccess|access_enforcement/);
     });
-    it("resolves the member's visible items and passes enforce to retrieve", () => {
+    it("resolves the member's visible items and passes enforce, then the carried authorization, to retrieve", () => {
       expect(src).toMatch(/resolveContentView\s*\(/);
-      // retrieve is called WITH the enforce arg (not the 5-arg permissive form).
-      expect(src).toMatch(/retrieve\([^)]*enforce\s*\)/);
+      // retrieve is called WITH the enforce arg (not the 5-arg permissive form), followed by the
+      // pre-visibility authorization capture it must carry (R67): `project, enforce, authorization)`.
+      expect(passesEnforceAndAuthorization(src)).toBe(true);
+    });
+    it("the call-site pin rejects each way the tail can be broken (in-memory mutants)", () => {
+      const tail = "project, enforce, authorization)";
+      expect(src).toContain(tail); // the mutations below act on the real call
+      const mutants: Record<string, string> = {
+        "enforce omitted": "project, authorization)",
+        "enforce replaced with null": "project, null, authorization)",
+        "authorization omitted": "project, enforce)",
+        "last two arguments swapped": "project, authorization, enforce)",
+      };
+      for (const [name, replacement] of Object.entries(mutants)) {
+        const mutated = src.replace(tail, replacement);
+        expect(mutated, `${name}: the mutant must change the source`).not.toBe(src);
+        expect(passesEnforceAndAuthorization(mutated), `${name} must be rejected`).toBe(false);
+      }
     });
     it("fails closed on a flag-read error (500, never unfiltered)", () => {
       expect(src).toMatch(/enforcement check failed/);

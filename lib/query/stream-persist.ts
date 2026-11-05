@@ -164,12 +164,22 @@ export async function runAnswerTurn(args: RunAnswerTurnArgs): Promise<void> {
       // `done`, marked the run failed even though the model had succeeded (and been billed), and left
       // the turn unlogged — resurrecting the under-bill through the DB-failure edge. Now a persistence
       // failure takes the catch below BEFORE any `done` was claimed, so the client is told the truth.
-      try {
-        await gate();
-      } catch (e) {
-        if (isRefusal(e)) await accountRefused(chunk.usage);
-        throw e;
-      }
+      // R69: an authorization check is a read, not a lock — a success authorizes nothing past the next
+      // await. So EACH source-bearing step that follows an await re-checks first. Before the spend is
+      // accounted, a refusal accounts it (source-free, once); after, it only refuses.
+      let accounted = false;
+      const fence = async () => {
+        try {
+          await gate();
+        } catch (e) {
+          if (isRefusal(e) && !accounted) {
+            accounted = true;
+            await accountRefused(chunk.usage);
+          }
+          throw e;
+        }
+      };
+      await fence();
       let finalMessageId: string | null = null;
       if (conversationId) {
         finalMessageId = await appendMessage(db, owner, conversationId, "assistant", answer, {
@@ -180,6 +190,7 @@ export async function runAnswerTurn(args: RunAnswerTurnArgs): Promise<void> {
         });
       }
 
+      await fence(); // the answer preview and cited items below are source-bearing
       // CHECK THE ERROR. The db adapter resolves `{ error }` instead of throwing, so an unchecked
       // insert fails SILENTLY — leaving a persisted answer with no spend row, which is precisely the
       // under-bill this slice exists to close. Loud (thrown → logged + the run marked failed) beats a
@@ -197,6 +208,7 @@ export async function runAnswerTurn(args: RunAnswerTurnArgs): Promise<void> {
         latency_ms: now() - args.startedAt,
       });
       if (logError) throw new Error(`query_log insert failed: ${logError.message}`);
+      accounted = true;
 
       await recordLlmUsage(db, {
         teamId: owner.teamId,
@@ -210,10 +222,14 @@ export async function runAnswerTurn(args: RunAnswerTurnArgs): Promise<void> {
         estimated: chunk.usage.estimated,
       });
 
-      // Flip the run LAST, pointing at the message that now exists.
+      // Flip the run LAST, pointing at the message that now exists — never as a success after a
+      // revocation that committed while the spend was being accounted.
+      await fence();
       if (runId) await finishRun(db, runId, finalMessageId);
 
-      // Everything durable is written — NOW tell the client the turn is complete.
+      // Everything durable is written — NOW tell the client the turn is complete, still authorized:
+      // a refusal here takes the catch, which marks the run failed (overriding `done`) and clears it.
+      await fence();
       send("sources", { sources });
       send("done", chunk.usage);
 

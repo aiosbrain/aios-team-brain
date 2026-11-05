@@ -121,8 +121,8 @@ export async function twoClaimFixture() {
 
 /** `v1` (API member key), `delegated` (v1 with the agent's token) or `dashboard` (session member). */
 export type Route = "v1" | "delegated" | "dashboard";
-export async function ask(route: Route, seed: Seed, key: string): Promise<Response> {
-  const body = { question: "zephyrquartz ledger owner?" };
+export async function ask(route: Route, seed: Seed, key: string, conversationId?: string): Promise<Response> {
+  const body = { question: "zephyrquartz ledger owner?", ...(conversationId ? { conversation_id: conversationId } : {}) };
   if (route === "v1" || route === "delegated") {
     const { POST } = await import("@/app/api/v1/query/route");
     return POST(new Request("http://test/api/v1/query", {
@@ -136,6 +136,14 @@ export async function ask(route: Route, seed: Seed, key: string): Promise<Respon
     method: "POST", headers: { "content-type": "application/json" },
     body: JSON.stringify({ team: seed.teamSlug, ...body }),
   }) as unknown as NextRequest);
+}
+
+/** An existing conversation owned by the fixture's reader (the path with no title generation). */
+export async function ownedConversation(seed: Seed): Promise<string> {
+  const { data, error } = await db().from("conversations")
+    .insert({ team_id: seed.teamId, member_id: seed.memberId, title: "earlier ledger thread" }).select("id").single();
+  if (error || !data) throw new Error(`conversation seed failed: ${error?.message}`);
+  return (data as { id: string }).id;
 }
 
 /** Everything a turn could have stored from the captured context. */

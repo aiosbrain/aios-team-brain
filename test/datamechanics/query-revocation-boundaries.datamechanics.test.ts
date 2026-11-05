@@ -4,7 +4,9 @@ import { getPool } from "@/lib/db/pg/pool";
 import { CONTEXT_AUTHORIZATION_CLIENT_MESSAGE } from "@/lib/query/stream-retry";
 import { recordGdriveItemClaim } from "@/lib/projects/context/gdrive-claims";
 import { db, driveFixture } from "./helpers";
-import { ITEM_TEXT, ask, expectNothingRevokedLeft, stored, twoClaimFixture } from "./query-revocation-fixture";
+import {
+  ITEM_TEXT, ask, expectNothingRevokedLeft, ownedConversation, stored, twoClaimFixture,
+} from "./query-revocation-fixture";
 
 // AIO-1167 R67 — the query's authorization runs from BEFORE the view that selects its content to
 // every later consumer of what it produced. Real routes, real admission, real `retrieve` (with a
@@ -23,6 +25,10 @@ const probe = vi.hoisted(() => {
     answer: null as null | ((attempt: number) => Promise<Response>),
     title: null as null | (() => Promise<void>),
     beforeTitleHelper: null as null | (() => Promise<void>),
+    // R69: awaits INSIDE the terminal persistence, where a revocation can commit between two steps.
+    afterAssistant: null as null | (() => Promise<void>),
+    duringAccounting: null as null | (() => Promise<void>),
+    duringFinish: null as null | (() => Promise<void>),
   };
 });
 
@@ -74,6 +80,38 @@ vi.mock("@/lib/chat/title", async (importOriginal) => {
     },
   };
 });
+// The REAL owners, each entered through a seam that lets a revocation commit inside its await.
+vi.mock("@/lib/chat/store", async (importOriginal) => {
+  const real = await importOriginal<typeof import("@/lib/chat/store")>();
+  return {
+    ...real,
+    appendMessage: async (...args: Parameters<typeof real.appendMessage>) => {
+      const id = await real.appendMessage(...args);
+      if (args[3] === "assistant" && probe.afterAssistant) await probe.afterAssistant();
+      return id;
+    },
+  };
+});
+vi.mock("@/lib/costs/llm-usage", async (importOriginal) => {
+  const real = await importOriginal<typeof import("@/lib/costs/llm-usage")>();
+  return {
+    ...real,
+    recordLlmUsage: async (...args: Parameters<typeof real.recordLlmUsage>) => {
+      if (args[1].source === "query" && probe.duringAccounting) await probe.duringAccounting();
+      return real.recordLlmUsage(...args);
+    },
+  };
+});
+vi.mock("@/lib/query/turn-runs", async (importOriginal) => {
+  const real = await importOriginal<typeof import("@/lib/query/turn-runs")>();
+  return {
+    ...real,
+    finishRun: async (...args: Parameters<typeof real.finishRun>) => {
+      if (probe.duringFinish) await probe.duringFinish();
+      return real.finishRun(...args);
+    },
+  };
+});
 vi.mock("@/lib/auth/session", () => ({ getSessionUser: vi.fn() }));
 vi.mock("@/lib/db/server", () => ({ serverClient: vi.fn() }));
 
@@ -105,6 +143,7 @@ function scripted(steps: Array<Uint8Array | (() => Promise<void>)>): Response {
 beforeEach(() => {
   Object.assign(probe, {
     afterView: null, epochUnreadable: false, requests: [], answer: null, title: null, beforeTitleHelper: null,
+    afterAssistant: null, duringAccounting: null, duringFinish: null,
   });
   let answers = 0;
   vi.stubGlobal("fetch", vi.fn(async (url: unknown, init?: { body?: unknown }) => {
@@ -157,6 +196,13 @@ async function conversationTitles(teamId: string): Promise<string[]> {
 async function usageRows(teamId: string) {
   const { rows } = await getPool().query<{ source: string; output_tokens: number }>(
     `select source, output_tokens from llm_usage where team_id=$1 order by created_at`, [teamId]);
+  return rows;
+}
+
+async function queryLogRows(teamId: string) {
+  const { rows } = await getPool().query<{ answer_preview: string | null; cited: number; output_tokens: number }>(
+    `select answer_preview, coalesce(cardinality(cited_item_ids), 0)::int as cited, output_tokens
+       from query_log where team_id=$1`, [teamId]);
   return rows;
 }
 
@@ -309,6 +355,14 @@ describe("AIO-1167 R67 a revocation after dispatch stops all later output (real 
 
     expect(requested("title")).toHaveLength(1);
     expect(await conversationTitles(seed.teamId)).not.toContain("Ledger owner");
+    if (route === "v1") {
+      // R69: the log write after the title await re-checks — no source-bearing preview or citations,
+      // and the spend is accounted exactly once.
+      expect(await queryLogRows(seed.teamId)).toEqual([
+        { answer_preview: "", cited: 0, output_tokens: 5 },
+      ]);
+      expect((await usageRows(seed.teamId)).filter((row) => row.source === "query")).toHaveLength(1);
+    }
   });
 
   it.each(["v1", "dashboard"] as const)("%s, unchanged: answer, citations, message, title and spend — a transport retry included", async (route) => {
@@ -353,3 +407,83 @@ async function settledRunOrNone(route: "v1" | "dashboard", teamId: string): Prom
   if (route === "dashboard") await settledRun(teamId);
   else await new Promise((resolve) => setTimeout(resolve, 50));
 }
+
+// ── R69: a terminal success authorizes nothing past the next await ───────────────────────────────
+
+describe("AIO-1167 R69 terminal source-publication fence (real Postgres)", () => {
+  it("v1: revoked after the assistant message is stored — the log carries no preview or citations, spend once", async () => {
+    const { seed, key, revokeA } = await fixture();
+    const conversation = await ownedConversation(seed); // existing thread: no title generation
+    probe.afterAssistant = async () => {
+      probe.afterAssistant = null;
+      await revokeA();
+    };
+
+    const sse = await (await ask("v1", seed, key, conversation)).text();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(sse).toContain("event: done"); // published before the revocation committed
+    expect(await queryLogRows(seed.teamId)).toEqual([{ answer_preview: "", cited: 0, output_tokens: 5 }]);
+    expect((await usageRows(seed.teamId)).filter((row) => row.source === "query")).toHaveLength(1);
+  });
+
+  it("dashboard, existing conversation: revoked while the spend is accounted — no sources/done, partial cleared, spend once", async () => {
+    const { seed, key, revokeA } = await fixture();
+    const conversation = await ownedConversation(seed);
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => { release = resolve; });
+    probe.duringAccounting = async () => {
+      probe.duringAccounting = null;
+      await released; // the accounting write is held…
+    };
+
+    const pending = ask("dashboard", seed, key, conversation).then((res) => res.text());
+    for (let i = 0; i < 200 && probe.duringAccounting !== null; i += 1) await new Promise((r) => setTimeout(r, 10));
+    await revokeA(); // …a revocation commits meanwhile…
+    release(); // …and the accounting completes.
+    const sse = await pending;
+    const run = await settledRun(seed.teamId);
+
+    expect(sse).not.toContain("event: sources");
+    expect(sse).not.toContain("event: done");
+    expect(sse).toContain(CONTEXT_AUTHORIZATION_CLIENT_MESSAGE);
+    expect(run).toEqual({ status: "error", partial_text: "", error_message: CONTEXT_AUTHORIZATION_CLIENT_MESSAGE });
+    expect((await usageRows(seed.teamId)).filter((row) => row.source === "query")).toHaveLength(1);
+    expect(await queryLogRows(seed.teamId)).toHaveLength(1);
+  });
+
+  it("dashboard: revoked while the run is being completed — the publication gate refuses and the run is failed", async () => {
+    const { seed, key, revokeA } = await fixture();
+    const conversation = await ownedConversation(seed);
+    probe.duringFinish = async () => {
+      probe.duringFinish = null;
+      await revokeA();
+    };
+
+    const sse = await (await ask("dashboard", seed, key, conversation)).text();
+    const run = await settledRun(seed.teamId);
+
+    expect(sse).not.toContain("event: sources");
+    expect(sse).not.toContain("event: done");
+    expect(sse).toContain(CONTEXT_AUTHORIZATION_CLIENT_MESSAGE);
+    expect(run).toEqual({ status: "error", partial_text: "", error_message: CONTEXT_AUTHORIZATION_CLIENT_MESSAGE });
+    expect((await usageRows(seed.teamId)).filter((row) => row.source === "query")).toHaveLength(1);
+  });
+
+  it.each(["v1", "dashboard"] as const)("%s, existing conversation, unchanged: stored answer, preview, citations, completion, spend", async (route) => {
+    const { seed, key } = await fixture();
+    const conversation = await ownedConversation(seed);
+
+    const sse = await (await ask(route, seed, key, conversation)).text();
+    await settledRunOrNone(route, seed.teamId);
+
+    expect(sse).toContain("event: sources");
+    expect(sse).toContain("event: done");
+    expect((await stored(seed)).messages).toContain("assistant:The owner is the payments desk [S1].");
+    expect(await queryLogRows(seed.teamId)).toEqual([
+      { answer_preview: "The owner is the payments desk [S1].", cited: 1, output_tokens: 5 },
+    ]);
+    expect((await usageRows(seed.teamId)).filter((row) => row.source === "query")).toHaveLength(1);
+    if (route === "dashboard") expect(await settledRun(seed.teamId)).toMatchObject({ status: "done", partial_text: "" });
+  });
+});

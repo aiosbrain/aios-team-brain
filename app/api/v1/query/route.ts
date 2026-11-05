@@ -321,9 +321,20 @@ export async function POST(req: NextRequest) {
               }
             }
 
-            // Accounting is kept either way (the provider billed it); the answer itself only when stored.
+            // Accounting is kept either way (the provider billed it); the answer itself only when stored —
+            // and only while still authorized NOW (R69): the awaits above (the assistant message, the
+            // title request) can span a revocation, and an earlier success authorizes nothing after it.
+            let preview = persist;
+            if (preview) {
+              try {
+                await gate();
+              } catch (e) {
+                if (!isRefusal(e)) throw e;
+                preview = false;
+              }
+            }
             await db.from("query_log").update({
-              ...(persist ? {
+              ...(preview ? {
                 answer_preview: answer.slice(0, 500),
                 cited_item_ids: sources.map((s) => s.item_id).filter(Boolean),
               } : {}),
