@@ -211,7 +211,7 @@ describe("a publication and a concurrent Everyone removal serialize, both interl
     const save = saveGdriveConnectionConfig(adminClient(), w.auth, {
       name: w.name, config: { ...before.row.config, fileIds: [], audienceProjectIds: [w.audience] },
     }).then(() => "saved", (e: unknown) => (e as { code?: string }).code);
-    expect(await waitsOnLock("%from members where id=$1 and team_id=$2 for update%"), "the publication waited on the removal").toBe(true);
+    expect(await waitsOnLock("%select role,status from members where id=$1 and team_id=$2 for no key update%"), "the publication waited on the removal").toBe(true);
     open();
     expect((await removal).ok).toBe(true);
     expect(await save).toBe("admin_authority_changed");

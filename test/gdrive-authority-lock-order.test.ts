@@ -120,7 +120,7 @@ const advisoryKey = (e: Entry) => (e.sql.includes("pg_advisory_xact_lock(hashtex
 const isIdentityLock = (e: Entry) => advisoryKey(e) === `${TEAM}:identity-authority`;
 const isNamedLock = (e: Entry) => advisoryKey(e) === `${TEAM}:gdrive:${NAME}`;
 const isConnectionLock = (e: Entry) => e.sql.includes("from integrations i") && e.sql.endsWith("for update of i, a");
-const isAdminLock = (e: Entry) => e.sql === "select role,status from members where id=$1 and team_id=$2 for update";
+const isAdminLock = (e: Entry) => e.sql === "select role,status from members where id=$1 and team_id=$2 for no key update";
 /** AIO-1167 R86 F4: the Admin's ACTUAL builtin Everyone membership, share-locked after the member row. */
 const isEveryoneLock = (e: Entry) => e.sql.includes("from group_members gm") && e.sql.endsWith("for share of gm");
 const isPrincipalLock = (e: Entry) => e.sql.includes("from api_keys k") && e.sql.endsWith("for update of k, m");

@@ -309,16 +309,24 @@ export async function lockGdriveConnection(teamId: string, integrationId: string
  * an Admin removed from Everyone during an OAuth exchange, a provider refresh/preview, a verified
  * selection or an ordinary save publishes nothing.
  *
- * Both rows are LOCKED through the caller's publication: the member row `for update`, then its Everyone
- * membership row `for share`. A sanctioned narrowing (`removeMemberFromGroup`, a posture move) locks
- * the member row first too and only then deletes the membership (lib/access/groups), so a removal
- * either commits before this check and is seen, or waits until the publication commits — never
- * member-row/membership-row inverted. A read failure throws: the publication fails closed.
+ * Both rows are LOCKED through the caller's publication: the member row `for no key update`, then its
+ * Everyone membership row `for share`. A sanctioned narrowing (`removeMemberFromGroup`, a posture move)
+ * locks the member row first too (`for no key update`, which conflicts with this one) and only then
+ * deletes the membership (lib/access/groups), so a removal either commits before this check and is seen,
+ * or waits until the publication commits — never member-row/membership-row inverted. A role/status
+ * update and a hard deletion conflict with it as well. A read failure throws: the publication fails closed.
+ *
+ * `for no key update`, not `for update` (AIO-1167 R89): a protected answer publication holds the
+ * revocation epoch `for share` and then needs a foreign-key KEY SHARE on this same member row for its
+ * message insert, while a Drive Admin publication that narrows an audience or creates a verified mapping
+ * advances that epoch while holding this lock. `for update` would block the key share and close a
+ * deadlock cycle; `for no key update` admits it, so the answer completes and the Drive publication's
+ * epoch advance then follows.
  * Always AFTER the connection rows (and so after the identity authority): see `lockedAuthority`.
  */
 export async function lockActiveTeamAdmin(teamId: string, memberId: string): Promise<boolean> {
   const { rows } = await runSql<{ role: string; status: string }>(
-    `select role,status from members where id=$1 and team_id=$2 for update`,
+    `select role,status from members where id=$1 and team_id=$2 for no key update`,
     [memberId, teamId],
   );
   if (rows[0]?.role !== "admin" || rows[0]?.status !== "active") return false;
