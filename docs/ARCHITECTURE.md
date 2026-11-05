@@ -1706,8 +1706,11 @@ recorded. On both routes a refusal before the cosmetic title request or its writ
 silently absorbed: that title operation is skipped, and a completed dashboard run remains `done`.
 Bytes already delivered and writes the preceding successful check admitted — an assistant
 message, a run's completion pointer — are retained, never recalled, even if authorization changed
-while they were in flight. The provider's spend is recorded once: source-free (tokens and cost only)
-by a refusal that comes before it was recorded, and never again by one after. A dashboard answer-turn
+while they were in flight. Accounting follows the provider's terminal usage: a refusal before that
+usage is known records no provider spend (the dashboard writes no usage; v1 may keep only its reserved
+zero-token `query_log` row, with no `llm_usage`). Once terminal usage is available, a refusal before
+it was recorded records it best-effort and source-free (tokens and cost only), and a refusal after it
+was recorded never records it a second time. A dashboard answer-turn
 refusal through terminal publication ends the run failed with its partial text cleared
 (`failRun(..., { clearPartial })`).
 Nothing is locked across a model request, and nothing is written to the counter here.
