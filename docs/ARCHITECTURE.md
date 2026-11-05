@@ -1695,15 +1695,21 @@ operation immediately after it, and authorization can change while that operatio
 every source-bearing step that follows an await re-checks first — the v1 log write after the
 assistant message and title awaits (which then omits the answer preview and cited items), and on the
 dashboard the log insert after the assistant message, the run's completion (`finishRun`) and the
-terminal `sources`/`done`. Changed or unreadable authorization refuses the NEXT gated step with the
-sanitized, retryable error (`CONTEXT_AUTHORIZATION_CLIENT_MESSAGE`, a 503 or SSE error): refused
-before a dispatch, that request is never sent; refused before the assistant write, that message is
-never stored; and once a check detects a change, no subsequent source-bearing publication or write is
-admitted. Bytes already delivered and writes the preceding successful check admitted — an assistant
+terminal `sources`/`done`. Changed or unreadable authorization refuses the NEXT gated operation:
+refused before a dispatch, that request is never sent; refused before the assistant write, that
+message is never stored; and once a check detects a change, no subsequent source-bearing publication
+or write is admitted. An answer-turn refusal through terminal `sources`/`done` publication returns
+the sanitized, retryable error (`CONTEXT_AUTHORIZATION_CLIENT_MESSAGE`, a 503 or SSE error); after
+v1 has sent `done`, its persistence and preview refusals instead silently omit the denied
+source-bearing writes (assistant message, title, preview, cited items) while the accounting is still
+recorded. On both routes a refusal before the cosmetic title request or its write, after `done`, is
+silently absorbed: that title operation is skipped, and a completed dashboard run remains `done`.
+Bytes already delivered and writes the preceding successful check admitted — an assistant
 message, a run's completion pointer — are retained, never recalled, even if authorization changed
 while they were in flight. The provider's spend is recorded once: source-free (tokens and cost only)
-by a refusal that comes before it was recorded, and never again by one after. A refused dashboard run
-ends failed with its partial text cleared (`failRun(..., { clearPartial })`).
+by a refusal that comes before it was recorded, and never again by one after. A dashboard answer-turn
+refusal through terminal publication ends the run failed with its partial text cleared
+(`failRun(..., { clearPartial })`).
 Nothing is locked across a model request, and nothing is written to the counter here.
 
 The Timeline reads Drive evidence through a stable seek-paginated ledger independent of the generic

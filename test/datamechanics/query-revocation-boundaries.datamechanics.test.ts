@@ -448,10 +448,21 @@ describe("AIO-1167 R69 terminal source-publication fence (real Postgres)", () =>
     };
 
     const pending = ask("dashboard", seed, key, conversation).then((res) => res.text());
-    for (let i = 0; i < 200 && probe.duringAccounting !== null; i += 1) await new Promise((r) => setTimeout(r, 10));
-    await revokeA(); // …a revocation commits meanwhile…
-    release(); // …and the accounting completes.
-    const sse = await pending;
+    // Settles either way, so the held request is always drained — even when an assertion below fails.
+    const settled = pending.then((text) => ({ text }), (error: unknown) => ({ error }));
+    try {
+      for (let i = 0; i < 200 && probe.duringAccounting !== null; i += 1) await new Promise((r) => setTimeout(r, 10));
+      // No silent fallback: the revocation must land WHILE the accounting write is held.
+      expect(probe.duringAccounting, "the accounting write was reached and is being held").toBeNull();
+      await revokeA(); // …a revocation commits meanwhile…
+    } finally {
+      probe.duringAccounting = null;
+      release(); // …and the accounting completes (or the unheld request finishes).
+      await settled;
+    }
+    const outcome = await settled;
+    if ("error" in outcome) throw outcome.error;
+    const sse = outcome.text;
     const run = await settledRun(seed.teamId);
 
     expect(sse).not.toContain("event: sources");
