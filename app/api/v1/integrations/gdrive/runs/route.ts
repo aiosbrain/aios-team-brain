@@ -26,6 +26,14 @@ const outcomeFields = {
   cursorAgeSeconds: z.number().nonnegative().nullable().optional(),
   authoritativeComplete: z.boolean().default(false),
   error: z.string().max(500).optional(),
+  // AIO-1167 R83 F1: the execution that PRODUCED this outcome, frozen when the coordinator acquired
+  // it. Absent only before acquisition (a busy deferral, an acquisition refusal); a `complete` or
+  // `partial` report without it is refused by the authority owner.
+  execution: z.object({
+    generation: z.number().int().positive(),
+    fence: z.number().int().nonnegative(),
+    owner: z.string().min(1).max(200),
+  }).strict().optional(),
 };
 const outcomeSchema = z.union([
   // A claimed request is reported only with the attempt token its claim returned.
@@ -89,21 +97,23 @@ export async function POST(req: NextRequest) {
   };
   if ("reportId" in outcome) {
     try {
-      const completed = await recordScheduledGdriveRun({
+      await recordScheduledGdriveRun({
         reportId: outcome.reportId, integrationId: outcome.integrationId, teamId: auth.teamId,
         apiKeyId: auth.apiKeyId, memberId: auth.memberId, status: outcome.status,
-        summary, error: outcome.error, startedAt: outcome.startedAt,
-      });
-      // The durable report above is kept either way; a neutral outcome only skips the ledger append.
-      if (completed.newly_completed && disposition !== "neutral") await recordIngestRun(adminClient(), {
-        teamId: auth.teamId, source: "gdrive", trigger: "scheduler",
-        ok: disposition === "success",
-        created: outcome.created, updated: outcome.updated, unchanged: outcome.unchanged,
-        errors: outcome.error ? [outcome.error] : outcome.failed ? [`${outcome.failed} Drive work item(s) failed`] : [],
-        meta: { reportId: outcome.reportId, status: outcome.status, removed: outcome.removed,
-          skipped: outcome.skipped, authoritativeComplete: outcome.authoritativeComplete,
-          backlog: outcome.backlog ?? null, cursorAgeSeconds: outcome.cursorAgeSeconds ?? null },
-        startedAt: new Date(completed.started_at).getTime(),
+        summary, error: outcome.error, startedAt: outcome.startedAt, execution: outcome.execution,
+        // The durable report is kept either way; a neutral outcome only skips the ledger append. The
+        // append runs INSIDE the report's authority-locked transaction (R83 F1), only when newly recorded.
+        publish: disposition === "neutral" ? undefined : (completed) => recordIngestRun(adminClient(), {
+          teamId: auth.teamId, source: "gdrive", trigger: "scheduler",
+          ok: disposition === "success",
+          created: outcome.created, updated: outcome.updated, unchanged: outcome.unchanged,
+          errors: outcome.error ? [outcome.error] : outcome.failed ? [`${outcome.failed} Drive work item(s) failed`] : [],
+          meta: { reportId: outcome.reportId, status: outcome.status, removed: outcome.removed,
+            skipped: outcome.skipped, authoritativeComplete: outcome.authoritativeComplete,
+            backlog: outcome.backlog ?? null, cursorAgeSeconds: outcome.cursorAgeSeconds ?? null,
+            execution: outcome.execution ?? null },
+          startedAt: new Date(completed.started_at).getTime(),
+        }),
       });
       return Response.json({ ok: true }, { headers: { "Cache-Control": "no-store" } });
     } catch (error) {
@@ -113,18 +123,20 @@ export async function POST(req: NextRequest) {
   const completed = await completeGdriveRun({
     requestId: outcome.requestId, attemptToken: outcome.attemptToken, teamId: auth.teamId,
     apiKeyId: auth.apiKeyId, memberId: auth.memberId,
-    status: outcome.status, summary, error: outcome.error,
+    status: outcome.status, summary, error: outcome.error, execution: outcome.execution,
+    // Inside the report's authority-locked transaction (R83 F1), only for a newly completed request.
+    publish: disposition === "neutral" ? undefined : (done) => recordIngestRun(adminClient(), {
+      teamId: auth.teamId, source: "gdrive", trigger: "manual",
+      ok: disposition === "success",
+      created: outcome.created, updated: outcome.updated, unchanged: outcome.unchanged,
+      errors: outcome.error ? [outcome.error] : outcome.failed ? [`${outcome.failed} Drive work item(s) failed`] : [],
+      meta: { requestId: outcome.requestId, requestTrigger: done.trigger, status: outcome.status,
+        removed: outcome.removed, skipped: outcome.skipped, authoritativeComplete: outcome.authoritativeComplete,
+        backlog: outcome.backlog ?? null, cursorAgeSeconds: outcome.cursorAgeSeconds ?? null,
+        execution: outcome.execution ?? null },
+      startedAt: new Date(done.started_at).getTime(),
+    }),
   });
   if (!completed) return errorResponse("stale_execution", "Google Drive run attempt is no longer current", 409);
-  if (completed.newly_completed && disposition !== "neutral") await recordIngestRun(adminClient(), {
-    teamId: auth.teamId, source: "gdrive", trigger: "manual",
-    ok: disposition === "success",
-    created: outcome.created, updated: outcome.updated, unchanged: outcome.unchanged,
-    errors: outcome.error ? [outcome.error] : outcome.failed ? [`${outcome.failed} Drive work item(s) failed`] : [],
-    meta: { requestId: outcome.requestId, requestTrigger: completed.trigger, status: outcome.status,
-      removed: outcome.removed, skipped: outcome.skipped, authoritativeComplete: outcome.authoritativeComplete,
-      backlog: outcome.backlog ?? null, cursorAgeSeconds: outcome.cursorAgeSeconds ?? null },
-    startedAt: new Date(completed.started_at).getTime(),
-  });
   return Response.json({ ok: true }, { headers: { "Cache-Control": "no-store" } });
 }

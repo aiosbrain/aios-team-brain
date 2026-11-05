@@ -63,9 +63,20 @@ describe("AIO-1167 authenticated HTTP connector authority", () => {
     expect(claim.status).toBe(200);
     const claimed = await claim.json();
     expect(claimed).toMatchObject({ request: { id: (first as { id: string }).id } });
+    // The run that produced the completion: acquired, then released normally — and named by its
+    // frozen execution identity on the wire (AIO-1167 R83 F1).
+    const run = await acquire(issued.key, seed, integrationId);
+    expect(run.response.status).toBe(200);
+    const released = await fetch(`${BASE_URL}/api/v1/integrations/gdrive/execution`, {
+      method: "POST", headers,
+      body: JSON.stringify({ action: "release", integration_id: integrationId, owner: run.owner,
+        generation: run.body.generation, fence: run.body.fence }),
+    });
+    expect(released.status).toBe(200);
     const completion = {
       requestId: (first as { id: string }).id, attemptToken: claimed.request.attempt_token as string,
       status: "complete", unchanged: 1, backlog: 0, authoritativeComplete: true,
+      execution: { generation: run.body.generation, fence: run.body.fence, owner: run.owner },
     };
     // A request outcome without its attempt token never reaches the request.
     const tokenless: Record<string, unknown> = { ...completion };

@@ -113,6 +113,19 @@ async function acquire(key: string, seed: Seed, integrationId: string, owner = r
   return { response, body: await response.json(), owner };
 }
 
+/** A finished coordinator run's execution as the sidecar reports it (AIO-1167 R83 F1): acquired, then
+ *  released normally — still the connection's current authority when its report arrives. */
+async function ranExecution(key: string, seed: Seed, integrationId: string) {
+  const run = await acquire(key, seed, integrationId);
+  expect(run.response.status).toBe(200);
+  const released = await executionPOST(request("http://test/api/v1/integrations/gdrive/execution", key, seed.teamSlug, {
+    action: "release", integration_id: integrationId, owner: run.owner,
+    generation: run.body.generation, fence: run.body.fence,
+  }));
+  expect(released.status).toBe(200);
+  return { generation: run.body.generation as number, fence: run.body.fence as number, owner: run.owner };
+}
+
 describe("AIO-1167 F1: a busy scheduled/notification deferral is neutral in the Admin run ledger (real Postgres)", () => {
   type Report = Record<string, unknown>;
   const BUSY: Report = {
@@ -125,8 +138,11 @@ describe("AIO-1167 F1: a busy scheduled/notification deferral is neutral in the 
     const integrationId = await integration(seed, `scheduled-${randomUUID().slice(0, 8)}`);
     const trusted = await provision(seed, integrationId);
     const report = async (fields: Report, reportId = randomUUID()) => {
+      // A run that acquired names its execution; a busy deferral acquired nothing and names none.
+      const execution = fields.status === "deferred" ? undefined : await ranExecution(trusted.key, seed, integrationId);
       const response = await runsPOST(request("http://test/api/v1/integrations/gdrive/runs", trusted.key, seed.teamSlug, {
-        reportId, integrationId, trigger: "scheduler", startedAt: new Date().toISOString(), ...fields,
+        reportId, integrationId, trigger: "scheduler", startedAt: new Date().toISOString(),
+        ...(execution ? { execution } : {}), ...fields,
       }));
       return { status: response.status, reportId };
     };
@@ -259,8 +275,10 @@ describe("AIO-1167 r37: manual Drive runs follow the same ledger rule (real Post
     const seed = await seedTeam();
     const integrationId = await integration(seed, `manual-${randomUUID().slice(0, 8)}`);
     const trusted = await provision(seed, integrationId);
-    const post = (claim: { requestId: string; attemptToken: string }, fields: Record<string, unknown>) =>
-      runsPOST(request("http://test/api/v1/integrations/gdrive/runs", trusted.key, seed.teamSlug, { ...claim, ...fields }));
+    const post = async (claim: { requestId: string; attemptToken: string }, fields: Record<string, unknown>) =>
+      runsPOST(request("http://test/api/v1/integrations/gdrive/runs", trusted.key, seed.teamSlug, {
+        ...claim, execution: await ranExecution(trusted.key, seed, integrationId), ...fields,
+      }));
 
     const healthy = await manualRun(seed, integrationId, trusted);
     expect((await post(healthy, { status: "partial", created: 2, failed: 0, backlog: 4 })).status).toBe(200);
@@ -323,15 +341,16 @@ describe("AIO-1167 Drive principal, broker, generation, and fence (real Postgres
     expect(await (await runsGET(getRequest("http://test/api/v1/integrations/gdrive/runs", trusted.key, seed.teamSlug))).json())
       .toEqual({ request: null });
 
+    const execution = await ranExecution(trusted.key, seed, integrationId);
     const completed = await runsPOST(request(
       "http://test/api/v1/integrations/gdrive/runs", trusted.key, seed.teamSlug,
-      { requestId: (queued as { id: string }).id, attemptToken, status: "complete", created: 2, updated: 1, unchanged: 3, removed: 1, failed: 0, backlog: 0, authoritativeComplete: true },
+      { requestId: (queued as { id: string }).id, attemptToken, status: "complete", created: 2, updated: 1, unchanged: 3, removed: 1, failed: 0, backlog: 0, authoritativeComplete: true, execution },
     ));
     expect(completed.status).toBe(200);
     const replay = await runsPOST(request(
       "http://test/api/v1/integrations/gdrive/runs", trusted.key, seed.teamSlug,
       { requestId: (queued as { id: string }).id, attemptToken, status: "complete", created: 2, updated: 1,
-        unchanged: 3, removed: 1, failed: 0, backlog: 0, authoritativeComplete: true },
+        unchanged: 3, removed: 1, failed: 0, backlog: 0, authoritativeComplete: true, execution },
     ));
     expect(replay.status).toBe(200);
     const { data: row } = await db().from("gdrive_run_requests").select("status,summary")
@@ -431,8 +450,11 @@ describe("AIO-1167 Drive principal, broker, generation, and fence (real Postgres
       const running = await runRow(requestId);
       expect(running).toMatchObject({ status: "running", attempt_token: b!.attempt_token, finished_at: null });
 
+      // B's own run: a fresh execution after A's lease ended, released normally before B reports.
+      const bRun = await ranExecution(trusted.key, seed, integrationId);
+      const aRun = { generation: active.body.generation as number, fence: active.body.fence as number, owner: active.owner };
       // A's delayed completion and deferral both fail, and change nothing of B's attempt.
-      const staleComplete = await report(seed, trusted.key, outcome(requestId, a!.attempt_token, { created: 9 }));
+      const staleComplete = await report(seed, trusted.key, outcome(requestId, a!.attempt_token, { created: 9, execution: aRun }));
       expect(staleComplete.status).toBe(409);
       expect(staleComplete.body.error.code).toBe("stale_execution");
       const staleDefer = await report(seed, trusted.key, outcome(requestId, a!.attempt_token, {
@@ -443,17 +465,17 @@ describe("AIO-1167 Drive principal, broker, generation, and fence (real Postgres
       expect(await manualLedger(seed)).toEqual([]);
 
       // B completes; its exact replay is idempotent, a conflicting one is refused.
-      expect((await report(seed, trusted.key, outcome(requestId, b!.attempt_token))).status).toBe(200);
+      expect((await report(seed, trusted.key, outcome(requestId, b!.attempt_token, { execution: bRun }))).status).toBe(200);
       const finished = await runRow(requestId);
       expect(finished).toMatchObject({
         status: "complete", attempt_token: b!.attempt_token, started_at: running.started_at,
         error: null, summary: expect.objectContaining({ created: 1, unchanged: 2 }),
       });
       expect(finished.finished_at).not.toBeNull();
-      expect((await report(seed, trusted.key, outcome(requestId, b!.attempt_token))).status).toBe(200);
-      expect((await report(seed, trusted.key, outcome(requestId, b!.attempt_token, { created: 5 }))).status).toBe(409);
+      expect((await report(seed, trusted.key, outcome(requestId, b!.attempt_token, { execution: bRun }))).status).toBe(200);
+      expect((await report(seed, trusted.key, outcome(requestId, b!.attempt_token, { created: 5, execution: bRun }))).status).toBe(409);
       // A stays stale after B finished, too.
-      expect((await report(seed, trusted.key, outcome(requestId, a!.attempt_token))).status).toBe(409);
+      expect((await report(seed, trusted.key, outcome(requestId, a!.attempt_token, { execution: aRun }))).status).toBe(409);
       expect(await runRow(requestId)).toEqual(finished);
       const ledger = await manualLedger(seed);
       expect(ledger).toHaveLength(1);
@@ -541,6 +563,7 @@ describe("AIO-1167 Drive principal, broker, generation, and fence (real Postgres
       reportId, integrationId, trigger: "scheduler", startedAt: new Date().toISOString(),
       status: "complete", unchanged: 4, skipped: 2, backlog: 0,
       cursorAgeSeconds: 3, authoritativeComplete: true,
+      execution: await ranExecution(trusted.key, seed, integrationId),
     };
     expect((await runsPOST(request(
       "http://test/api/v1/integrations/gdrive/runs", trusted.key, seed.teamSlug, body,

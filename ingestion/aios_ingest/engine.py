@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 from collections import Counter
 from dataclasses import dataclass
-from typing import Iterable, Iterator
+from typing import Any, Iterable, Iterator
 
 from .brain_client import BrainClient, BrainError
 from .config import BrainSettings, Connection
@@ -37,6 +37,9 @@ class IngestSummary:
     backlog: int | None = None
     cursor_age_seconds: float | None = None
     integration_id: str | None = None
+    # AIO-1167 R83 F1: the Drive execution that PRODUCED this outcome — ``{generation, fence, owner}``,
+    # frozen when it was acquired and never re-read later. ``None`` before (or without) an acquisition.
+    execution: dict[str, Any] | None = None
 
     @property
     def total(self) -> int:

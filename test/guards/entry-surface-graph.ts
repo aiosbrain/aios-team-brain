@@ -1528,6 +1528,14 @@ export const ENTRY_INVENTORY: Record<string, EntryRecord> = {
       "execution route). It hands the fenced connector a short-lived Google access token and writes " +
       "no item",
   },
+  "app/api/v1/integrations/gdrive/runs/route.ts": {
+    class: "IMPORT_ONLY",
+    reason:
+      "reaches lib/integrations/gdrive-authority through lib/integrations/gdrive-runs (AIO-1167 R83 F1: " +
+      "lockGdriveReportAuthority / gdriveTerminalReportVerdict bind a terminal run report to the execution " +
+      "that produced it; same edge as the execution route). It records a run report and its ingest_runs " +
+      "ledger row and writes no item",
+  },
   "app/api/v1/integrations/route.ts": {
     class: "IMPORT_ONLY",
     reason:

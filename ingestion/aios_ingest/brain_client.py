@@ -504,6 +504,7 @@ class BrainClient:
         # instead of serializing JSON null, which previously turned a successful run into a 422.
         if error is not None:
             payload["error"] = error
+        _attach_execution(payload, summary)
         resp = await self._client.post(
             f"{self._base}/api/v1/integrations/gdrive/runs",
             json=payload,
@@ -531,6 +532,7 @@ class BrainClient:
         }
         if error is not None:
             payload["error"] = error
+        _attach_execution(payload, summary)
         # AC-04: a retryable answer (429/5xx — the route's 503 `report_unavailable` among them) is
         # re-sent with THIS payload and report id, unchanged, so a report that committed before its
         # answer was lost replays idempotently instead of being recorded twice. Bounded by attempts
@@ -902,6 +904,18 @@ def _named_retry_after(resp: httpx.Response) -> float | None:
             return None
         return max(0.0, delay) if -1 < delay <= 3600 else None
     return delay if math.isfinite(delay) and 0 <= delay <= 3600 else None
+
+
+def _attach_execution(payload: dict[str, Any], summary: Any) -> None:
+    """Name the execution that PRODUCED this outcome (AIO-1167 R83 F1): the identity frozen at its
+    acquisition, carried as-is — never a lookup of the current authority. Omitted, not ``null``, when
+    the run acquired nothing (a busy deferral or an acquisition refusal)."""
+    execution = getattr(summary, "execution", None)
+    if execution:
+        payload["execution"] = {
+            "generation": int(execution["generation"]), "fence": int(execution["fence"]),
+            "owner": str(execution["owner"]),
+        }
 
 
 def _error_fields(resp: httpx.Response) -> tuple[str, str]:

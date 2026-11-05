@@ -1692,6 +1692,24 @@ async def run_gdrive_stream(
     *,
     max_work: int = 500,
 ) -> IngestSummary:
+    """One coordinator run, its outcome bound to the execution that produced it (AIO-1167 R83 F1).
+
+    The identity is captured once, from THIS run's acquisition, and attached to whatever summary the
+    run returns — never looked up again when the outcome is reported, so a report delivered after a
+    scope, reconnect or fence transition still names the authority it actually ran under."""
+    acquired: list[dict[str, Any]] = []
+    summary = await _run_gdrive_stream_acquired(settings, conn, state, max_work=max_work, acquired=acquired)
+    return dataclasses.replace(summary, execution=dict(acquired[0]) if acquired else None)
+
+
+async def _run_gdrive_stream_acquired(
+    settings: BrainSettings,
+    conn: Connection,
+    state: StateStore,
+    *,
+    max_work: int,
+    acquired: list[dict[str, Any]],
+) -> IngestSummary:
     # Set only by the scheduler for an explicit Admin run (Run now / Retry) — R44 C7.
     rearm_exhausted = bool(conn.options.get("rearm_exhausted"))
     options = dict(conn.options)
@@ -1720,6 +1738,9 @@ async def run_gdrive_stream(
                 conn.name, skipped=1, failed=0 if busy else 1, failure_categories={exc.code: 1},
                 deferred=busy, backlog=None, integration_id=integration_id,
             )
+        acquired.append({
+            "generation": int(execution.generation), "fence": int(execution.fence), "owner": str(execution.owner),
+        })
         # One absolute deadline for the whole run. It travels with the execution so every sink and
         # reconcile call — limiter wait, request and retry — is bounded by the same instant.
         run_deadline = time.monotonic() + _RUN_DEADLINE_SECONDS

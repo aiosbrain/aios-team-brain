@@ -16,8 +16,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
  *     for the winner, re-reads the winner's row under CURRENT authority, and is a success only as an
  *     exact replay of it. A unique violation by itself is never a success.
  *
- * The race is real: a held transaction inserts the report first, and the route's own insert is
- * observed waiting on it in `pg_stat_activity` before the holder commits — a fact, not a delay.
+ * The race is real: a held transaction inserts the report first, and the route's delivery is observed
+ * waiting on it in `pg_stat_activity` before the holder commits — a fact, not a delay. Since AIO-1167
+ * R83 F1 the delivery locks the connection's authority FIRST and holds it to commit, so it now waits
+ * there (the held insert's foreign key shares the integration row) rather than at its own insert: two
+ * deliveries serialize on the authority before either reads, and the loser still meets the winner's
+ * committed row and is judged as an exact replay or a conflict.
  * Infrastructure failures are injected at the one `runSql` seam, on the report insert only.
  */
 const failing = vi.hoisted(() => ({ next: null as null | { match: RegExp; error: Error } }));
@@ -35,6 +39,7 @@ vi.mock("@/lib/db/pg/pool", async (importOriginal) => {
   return { ...actual, runSql };
 });
 
+import { POST as executionPOST } from "@/app/api/v1/integrations/gdrive/execution/route";
 import { POST as runsPOST } from "@/app/api/v1/integrations/gdrive/runs/route";
 import { getPool } from "@/lib/db/pg/pool";
 import { provisionGdriveConnectorPrincipal } from "@/lib/integrations/gdrive-authority";
@@ -64,22 +69,39 @@ async function scheduled() {
   const issued = await provisionGdriveConnectorPrincipal({
     teamId: seed.teamId, integrationId, actorMemberId: seed.memberId,
   });
-  return { seed, integrationId, key: issued.key, connectorMemberId: issued.memberId };
+  // The run being reported: acquired, then released normally (AIO-1167 R83 F1) — still current.
+  const call = async (body: Record<string, unknown>) => {
+    const response = await executionPOST(new Request("http://test/api/v1/integrations/gdrive/execution", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${issued.key}`, "X-AIOS-Team": seed.teamSlug, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }) as NextRequest);
+    expect(response.status).toBe(200);
+    return response.json();
+  };
+  const owner = randomUUID();
+  const acquired = await call({ action: "acquire", integration_id: integrationId, owner });
+  const execution = { generation: acquired.generation as number, fence: acquired.fence as number, owner };
+  await call({ action: "release", integration_id: integrationId, owner, generation: execution.generation, fence: execution.fence });
+  return { seed, integrationId, key: issued.key, connectorMemberId: issued.memberId, execution };
 }
 
 type S = Awaited<ReturnType<typeof scheduled>>;
 
-/** One scheduled report body; the route stores exactly SUMMARY for it. */
+/** One scheduled report body; the route stores exactly `stored(s)` for it. */
 function body(s: S, reportId: string, over: Record<string, unknown> = {}) {
   return {
     reportId, integrationId: s.integrationId, trigger: "scheduler", startedAt: new Date().toISOString(),
-    status: "complete", created: 2, backlog: 0, cursorAgeSeconds: 5, authoritativeComplete: true, ...over,
+    status: "complete", created: 2, backlog: 0, cursorAgeSeconds: 5, authoritativeComplete: true,
+    execution: s.execution, ...over,
   };
 }
 const SUMMARY = {
   created: 2, updated: 0, unchanged: 0, removed: 0, failed: 0, skipped: 0,
   backlog: 0, cursorAgeSeconds: 5, authoritativeComplete: true,
 };
+/** What the route stores for `body(s, …)`: the counters plus the run's frozen execution identity. */
+const stored = (s: S) => ({ ...SUMMARY, execution: s.execution });
 
 function post(s: S, payload: unknown) {
   return runsPOST(new Request("http://test/api/v1/integrations/gdrive/runs", {
@@ -122,13 +144,15 @@ async function loseTheInsertRace(
     await alsoInHolder((sql, params) => holder.query(sql, params));
     let settled = false;
     const delivery = post(s, payload).finally(() => { settled = true; });
-    // The delivery must reach ITS insert and wait there; otherwise this is not the race.
+    // The delivery must reach the held report and wait on it; otherwise this is not the race. It waits
+    // at its connection-authority lock (R83 F1) — or, were that ever not shared, at its own insert.
     let waited = false;
     for (let tries = 0; tries < 400 && !settled && !waited; tries++) {
       const { rows } = await getPool().query<{ n: number }>(
         `select count(*)::int as n from pg_stat_activity
           where datname=current_database() and wait_event_type='Lock'
-            and query ilike '%insert into gdrive_run_requests%on conflict%'`);
+            and (query ilike '%insert into gdrive_run_requests%on conflict%'
+                 or query ilike '%join gdrive_connection_authority a%for update of i, a%')`);
       waited = rows[0].n > 0;
       if (!waited) await new Promise((resolve) => setTimeout(resolve, 25));
     }
@@ -148,7 +172,7 @@ describe("AIO-1167 r37 concurrent first delivery of one scheduled report (real P
   it("the delivery that loses the race to an identical report is an idempotent success", async () => {
     const s = await scheduled();
     const reportId = randomUUID();
-    const response = await loseTheInsertRace(s, reportId, body(s, reportId), { status: "complete", summary: SUMMARY });
+    const response = await loseTheInsertRace(s, reportId, body(s, reportId), { status: "complete", summary: stored(s) });
     expect(response.status).toBe(200);
     expect(await reportRows(reportId)).toEqual([{ status: "complete", integration_id: s.integrationId }]);
     // The loser is a replay: it appends nothing (the winner, here the holder, owns any ledger row).
@@ -159,7 +183,7 @@ describe("AIO-1167 r37 concurrent first delivery of one scheduled report (real P
     const s = await scheduled();
     const reportId = randomUUID();
     const response = await loseTheInsertRace(
-      s, reportId, body(s, reportId), { status: "failed", summary: { ...SUMMARY, failed: 1 } },
+      s, reportId, body(s, reportId), { status: "failed", summary: { ...stored(s), failed: 1 } },
     );
     expect(response.status).toBe(409);
     expect((await response.json()).error.code).toBe("conflicting_report");
@@ -172,7 +196,7 @@ describe("AIO-1167 r37 concurrent first delivery of one scheduled report (real P
     const other = await integration(s.seed, `other-${randomUUID().slice(0, 8)}`);
     const reportId = randomUUID();
     const response = await loseTheInsertRace(
-      s, reportId, body(s, reportId), { status: "complete", summary: SUMMARY, integrationId: other },
+      s, reportId, body(s, reportId), { status: "complete", summary: stored(s), integrationId: other },
     );
     expect(response.status).toBe(409);
     expect((await response.json()).error.code).toBe("conflicting_report");
@@ -183,7 +207,7 @@ describe("AIO-1167 r37 concurrent first delivery of one scheduled report (real P
     const s = await scheduled();
     const reportId = randomUUID();
     const response = await loseTheInsertRace(
-      s, reportId, body(s, reportId), { status: "complete", summary: SUMMARY },
+      s, reportId, body(s, reportId), { status: "complete", summary: stored(s) },
       // Committed together with the winning row, after the delivery passed its first authority check.
       (q) => q(`update members set status='disabled' where id=$1`, [s.connectorMemberId]).then(() => {}),
     );

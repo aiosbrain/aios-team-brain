@@ -992,6 +992,71 @@ export async function verifyGdriveServiceAccount(
   });
 }
 
+/**
+ * The execution that PRODUCED a terminal run report, frozen when the coordinator acquired it and
+ * carried unchanged through its summary, the wire, the durable report and every replay comparison
+ * (AIO-1167 R83 F1). Never read from the current authority at reporting time: that would bind
+ * yesterday's result to today's authority.
+ */
+export interface GdriveReportExecution {
+  generation: number;
+  fence: number;
+  owner: string;
+}
+
+export type GdriveReportStatus = "complete" | "partial" | "failed" | "deferred";
+
+/**
+ * The bounded terminal-report rule (AIO-1167 R83 F1), decided against the connection's CURRENT
+ * authority as `lockGdriveReportAuthority` holds it:
+ *
+ *   · `current`    — the report's execution is still the connection's: the same generation (no scope,
+ *                    credential or reconnect transition since — A→B→A advances it twice) and the same
+ *                    fence (no pause→resume, no replacement lease), with the lease still held by its
+ *                    owner or released normally (owner cleared, fence unchanged). A healthy completion
+ *                    reported right after its own release is accepted.
+ *   · `stale`      — anything else: a superseded generation, a same-generation lease replacement (a
+ *                    new acquisition always advances the fence) or a pause→resume. Refused, whatever
+ *                    the status: an old report may neither clear newer failure evidence nor add to it.
+ *   · `diagnostic` — no execution identity, on a report that claims nothing was produced under one: a
+ *                    failure before acquisition, or a busy deferral. Accepted as a diagnostic; it names
+ *                    no authority and so can never be success or progress.
+ *   · `unbound`    — no (or a legacy) execution identity on a `complete` or `partial` report: progress
+ *                    or success that names no execution never certifies anything. Refused.
+ */
+export function gdriveTerminalReportVerdict(
+  current: { generation: number; fence: number; leaseOwner: string | null },
+  report: { status: GdriveReportStatus; execution?: GdriveReportExecution | null },
+): "current" | "stale" | "diagnostic" | "unbound" {
+  const execution = report.execution;
+  if (!execution) return report.status === "failed" || report.status === "deferred" ? "diagnostic" : "unbound";
+  const same = current.generation === execution.generation && current.fence === execution.fence
+    && (current.leaseOwner === null || current.leaseOwner === execution.owner);
+  return same ? "current" : "stale";
+}
+
+/**
+ * Lock a connection's authority for a terminal run report, in the established connection lock order
+ * (`lockedAuthority`: team identity authority → integration + connection-authority rows), and return
+ * the authority the report is judged against. Must run inside the report's transaction, which holds
+ * these locks through the report write AND the run-ledger append: a scope, credential or status
+ * transition (`sync_gdrive_connection_authority`, fired by the integration row it must lock) or a new
+ * acquisition queues behind them, so it cannot land between validation and success publication.
+ * `null` when the connection no longer exists.
+ */
+export async function lockGdriveReportAuthority(
+  teamId: string,
+  integrationId: string,
+): Promise<{ generation: number; fence: number; leaseOwner: string | null } | null> {
+  try {
+    const row = await lockedAuthority(integrationId, teamId);
+    return { generation: Number(row.generation), fence: Number(row.fence), leaseOwner: row.lease_owner };
+  } catch (error) {
+    if (error instanceof GdriveAuthorityError && error.code === "wrong_connection") return null;
+    throw error;
+  }
+}
+
 export async function releaseGdriveExecution(auth: ApiAuth, ref: GdriveExecutionRef): Promise<void> {
   await withTransaction(async () => {
     await assertLockedExecution(auth, ref);

@@ -672,8 +672,12 @@ async def _cleanup(
     for record in sorted(run.records.values(), key=lambda r: r.attempt_id):
         if record.connection != connection or record.state != CLEANUP_PENDING or not record.resource_id:
             continue
-        if budget.stops <= 0 or record.stop_attempts >= MAX_STOP_ATTEMPTS or run.remaining() <= 0:
-            return
+        if budget.stops <= 0 or run.remaining() <= 0:
+            return  # the SWEEP's stop budget or deadline is spent: nothing further is stopped
+        if record.stop_attempts >= MAX_STOP_ATTEMPTS:
+            # THIS record exhausted its attempts. It is kept as it is — its evidence, its attempts,
+            # no slot spent — for the existing expiry handling; the records after it still get theirs.
+            continue
         if account_id and _account_held(run, account_id):
             return  # a hold adopted during this sweep (e.g. a late worker's quota answer) stands
         stop_operation = f"{WATCH_STOP_RESOURCE}{record.resource_id}"
