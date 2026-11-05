@@ -206,6 +206,16 @@ async function queryLogRows(teamId: string) {
   return rows;
 }
 
+/** The run's final message pointer and the stored assistant message, read once the run settled. */
+async function runCompletion(teamId: string) {
+  const { rows } = await getPool().query<{ final_message_id: string | null; assistant_id: string | null }>(
+    `select r.final_message_id,
+            (select m.id from chat_messages m where m.team_id=$1 and m.role='assistant'
+              order by m.created_at desc limit 1) as assistant_id
+       from chat_turn_runs r where r.team_id=$1`, [teamId]);
+  return rows[0];
+}
+
 async function settledRun(teamId: string) {
   for (let i = 0; i < 100; i += 1) {
     const { rows } = await getPool().query<{ status: string; partial_text: string; error_message: string | null }>(
@@ -450,6 +460,30 @@ describe("AIO-1167 R69 terminal source-publication fence (real Postgres)", () =>
     expect(run).toEqual({ status: "error", partial_text: "", error_message: CONTEXT_AUTHORIZATION_CLIENT_MESSAGE });
     expect((await usageRows(seed.teamId)).filter((row) => row.source === "query")).toHaveLength(1);
     expect(await queryLogRows(seed.teamId)).toHaveLength(1);
+    // The fence BEFORE `finishRun` refused: the run was never completed, so it points at no message
+    // (the later publication fence alone would leave the completion's pointer behind).
+    expect((await runCompletion(seed.teamId)).final_message_id).toBeNull();
+  });
+
+  it("dashboard, existing conversation: revoked right after the assistant message is stored — no preview, no citations, spend once", async () => {
+    const { seed, key, revokeA } = await fixture();
+    const conversation = await ownedConversation(seed);
+    probe.afterAssistant = async () => {
+      probe.afterAssistant = null;
+      await revokeA();
+    };
+
+    const sse = await (await ask("dashboard", seed, key, conversation)).text();
+    const run = await settledRun(seed.teamId);
+
+    // The fence after `appendMessage` refused BEFORE the source-bearing log insert: the spend is
+    // accounted source-free, once — no answer preview, no cited items.
+    expect(await queryLogRows(seed.teamId)).toEqual([{ answer_preview: "", cited: 0, output_tokens: 5 }]);
+    expect((await usageRows(seed.teamId)).filter((row) => row.source === "query")).toHaveLength(1);
+    expect(sse).not.toContain("event: sources");
+    expect(sse).not.toContain("event: done");
+    expect(sse).toContain(CONTEXT_AUTHORIZATION_CLIENT_MESSAGE);
+    expect(run).toEqual({ status: "error", partial_text: "", error_message: CONTEXT_AUTHORIZATION_CLIENT_MESSAGE });
   });
 
   it("dashboard: revoked while the run is being completed — the publication gate refuses and the run is failed", async () => {
@@ -468,6 +502,11 @@ describe("AIO-1167 R69 terminal source-publication fence (real Postgres)", () =>
     expect(sse).toContain(CONTEXT_AUTHORIZATION_CLIENT_MESSAGE);
     expect(run).toEqual({ status: "error", partial_text: "", error_message: CONTEXT_AUTHORIZATION_CLIENT_MESSAGE });
     expect((await usageRows(seed.teamId)).filter((row) => row.source === "query")).toHaveLength(1);
+    // Here `finishRun` itself completed before the publication fence refused: its pointer names the
+    // assistant message that was stored while authorization was current (retained, never recalled).
+    const completion = await runCompletion(seed.teamId);
+    expect(completion.final_message_id).not.toBeNull();
+    expect(completion.final_message_id).toBe(completion.assistant_id);
   });
 
   it.each(["v1", "dashboard"] as const)("%s, existing conversation, unchanged: stored answer, preview, citations, completion, spend", async (route) => {

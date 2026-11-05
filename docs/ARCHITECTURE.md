@@ -1690,11 +1690,20 @@ it once route preparation is done, and immediately before EVERY provider request
 context — each attempt, both adapters, and the inline size-refusal fallback (R67). After dispatch,
 every new publication or persistence boundary re-checks it too (R67): each delta (and the dashboard's
 partial flush), the terminal citations, the stored answer and its log preview, and the title request
-and its write (`generateAndSetTitle(..., gate)`). Bytes already delivered are not recalled; after a
-change nothing further is emitted or stored, the provider's spend is still accounted, and a dashboard
-run is failed with its partial text cleared (`failRun(..., { clearPartial })`). Changed or unreadable, the turn is refused — a sanitized, retryable 503 or SSE
-error (`CONTEXT_AUTHORIZATION_CLIENT_MESSAGE`) — with no dispatch, no answer text or citations, and
-no assistant message or partial run text from the captured context; the run is still finalized.
+and its write (`generateAndSetTitle(..., gate)`). Each check is a read, not a lock (R69): a success admits only the
+operation immediately after it, and authorization can change while that operation is in flight, so
+every source-bearing step that follows an await re-checks first — the v1 log write after the
+assistant message and title awaits (which then omits the answer preview and cited items), and on the
+dashboard the log insert after the assistant message, the run's completion (`finishRun`) and the
+terminal `sources`/`done`. Changed or unreadable authorization refuses the NEXT gated step with the
+sanitized, retryable error (`CONTEXT_AUTHORIZATION_CLIENT_MESSAGE`, a 503 or SSE error): refused
+before a dispatch, that request is never sent; refused before the assistant write, that message is
+never stored; and once a check detects a change, no subsequent source-bearing publication or write is
+admitted. Bytes already delivered and writes the preceding successful check admitted — an assistant
+message, a run's completion pointer — are retained, never recalled, even if authorization changed
+while they were in flight. The provider's spend is recorded once: source-free (tokens and cost only)
+by a refusal that comes before it was recorded, and never again by one after. A refused dashboard run
+ends failed with its partial text cleared (`failRun(..., { clearPartial })`).
 Nothing is locked across a model request, and nothing is written to the counter here.
 
 The Timeline reads Drive evidence through a stable seek-paginated ledger independent of the generic
