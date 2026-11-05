@@ -4306,7 +4306,10 @@ def _selecting_stream(
 ) -> str | None:
     """The namespace of a stream of this connection whose CONFIGURED selected roots contain the
     document as the provider reports it NOW — its own id, its drive, or an ancestor folder found by
-    reading parents' metadata (AIO-1167 R67) — or ``None`` when no root does.
+    reading parents' metadata (AIO-1167 R67) — or ``None`` when no root does. A folder root selects
+    as the baseline enumeration does (R79): a NONRECURSIVE folder only its immediate children, a
+    recursive one every descendant; a deeper match on a nonrecursive folder is no match, and the
+    walk continues for a recursive root further up.
 
     Local traversal alone cannot answer this for a retained removal: a store whose snapshot predates a
     restoration another worker published may not traverse the folder the document came back through.
@@ -4317,11 +4320,12 @@ def _selecting_stream(
         progress.namespace for progress in state.list_progress(connection_id, work.generation)
         if progress.namespace != work.namespace
     ]
-    roots_by_stream: dict[str, set[tuple[str, str]]] = {}
+    # (kind, id) -> recursive: a folder root's recursion decides how deep it selects.
+    roots_by_stream: dict[str, dict[tuple[str, str], bool]] = {}
     for namespace in streams:
         snapshot = state.work_snapshot_id(work) if namespace == work.namespace else None
         roots_by_stream[namespace] = {
-            (str(row["root_kind"]), str(row["root_id"]))
+            (str(row["root_kind"]), str(row["root_id"])): bool(row["recursive"])
             for row in state.list_roots(namespace, work.generation, snapshot_id=snapshot)
         }
     drive_id = str(meta.get("driveId") or "my-drive")
@@ -4336,11 +4340,16 @@ def _selecting_stream(
             return namespace
     frontier = [str(parent) for parent in meta.get("parents") or []]
     seen: set[str] = set()
-    for _depth in range(_RETAINED_ANCESTRY_DEPTH):
+    for depth in range(_RETAINED_ANCESTRY_DEPTH):
         if not frontier:
             return None
         for namespace, roots in roots_by_stream.items():
-            if any(("folder", folder) in roots for folder in frontier):
+            # Depth 0 is the document's immediate parents: any folder root selects them. Further up,
+            # only a recursive root does.
+            if any(
+                ("folder", folder) in roots and (depth == 0 or roots[("folder", folder)])
+                for folder in frontier
+            ):
                 return namespace
         chain.extend(frontier)
         next_frontier: list[str] = []
