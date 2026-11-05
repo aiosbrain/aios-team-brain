@@ -104,6 +104,10 @@ export function describeAuthorRef(ref: AuthorRef): string {
  * generic `author`/`author_email`. Pure — validates untrusted frontmatter defensively.
  */
 export function parseAuthorRefs(fm: Record<string, unknown>): AuthorRef[] {
+  // AIO-1167 R76 F4: evidence on a known Google Drive item that names no provider is GOOGLE evidence. It
+  // keeps that origin, so it takes the one Google authority decision (unlink, conflict, exact email)
+  // instead of the generic heuristics. An explicitly named foreign provider is kept as named.
+  const googleOrigin = str(fm.source).toLowerCase() === "gdrive";
   // 1. Structured, source-agnostic: `authors: [{role,email,handle,provider,external_id,display_name}]`.
   if (Array.isArray(fm.authors)) {
     const refs: AuthorRef[] = [];
@@ -114,7 +118,7 @@ export function parseAuthorRefs(fm: Record<string, unknown>): AuthorRef[] {
         role: str(o.role) || undefined,
         email: str(o.email) || undefined,
         handle: str(o.handle) || undefined,
-        provider: str(o.provider) || undefined,
+        provider: str(o.provider) || (googleOrigin ? "gdrive" : undefined),
         externalId: (str(o.external_id) || str(o.externalId)) || undefined,
         displayName: (str(o.display_name) || str(o.displayName)) || undefined,
       };
@@ -141,7 +145,9 @@ export function parseAuthorRefs(fm: Record<string, unknown>): AuthorRef[] {
   //    handle would collide with a same-named `actor_handle` and misattribute an external article to a
   //    roster member. A display name alone is left unresolvable (correct).
   const genericEmail = str(fm.author_email);
-  if (genericEmail) return [{ email: genericEmail, role: "author" }];
+  if (genericEmail) {
+    return [{ email: genericEmail, role: "author", ...(googleOrigin ? { provider: "gdrive" } : {}) }];
+  }
   return [];
 }
 
@@ -171,6 +177,9 @@ function resolveRef(map: IdentityMap, ref: AuthorRef): { memberId: string | null
     const r = resolveMemberDetailed(map, { email: ref.email, key: ref.email });
     if (r.memberId) return r;
   }
+  // Google evidence never falls through to a handle (a local part or display handle is not a Google
+  // identity): only its exact provider id or the Google email bridge above may credit it (R76 F4).
+  if (ref.provider?.toLowerCase() === "gdrive") return { memberId: null, method: "unresolved" };
   if (ref.handle) {
     const r = resolveMemberDetailed(map, { key: ref.handle });
     if (r.memberId) return r;

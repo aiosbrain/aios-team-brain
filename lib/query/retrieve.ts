@@ -224,7 +224,13 @@ export async function fetchGraphFactsForGroups(
   question: string,
   groupIds: readonly string[],
   client?: GraphitiClient,
-  authority?: { db: DbClient; teamId: string; authorization?: ContextAuthorization },
+  authority?: {
+    db: DbClient;
+    teamId: string;
+    authorization?: ContextAuthorization;
+    /** AIO-1167 R76: receives the items behind the returned facts (model-input provenance). */
+    onItems?: (items: { itemIds: string[]; complete: boolean }) => void;
+  },
 ): Promise<GraphFact[]> {
   // The REST /search payload still lacks relationship episodes. Production retrieval therefore
   // uses the direct, provenance-complete Neo4j path; keeping the client parameter preserves the
@@ -241,6 +247,7 @@ export async function fetchGraphFactsForGroups(
     throw new QueryContextAuthorizationChangedError("changed");
   }
   const facts = result.facts;
+  authority.onItems?.({ itemIds: result.itemIds ?? [], complete: result.itemsComplete === true });
   return facts.map((fact) => ({
     uuid: fact.id,
     fact: fact.fact,
@@ -556,6 +563,8 @@ async function nativeRetrieve(
   // tier arm. Delegated tokens keep the §5.8b omit (no graphProjectIds). Permissive keeps the
   // two-bucket path with POSTURE as its input.
   let graphScope: { covered: number; total: number } | undefined;
+  // AIO-1167 R76: the items behind the graph facts admitted to the model (output provenance).
+  let graphItems: { itemIds: string[]; complete: boolean } = { itemIds: [], complete: true };
   const graphFactsP = (async (): Promise<GraphFact[]> => {
     // Configured check FIRST (review Medium 8): a default no-Graphiti install must not pay team,
     // project, arming, or aggregate reads — let alone latch WRITES — for a leg that cannot run.
@@ -565,7 +574,9 @@ async function nativeRetrieve(
     try {
       const scope = await selectEnforcedGraphPartitions(db, { teamId, visibleProjectIds: enforce.graphProjectIds });
       graphScope = { covered: scope.covered, total: scope.total };
-      return fetchGraphFactsForGroups(q, scope.groups, undefined, { db, teamId, authorization });
+      return fetchGraphFactsForGroups(q, scope.groups, undefined, {
+        db, teamId, authorization, onItems: (items) => { graphItems = items; },
+      });
     } catch (err) {
       if (err instanceof GraphProvenanceUnavailableError || err instanceof QueryContextAuthorizationChangedError) throw err;
       // Fail CLOSED and gracefully (review Medium 6) — but never SILENTLY (review-2 Medium 6): a
@@ -1025,7 +1036,31 @@ async function nativeRetrieve(
   // (Runs on the RRF-fused order when dense retrieval contributed, else the FTS/recency order.)
   const ranked = await rerankSources(question, orderedSources, authorization);
 
-  return { sources: ranked, structured: structuredWithGraph, grounded, ...(graphScope ? { graphScope } : {}) };
+  // AIO-1167 R76: everything admitted to the answer model, by item — sources, the items behind task and
+  // decision lines, and the episodes behind graph facts. Org-structural legs (actors, reporting lines)
+  // carry no item. Any leg whose items are not known here (a source without an item, commitments, the
+  // aggregate digests, unresolved graph episodes) makes the set incomplete: the answer is protected.
+  const inputItemIds: string[] = [];
+  let inputsComplete = graphItems.complete || graphFacts.length === 0;
+  for (const source of ranked) {
+    if (source.item_id) inputItemIds.push(source.item_id);
+    else inputsComplete = false;
+  }
+  for (const decision of [...recencyDecisions, ...olderMatches]) {
+    if (decision.source_item_id) inputItemIds.push(decision.source_item_id);
+  }
+  for (const task of tasks ?? []) {
+    const sourceItemId = (task as { source_item_id?: string | null }).source_item_id;
+    if (sourceItemId) inputItemIds.push(sourceItemId);
+  }
+  if (graphFacts.length) inputItemIds.push(...graphItems.itemIds);
+  if ((commitments ?? []).length || gitDigest.trim() || peopleDigest.trim()) inputsComplete = false;
+  const modelInputs = { itemIds: [...new Set(inputItemIds)], complete: inputsComplete };
+
+  return {
+    sources: ranked, structured: structuredWithGraph, grounded, modelInputs,
+    ...(graphScope ? { graphScope } : {}),
+  };
 }
 
 /**

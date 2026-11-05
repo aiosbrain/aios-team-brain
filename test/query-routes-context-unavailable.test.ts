@@ -150,6 +150,13 @@ vi.mock("@/lib/costs/llm-usage", () => ({ recordLlmUsage: async () => void h.eve
 vi.mock("@/lib/query/turn-runs", () => ({ createRun: async () => (h.events.push("run.create"), { id: "run-1" }) }));
 vi.mock("@/lib/query/stream-persist", () => ({ runAnswerTurn: spies.runAnswerTurn }));
 vi.mock("@/lib/query/claude", () => ({ streamAnswer: spies.streamAnswer }));
+// R76: output provenance needs the database; the unit tier classifies every context as non-Google and
+// runs the publication body directly (the real behaviour is pinned in the data-mechanics tier).
+vi.mock("@/lib/query/output-provenance", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/query/output-provenance")>()),
+  classifyOutputProvenance: async () => ({ epoch: 0 }),
+  withOutputPublication: async (_team: string, _provenance: unknown, fn: () => Promise<unknown>) => fn(),
+}));
 
 const dashboard = await import("@/app/api/dashboard/query/route");
 const v1 = await import("@/app/api/v1/query/route");
@@ -344,9 +351,11 @@ describe("POST /api/v1/query — retrieval before any turn state, accounting bef
     expect(res.status).toBe(200);
     await res.text();
     expect(h.events.indexOf("retrieve")).toBe(0);
+    // R76: the stored answer and its log preview commit together (one epoch-checked transaction), the
+    // spend is metered, and only then the cosmetic title runs.
     expect(traces()).toEqual([
       "conversation.create", "message.user", "query_log.insert",
-      "answer", "message.assistant", "title", "query_log.update", "llm_usage",
+      "answer", "message.assistant", "query_log.update", "llm_usage", "title",
     ]);
   });
 

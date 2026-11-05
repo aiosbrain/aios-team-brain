@@ -39,7 +39,9 @@ interface Obligation {
 function hasRetainedGdriveEvidence(frontmatter: Record<string, unknown>): boolean {
   return frontmatter.source === "gdrive" && (
     (Array.isArray(frontmatter.authors) && frontmatter.authors.length > 0) ||
-    (Array.isArray(frontmatter.contributions) && frontmatter.contributions.length > 0)
+    (Array.isArray(frontmatter.contributions) && frontmatter.contributions.length > 0) ||
+    // R76 F4: a scalar author email on a Drive item is Google evidence too.
+    (typeof frontmatter.author_email === "string" && frontmatter.author_email.trim() !== "")
   );
 }
 
@@ -105,7 +107,9 @@ function namesGoogleEmail(frontmatter: Record<string, unknown>, canonical: strin
       if (email && email === address) return true;
     }
   }
-  return false;
+  // R76 F4: the scalar author email of a Drive item is Google email evidence under the same comparison.
+  const scalar = text(frontmatter.author_email).trim().toLowerCase();
+  return Boolean(scalar) && scalar === address;
 }
 
 async function currentObligation(obligation: Obligation): Promise<Obligation | null> {
@@ -310,7 +314,8 @@ export async function runIdentityRepairObligation(
             where i.team_id=$1 and ${DRIVE_OBLIGATION_PROVENANCE}
               and ($2::uuid is null or i.id>$2::uuid)
               and (jsonb_typeof(i.frontmatter->'authors')='array'
-                   or jsonb_typeof(i.frontmatter->'contributions')='array')
+                   or jsonb_typeof(i.frontmatter->'contributions')='array'
+                   or coalesce(i.frontmatter->>'author_email', '') <> '')
             order by i.id limit $3`,
           [current.team_id, current.cursor_item_id, batchSize],
         );

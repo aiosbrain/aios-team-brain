@@ -1,6 +1,13 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import type { ChatTurn } from "@/lib/query/claude";
+import { runSql } from "@/lib/db/pg/pool";
+import {
+  outputReadable,
+  outputReusable,
+  withOutputRead,
+  type OutputProvenance,
+} from "@/lib/query/output-provenance";
 
 /**
  * Single writer + reader for persistent chat history (`conversations` + `chat_messages`).
@@ -87,7 +94,10 @@ export async function appendMessage(
   conversationId: string,
   role: "user" | "assistant",
   content: string,
-  usage: MessageUsage = {}
+  usage: MessageUsage,
+  // AIO-1167 R76: the message's output provenance — 0 for a user message or a non-Google answer, the
+  // answer's ORIGINAL positive epoch for a protected one. Required: new messages never store NULL.
+  provenance: OutputProvenance,
 ): Promise<string | null> {
   const { data, error } = await db
     .from("chat_messages")
@@ -97,6 +107,7 @@ export async function appendMessage(
       member_id: owner.memberId,
       role,
       content,
+      context_authorization_epoch: provenance.epoch,
       cited_item_ids: usage.cited_item_ids ?? [],
       input_tokens: usage.input_tokens ?? 0,
       output_tokens: usage.output_tokens ?? 0,
@@ -148,17 +159,18 @@ export async function searchConversations(
 ): Promise<Conversation[]> {
   const q = query.trim();
   if (!q) return listConversations(db, owner, limit);
-  // Content matches: message bodies via FTS → the conversations they belong to (owner-scoped).
-  const { data: hits } = await db
-    .from("chat_messages")
-    .select("conversation_id")
-    .eq("team_id", owner.teamId)
-    .eq("member_id", owner.memberId)
-    .textSearch("search", q, { type: "websearch", config: "english" })
-    .limit(1000);
-  const contentIds = new Set(
-    (hits ?? []).map((h) => (h as { conversation_id: string }).conversation_id)
-  );
+  // Content matches: message bodies via FTS → the conversations they belong to (owner-scoped). AIO-1167
+  // R76: a match inside protected output whose authorization is obsolete or unverifiable is no match —
+  // only historical (NULL), 0 and current-epoch messages are searched.
+  const hits = await withOutputRead(owner.teamId, async (current) => (await runSql<{ conversation_id: string }>(
+    `select distinct conversation_id from chat_messages
+      where team_id=$1 and member_id=$2 and search @@ websearch_to_tsquery('english', $3)
+        and (context_authorization_epoch is null or context_authorization_epoch = 0
+             or context_authorization_epoch = $4)
+      limit 1000`,
+    [owner.teamId, owner.memberId, q, current ?? -1],
+  )).rows);
+  const contentIds = new Set(hits.map((h) => h.conversation_id));
   // The member's non-archived conversations; keep those whose title matches OR whose content matched.
   const { data } = await db
     .from("conversations")
@@ -190,12 +202,19 @@ export async function getConversation(
     .maybeSingle();
   const c = convo as { id: string; title: string } | null;
   if (!c) return null;
-  const { data: msgs } = await db
-    .from("chat_messages")
-    .select("id, role, content, cited_item_ids, created_at")
-    .eq("conversation_id", conversationId)
-    .order("created_at", { ascending: true });
-  return { id: c.id, title: c.title, messages: (msgs ?? []) as ChatMessage[] };
+  // AIO-1167 R76: an assistant message whose protected provenance is obsolete or unverifiable is
+  // omitted (text and citations); user and permitted messages are kept.
+  const messages = await withOutputRead(owner.teamId, async (current) => {
+    const { data: msgs } = await db
+      .from("chat_messages")
+      .select("id, role, content, cited_item_ids, created_at, context_authorization_epoch")
+      .eq("conversation_id", conversationId)
+      .order("created_at", { ascending: true });
+    return ((msgs ?? []) as (ChatMessage & { context_authorization_epoch?: unknown })[])
+      .filter((m) => outputReadable(m.context_authorization_epoch, current, "completed"))
+      .map(({ context_authorization_epoch: _stored, ...message }) => message);
+  });
+  return { id: c.id, title: c.title, messages };
 }
 
 /**
@@ -209,12 +228,18 @@ export async function recentTurns(
   maxTurns = 6
 ): Promise<ChatTurn[]> {
   if (!(await ownsConversation(db, owner, conversationId))) return [];
-  const { data } = await db
-    .from("chat_messages")
-    .select("role, content, created_at")
-    .eq("conversation_id", conversationId)
-    .order("created_at", { ascending: true });
-  const msgs = (data ?? []) as { role: "user" | "assistant"; content: string }[];
+  // AIO-1167 R76: only answers CERTIFIED for reuse as model input are history — 0, or protected output
+  // whose epoch is current. Historical (NULL) answers stay readable but are not reused; obsolete ones
+  // are excluded, and their question is left without a pair.
+  const msgs = await withOutputRead(owner.teamId, async (current) => {
+    const { data } = await db
+      .from("chat_messages")
+      .select("role, content, created_at, context_authorization_epoch")
+      .eq("conversation_id", conversationId)
+      .order("created_at", { ascending: true });
+    return ((data ?? []) as { role: "user" | "assistant"; content: string; context_authorization_epoch?: unknown }[])
+      .filter((m) => m.role === "user" || outputReusable(m.context_authorization_epoch, current));
+  });
   // Pair user→assistant into turns; keep only complete pairs.
   const turns: ChatTurn[] = [];
   let pendingQ: string | null = null;

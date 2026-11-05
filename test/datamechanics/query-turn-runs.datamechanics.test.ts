@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { NON_GOOGLE_OUTPUT } from "@/lib/query/output-provenance";
 import { randomUUID } from "node:crypto";
 import { db, seedTeam } from "./helpers";
 import { createConversation, appendMessage, recentTurns } from "@/lib/chat/store";
@@ -39,18 +40,18 @@ describe("chat turn runs (data-mechanics)", () => {
     const seed = await seedTeam();
     const owner = { teamId: seed.teamId, memberId: seed.memberId };
     const convo = await createConversation(db(), owner, "what shipped?");
-    const run = await createRun(db(), owner, convo!.id, "what shipped?");
+    const run = await createRun(db(), owner, convo!.id, "what shipped?", NON_GOOGLE_OUTPUT);
     expect(run?.id).toBeTruthy();
 
     const fresh = await latestRun(db(), owner, convo!.id);
     expect(fresh?.status).toBe("streaming");
     expect(fresh?.partial_text).toBe(""); // default, not null
 
-    await flushPartial(db(), run!.id, "partial ans");
+    await flushPartial(db(), run!.id, "partial ans", { teamId: owner.teamId, provenance: NON_GOOGLE_OUTPUT });
     expect((await latestRun(db(), owner, convo!.id))?.partial_text).toBe("partial ans");
 
     // The real ordering: the assistant message exists FIRST, then the run points at it.
-    const messageId = await appendMessage(db(), owner, convo!.id, "assistant", "the full answer");
+    const messageId = await appendMessage(db(), owner, convo!.id, "assistant", "the full answer", {}, NON_GOOGLE_OUTPUT);
     expect(messageId).toBeTruthy();
     await finishRun(db(), run!.id, messageId);
 
@@ -63,7 +64,7 @@ describe("chat turn runs (data-mechanics)", () => {
     const seed = await seedTeam();
     const owner = { teamId: seed.teamId, memberId: seed.memberId };
     const convo = await createConversation(db(), owner, "q");
-    const run = await createRun(db(), owner, convo!.id, "q");
+    const run = await createRun(db(), owner, convo!.id, "q", NON_GOOGLE_OUTPUT);
     await failRun(db(), run!.id, "The model was busy. Please try again in a moment.");
 
     const read = await latestRun(db(), owner, convo!.id);
@@ -76,7 +77,7 @@ describe("chat turn runs (data-mechanics)", () => {
     const seed = await seedTeam();
     const owner = { teamId: seed.teamId, memberId: seed.memberId };
     const convo = await createConversation(db(), owner, "private question");
-    await createRun(db(), owner, convo!.id, "private question");
+    await createRun(db(), owner, convo!.id, "private question", NON_GOOGLE_OUTPUT);
 
     const intruder = { teamId: seed.teamId, memberId: await secondMember(seed.teamId) };
     expect(await latestRun(db(), intruder, convo!.id)).toBeNull();
@@ -89,7 +90,7 @@ describe("chat turn runs (data-mechanics)", () => {
     const seed = await seedTeam();
     const owner = { teamId: seed.teamId, memberId: seed.memberId };
     const convo = await createConversation(db(), owner, "q");
-    const run = await createRun(db(), owner, convo!.id, "q");
+    const run = await createRun(db(), owner, convo!.id, "q", NON_GOOGLE_OUTPUT);
 
     const live = await activeRun(db(), owner);
     expect(live?.id).toBe(run!.id);
@@ -102,7 +103,7 @@ describe("chat turn runs (data-mechanics)", () => {
     const seed = await seedTeam();
     const owner = { teamId: seed.teamId, memberId: seed.memberId };
     const convo = await createConversation(db(), owner, "q");
-    const run = await createRun(db(), owner, convo!.id, "q");
+    const run = await createRun(db(), owner, convo!.id, "q", NON_GOOGLE_OUTPUT);
 
     // Simulate the process dying: the row stays `streaming` and simply stops heartbeating.
     const dead = new Date(Date.now() - RUN_STALE_AFTER_MS - 60_000).toISOString();
@@ -117,10 +118,10 @@ describe("chat turn runs (data-mechanics)", () => {
     const seed = await seedTeam();
     const owner = { teamId: seed.teamId, memberId: seed.memberId };
     const convo = await createConversation(db(), owner, "q");
-    const run = await createRun(db(), owner, convo!.id, "q");
+    const run = await createRun(db(), owner, convo!.id, "q", NON_GOOGLE_OUTPUT);
     await finishRun(db(), run!.id, null);
 
-    await flushPartial(db(), run!.id, "late chunk that must be ignored");
+    await flushPartial(db(), run!.id, "late chunk that must be ignored", { teamId: owner.teamId, provenance: NON_GOOGLE_OUTPUT });
     const read = await latestRun(db(), owner, convo!.id);
     expect(read?.status).toBe("done");
     expect(read?.partial_text).toBe("");
@@ -131,12 +132,12 @@ describe("chat turn runs (data-mechanics)", () => {
     const owner = { teamId: seed.teamId, memberId: seed.memberId };
     const convo = await createConversation(db(), owner, "first");
     // One completed turn…
-    await appendMessage(db(), owner, convo!.id, "user", "first");
-    await appendMessage(db(), owner, convo!.id, "assistant", "first answer");
+    await appendMessage(db(), owner, convo!.id, "user", "first", {}, NON_GOOGLE_OUTPUT);
+    await appendMessage(db(), owner, convo!.id, "assistant", "first answer", {}, NON_GOOGLE_OUTPUT);
     // …then a turn that is still streaming, with a partial living in the run row.
-    await appendMessage(db(), owner, convo!.id, "user", "second");
-    const run = await createRun(db(), owner, convo!.id, "second");
-    await flushPartial(db(), run!.id, "half an answer that must not be remembered");
+    await appendMessage(db(), owner, convo!.id, "user", "second", {}, NON_GOOGLE_OUTPUT);
+    const run = await createRun(db(), owner, convo!.id, "second", NON_GOOGLE_OUTPUT);
+    await flushPartial(db(), run!.id, "half an answer that must not be remembered", { teamId: owner.teamId, provenance: NON_GOOGLE_OUTPUT });
 
     const turns = await recentTurns(db(), owner, convo!.id);
     expect(turns).toHaveLength(1);
@@ -148,7 +149,7 @@ describe("chat turn runs (data-mechanics)", () => {
     const seed = await seedTeam();
     const owner = { teamId: seed.teamId, memberId: seed.memberId };
     const convo = await createConversation(db(), owner, "q");
-    await createRun(db(), owner, convo!.id, "q");
+    await createRun(db(), owner, convo!.id, "q", NON_GOOGLE_OUTPUT);
 
     const count = async (table: string) => {
       const { count: n } = await db().from(table).select("id", { count: "exact", head: true }).eq("team_id", seed.teamId);
@@ -169,9 +170,9 @@ describe("chat turn runs (data-mechanics)", () => {
     const seed = await seedTeam();
     const owner = { teamId: seed.teamId, memberId: seed.memberId };
     const convo = await createConversation(db(), owner, "q");
-    const run = await createRun(db(), owner, convo!.id, "q");
-    await flushPartial(db(), run!.id, "a partial answer");
-    const messageId = await appendMessage(db(), owner, convo!.id, "assistant", "the full answer");
+    const run = await createRun(db(), owner, convo!.id, "q", NON_GOOGLE_OUTPUT);
+    await flushPartial(db(), run!.id, "a partial answer", { teamId: owner.teamId, provenance: NON_GOOGLE_OUTPUT });
+    const messageId = await appendMessage(db(), owner, convo!.id, "assistant", "the full answer", {}, NON_GOOGLE_OUTPUT);
     await finishRun(db(), run!.id, messageId);
 
     const read = await latestRun(db(), owner, convo!.id);
@@ -183,7 +184,7 @@ describe("chat turn runs (data-mechanics)", () => {
     const seed = await seedTeam();
     const owner = { teamId: seed.teamId, memberId: seed.memberId };
     const convo = await createConversation(db(), owner, "q");
-    const run = await createRun(db(), owner, convo!.id, "q");
+    const run = await createRun(db(), owner, convo!.id, "q", NON_GOOGLE_OUTPUT);
     // Backdate it so a successful heartbeat is observable.
     const old = new Date(Date.now() - 2 * 60_000).toISOString();
     await db().from("chat_turn_runs").update({ updated_at: old }).eq("id", run!.id);
@@ -203,7 +204,7 @@ describe("chat turn runs (data-mechanics)", () => {
     const seed = await seedTeam();
     const owner = { teamId: seed.teamId, memberId: seed.memberId };
     const convo = await createConversation(db(), owner, "q");
-    const run = await createRun(db(), owner, convo!.id, "q");
+    const run = await createRun(db(), owner, convo!.id, "q", NON_GOOGLE_OUTPUT);
     await db().from("conversations").delete().eq("id", convo!.id);
     const { data } = await db().from("chat_turn_runs").select("id").eq("id", run!.id).maybeSingle();
     expect(data).toBeNull();

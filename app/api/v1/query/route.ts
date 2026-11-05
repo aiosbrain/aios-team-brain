@@ -24,6 +24,12 @@ import {
   QueryContextAuthorizationChangedError,
   requireContextAuthorization,
 } from "@/lib/query/context-authorization";
+import {
+  NON_GOOGLE_OUTPUT,
+  classifyOutputProvenance,
+  withOutputPublication,
+  type OutputProvenance,
+} from "@/lib/query/output-provenance";
 
 export const runtime = "nodejs";
 export const maxDuration = 120;
@@ -205,6 +211,18 @@ export async function POST(req: NextRequest) {
     throw e;
   }
 
+  // AIO-1167 R76: the answer's output provenance — classified ONCE from every input admitted to the
+  // model, re-checked against the original capture, and frozen before any turn state, run or dispatch.
+  let provenance: OutputProvenance;
+  try {
+    provenance = await classifyOutputProvenance(teamId, ctx.modelInputs, authorization);
+  } catch (e) {
+    if (e instanceof QueryContextAuthorizationChangedError) {
+      return errorResponse("temporarily_unavailable", CONTEXT_AUTHORIZATION_CLIENT_MESSAGE, 503);
+    }
+    throw e;
+  }
+
   // Persistent thread, owned by the key's member — same store as the dashboard chat, so a CLI /
   // Telegram-via-Hermes turn continues the member's existing conversation; the assistant turn is
   // persisted once streaming completes. Delegated tokens get NO thread: nothing is read or
@@ -217,7 +235,7 @@ export async function POST(req: NextRequest) {
     conversationId = created?.id ?? null;
     createdNew = true;
   }
-  if (owner && conversationId) await appendMessage(db, owner, conversationId, "user", question);
+  if (owner && conversationId) await appendMessage(db, owner, conversationId, "user", question, {}, NON_GOOGLE_OUTPUT);
 
   // Quota integrity (Codex B3 High): write the query_log row BEFORE streaming and UPDATE it on
   // `done` — the daily count and team budget read query_log, and a row written only in the done
@@ -226,7 +244,9 @@ export async function POST(req: NextRequest) {
   // stay 0 for incomplete streams (the usage numbers only exist at `done`).
   const { data: logRow, error: logErr } = await db
     .from("query_log")
-    .insert({ team_id: teamId, member_id: launcherId, question })
+    // R76: the reservation carries the answer's provenance; a protected one may keep its epoch with an
+    // empty preview and no citations when the answer is refused.
+    .insert({ team_id: teamId, member_id: launcherId, question, context_authorization_epoch: provenance.epoch })
     .select("id")
     .single();
   if (logErr || !logRow) {
@@ -308,42 +328,46 @@ export async function POST(req: NextRequest) {
               }
             }
 
-            if (persist && owner && conversationId) {
-              await appendMessage(db, owner, conversationId, "assistant", answer, {
-                cited_item_ids: sources.map((s) => s.item_id).filter((id): id is string => Boolean(id)),
-                input_tokens: chunk.usage.input_tokens,
-                output_tokens: chunk.usage.output_tokens,
-                cost_usd: chunk.usage.cost_usd,
-              });
-              if (createdNew) {
-                // The title request carries the answer: gated before its dispatch and its write.
-                await generateAndSetTitle(db, owner, conversationId, question, answer, keys, gate);
-              }
-            }
-
-            // Accounting is kept either way (the provider billed it); the answer itself only when stored —
-            // and only while still authorized NOW (R69): the awaits above (the assistant message, the
-            // title request) can span a revocation, and an earlier success authorizes nothing after it.
-            let preview = persist;
-            if (preview) {
-              try {
-                await gate();
-              } catch (e) {
-                if (!isRefusal(e)) throw e;
-                preview = false;
-              }
-            }
-            await db.from("query_log").update({
-              ...(preview ? {
-                answer_preview: answer.slice(0, 500),
-                cited_item_ids: sources.map((s) => s.item_id).filter(Boolean),
-              } : {}),
+            // R76: the stored answer and its source-bearing preview commit in ONE short transaction that
+            // share-locks the revocation epoch first and re-checks the answer's ORIGINAL epoch (the
+            // checks above are defense only). Refused — a revocation committed first — neither is written
+            // and the reserved row keeps only its accounting; a revocation arriving while it holds the
+            // lock waits, and readers then suppress the now-obsolete output.
+            const accounting = {
               input_tokens: chunk.usage.input_tokens,
               output_tokens: chunk.usage.output_tokens,
               cache_read_tokens: chunk.usage.cache_read_tokens,
               cost_usd: chunk.usage.cost_usd,
               latency_ms: Date.now() - started,
-            }).eq("id", queryLogId);
+            };
+            let stored = false;
+            if (persist) {
+              try {
+                await withOutputPublication(teamId, provenance, async () => {
+                  if (owner && conversationId) {
+                    await appendMessage(db, owner, conversationId, "assistant", answer, {
+                      cited_item_ids: sources.map((s) => s.item_id).filter((id): id is string => Boolean(id)),
+                      input_tokens: chunk.usage.input_tokens,
+                      output_tokens: chunk.usage.output_tokens,
+                      cost_usd: chunk.usage.cost_usd,
+                    }, provenance);
+                  }
+                  const { error: previewError } = await db.from("query_log").update({
+                    ...accounting,
+                    answer_preview: answer.slice(0, 500),
+                    cited_item_ids: sources.map((s) => s.item_id).filter(Boolean),
+                  }).eq("id", queryLogId);
+                  if (previewError) throw new Error(`query_log update failed: ${previewError.message}`);
+                });
+                stored = true;
+              } catch (e) {
+                if (!isRefusal(e)) throw e;
+              }
+            }
+            if (!stored) {
+              // Accounting is kept either way (the provider billed it) — source-free, once.
+              await db.from("query_log").update(accounting).eq("id", queryLogId);
+            }
 
             // Meter this answer's spend into the unified brain-inference ledger (source "query"), so
             // the Pulse Spend KPI + costs breakdown see it alongside every background LLM task.
@@ -358,6 +382,11 @@ export async function POST(req: NextRequest) {
               costUsd: chunk.usage.cost_usd,
               estimated: chunk.usage.estimated,
             });
+            if (stored && createdNew && owner && conversationId) {
+              // Cosmetic: a protected answer keeps its question-derived title (no title request at all);
+              // a non-Google one is gated before the title request and its write.
+              await generateAndSetTitle(db, owner, conversationId, question, answer, keys, provenance, gate);
+            }
             if (!publish) throw new QueryContextAuthorizationChangedError("changed");
           }
         }

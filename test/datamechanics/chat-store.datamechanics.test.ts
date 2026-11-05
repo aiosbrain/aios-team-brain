@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { NON_GOOGLE_OUTPUT } from "@/lib/query/output-provenance";
 import { randomUUID } from "node:crypto";
 import { db, seedTeam } from "./helpers";
 import {
@@ -38,11 +39,11 @@ describe("chat store (data-mechanics)", () => {
     const owner = { teamId: seed.teamId, memberId: seed.memberId };
     const convo = await createConversation(db(), owner, "what did chetan ship last week?");
     expect(convo?.id).toBeTruthy();
-    await appendMessage(db(), owner, convo!.id, "user", "what did chetan ship last week?");
+    await appendMessage(db(), owner, convo!.id, "user", "what did chetan ship last week?", {}, NON_GOOGLE_OUTPUT);
     await appendMessage(db(), owner, convo!.id, "assistant", "Chetan shipped the Linear importer [S1].", {
       cited_item_ids: [],
       cost_usd: 0.01,
-    });
+    }, NON_GOOGLE_OUTPUT);
 
     const read = await getConversation(db(), owner, convo!.id);
     expect(read?.title).toBe("what did chetan ship last week?");
@@ -57,8 +58,8 @@ describe("chat store (data-mechanics)", () => {
     const other = { teamId: seed.teamId, memberId: otherId };
 
     const convo = await createConversation(db(), owner, "private question");
-    await appendMessage(db(), owner, convo!.id, "user", "private question");
-    await appendMessage(db(), owner, convo!.id, "assistant", "private answer");
+    await appendMessage(db(), owner, convo!.id, "user", "private question", {}, NON_GOOGLE_OUTPUT);
+    await appendMessage(db(), owner, convo!.id, "assistant", "private answer", {}, NON_GOOGLE_OUTPUT);
 
     expect(await getConversation(db(), other, convo!.id)).toBeNull();
     expect(await recentTurns(db(), other, convo!.id)).toEqual([]);
@@ -72,8 +73,8 @@ describe("chat store (data-mechanics)", () => {
     const owner = { teamId: seed.teamId, memberId: seed.memberId };
     const convo = await createConversation(db(), owner, "q0");
     for (let i = 0; i < 4; i++) {
-      await appendMessage(db(), owner, convo!.id, "user", `q${i}`);
-      await appendMessage(db(), owner, convo!.id, "assistant", `a${i}`);
+      await appendMessage(db(), owner, convo!.id, "user", `q${i}`, {}, NON_GOOGLE_OUTPUT);
+      await appendMessage(db(), owner, convo!.id, "assistant", `a${i}`, {}, NON_GOOGLE_OUTPUT);
     }
     const turns = await recentTurns(db(), owner, convo!.id, 2);
     expect(turns).toEqual([
@@ -86,7 +87,7 @@ describe("chat store (data-mechanics)", () => {
     const seed = await seedTeam();
     const owner = { teamId: seed.teamId, memberId: seed.memberId };
     const convo = await createConversation(db(), owner, "to delete");
-    await appendMessage(db(), owner, convo!.id, "user", "to delete");
+    await appendMessage(db(), owner, convo!.id, "user", "to delete", {}, NON_GOOGLE_OUTPUT);
 
     expect(await archiveConversation(db(), owner, convo!.id)).toBe(true);
     expect(await getConversation(db(), owner, convo!.id)).toBeNull();
@@ -112,7 +113,7 @@ describe("chat store (data-mechanics)", () => {
     // activity ordering (millisecond rounding can cause the same reversal).
     const appClock = vi.spyOn(Date.prototype, "toISOString").mockReturnValue("2000-01-01T00:00:00.000Z");
     try {
-      await appendMessage(db(), owner, a!.id, "user", "bump");
+      await appendMessage(db(), owner, a!.id, "user", "bump", {}, NON_GOOGLE_OUTPUT);
     } finally {
       appClock.mockRestore();
     }

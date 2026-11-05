@@ -1009,7 +1009,12 @@ R44 contracts (AIO-1167):
   before. For each SURVIVING observation, exact permission authority, and a direct `author-email:`
   observation's own owner, are decided before any email fallback and never replaced by it; coalescing
   itself is unchanged — an `author-email:` row folded into its one permission id is not kept, and that
-  surviving permission observation can stay unresolved under the bridge's diagnostic.
+  surviving permission observation can stay unresolved under the bridge's diagnostic. Evidence on a
+  known `source: gdrive` item that names no provider — a structured author ref, or a scalar
+  `author_email` — keeps its Google origin (`parseAuthorRefs`, R76 F4): it takes this one decision and
+  never the generic email/local-part/handle heuristics, an explicitly named foreign provider keeps its
+  own path, and the Google identity repair treats a scalar author email as retained Google evidence
+  (nomination, `namesGoogleEmail`, credit clearing). Other sources are unchanged.
 - **Sidecar:** a service-account run is namespaced by the account its LOADED key authenticates as and
   refused before any progress is used when that differs from the verified identity; watch renewal
   resolves the same namespace. Jobs bind local entries by immutable integration id (a same-name entry
@@ -1217,7 +1222,12 @@ its CURRENT parent chain read through the provider gate is weighed against every
 configured roots (`_selecting_stream`, never the stored traversal, which is as old as the evidence)
 — under this stream's roots it is superseded, under a readable peer's it only ends this stream's
 membership, under none the ordinary weighing decides; an inconclusive read (5xx, an auth answer, the
-depth bound) is weighed but never concluded absent.
+depth bound) is weighed but never concluded absent. Retained UPSERTS get the same treatment during
+divergent-state recovery (R76 F1): each upsert is stamped where it is observed, and while the stream is
+`recovery_required` (its local state no longer matches the authority, its replacement enumeration not
+complete) one observed under an earlier execution restores only when the document's current parent
+chain reaches this stream's configured roots (`_retained_upsert_selected`). Otherwise it stays pending —
+never discarded, never used to infer absence — for the replacement enumeration to settle.
 An unstarted stream no root needs any more is forgotten locally and leaves the brain's
 checkpoint with the run's next checkpoint. Shared Drive listing, traversal, rescan, and parent-membership checks use the
 provider's actual `driveId` as the root; the former synthetic `root` key is repaired only when the
@@ -1714,6 +1724,22 @@ was recorded never records it a second time. A dashboard answer-turn
 refusal through terminal publication ends the run failed with its partial text cleared
 (`failRun(..., { clearPartial })`).
 Nothing is locked across a model request, and nothing is written to the counter here.
+Query OUTPUT carries durable provenance (R76, `lib/query/output-provenance.ts`, migration
+`20261105163000_query_output_authorization_epoch`): `context_authorization_epoch` on `chat_turn_runs`,
+`chat_messages` and `query_log` is NULL for historical rows, 0 for output with no Google-derived model
+input, or the ORIGINAL captured epoch. It is classified once from every input admitted to the model
+(retrieved sources, the items behind task/decision lines and graph facts; unproven inputs protect),
+re-checked against the capture and frozen before the run is created — never re-derived or refreshed.
+Protected writes — the partial flush, and the completed answer (assistant message, query-log preview,
+run completion) committed together — run in one short transaction that share-locks the revocation
+epoch first (`lockedRevocationEpoch`, no identity lock) and commits only while it equals the original:
+a revocation that commits first means no output; one that arrives while the lock is held waits, and
+readers then suppress it. Readers (`latestRun`, `activeRun`, `getConversation`, `searchConversations`,
+`recentTurns`) read at a revocation-linearized epoch and project fail-closed whatever the worker is
+doing: obsolete, unreadable or malformed protected output is hidden (a run reports a retryable refusal
+with no partial or final pointer), a NULL streaming partial is never replayed, completed NULL history
+stays readable but is never reused as model input, and 0 stays readable. A protected answer never
+feeds a title (the question-derived title stays); non-Google answers keep automatic titles.
 
 The Timeline reads Drive evidence through a stable seek-paginated ledger independent of the generic
 item cap, re-resolves against complete current identity reads, and reapplies manual correction locks.

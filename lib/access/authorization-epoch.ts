@@ -88,6 +88,25 @@ export async function lockedAuthorizationEpoch(teamId: string): Promise<number> 
   return Number(rows[0]?.epoch ?? 1);
 }
 
+/**
+ * The revocation epoch, share-locked inside the CALLER's transaction — the revocation-only twin of
+ * `lockedAuthorizationEpoch` (AIO-1167 R76). Query output carries no person attribution, so the
+ * identity-repair gate does not apply; the lock order is unchanged (no identity-authority lock is ever
+ * taken after it). Must run inside `withTransaction`.
+ */
+export async function lockedRevocationEpoch(teamId: string): Promise<number> {
+  await runSql(
+    `insert into team_authorization_epochs(team_id,epoch) values ($1,1)
+     on conflict (team_id) do nothing`,
+    [teamId],
+  );
+  const { rows } = await runSql<{ epoch: string | number }>(
+    `select epoch from team_authorization_epochs where team_id=$1 for share`,
+    [teamId],
+  );
+  return Number(rows[0]?.epoch ?? 1);
+}
+
 /** Execute a cache-memory read at a revocation-linearized epoch. */
 export async function withLockedAuthorizationEpoch<T>(
   teamId: string,

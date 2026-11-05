@@ -8,6 +8,7 @@ import { generateAndSetTitle } from "@/lib/chat/title";
 import { recordLlmUsage } from "@/lib/costs/llm-usage";
 import { flushPartial, finishRun, failRun, touchRun } from "./turn-runs";
 import { QueryContextAuthorizationChangedError, requireContextAuthorization } from "./context-authorization";
+import { NON_GOOGLE_OUTPUT, withOutputPublication, type OutputProvenance } from "./output-provenance";
 
 /**
  * Run ONE answer turn to completion and persist it — independently of whether the client is still
@@ -51,6 +52,8 @@ export interface RunAnswerTurnArgs {
   now?: () => number;
   /** Liveness heartbeat interval; tests shorten it. Defaults to HEARTBEAT_MS. */
   heartbeatMs?: number;
+  /** AIO-1167 R76: the answer's FROZEN output provenance (classified before the run was created). */
+  provenance: OutputProvenance;
 }
 
 /** Partial-text flush cadence: often enough for a returning tab to see progress, rare enough to be cheap. */
@@ -113,6 +116,8 @@ export async function runAnswerTurn(args: RunAnswerTurnArgs): Promise<void> {
         team_id: owner.teamId, member_id: owner.memberId, question,
         input_tokens: usage.input_tokens, output_tokens: usage.output_tokens,
         cache_read_tokens: usage.cache_read_tokens, cost_usd: usage.cost_usd, latency_ms: now() - args.startedAt,
+        // Source-free accounting: no answer, no citations — provenance 0 (R76).
+        context_authorization_epoch: NON_GOOGLE_OUTPUT.epoch,
       });
       if (error) throw new Error(error.message);
       await recordLlmUsage(db, {
@@ -145,8 +150,11 @@ export async function runAnswerTurn(args: RunAnswerTurnArgs): Promise<void> {
         if (runId && now() - lastFlush >= PARTIAL_FLUSH_MS) {
           lastFlush = now();
           try {
-            await flushPartial(db, runId, answer);
+            // R76: a protected flush commits only inside a revocation-linearized transaction, onto the
+            // run's own frozen provenance.
+            await flushPartial(db, runId, answer, { teamId: owner.teamId, provenance: args.provenance });
           } catch (e) {
+            if (isRefusal(e)) throw e; // an authorization refusal ends the turn; it is not a flush hiccup
             console.warn("[query] partial flush failed:", e instanceof Error ? e.message : e);
           }
         }
@@ -179,36 +187,54 @@ export async function runAnswerTurn(args: RunAnswerTurnArgs): Promise<void> {
           throw e;
         }
       };
-      await fence();
+      await fence(); // preliminary defense only — the transaction below is the linearization point
+      // R76: the completed answer — assistant message, source-bearing log preview and the run's success —
+      // commits in ONE short transaction that share-locks the revocation epoch first and re-checks the
+      // answer's ORIGINAL epoch. A revocation that commits first means none of it is written; one that
+      // arrives while it holds the lock waits, and readers then suppress the now-obsolete output.
       let finalMessageId: string | null = null;
-      if (conversationId) {
-        finalMessageId = await appendMessage(db, owner, conversationId, "assistant", answer, {
-          cited_item_ids: sources.map((s) => s.item_id).filter((id): id is string => Boolean(id)),
-          input_tokens: chunk.usage.input_tokens,
-          output_tokens: chunk.usage.output_tokens,
-          cost_usd: chunk.usage.cost_usd,
+      try {
+        finalMessageId = await withOutputPublication(owner.teamId, args.provenance, async () => {
+          let messageId: string | null = null;
+          if (conversationId) {
+            messageId = await appendMessage(db, owner, conversationId, "assistant", answer, {
+              cited_item_ids: sources.map((s) => s.item_id).filter((id): id is string => Boolean(id)),
+              input_tokens: chunk.usage.input_tokens,
+              output_tokens: chunk.usage.output_tokens,
+              cost_usd: chunk.usage.cost_usd,
+            }, args.provenance);
+          }
+          // CHECK THE ERROR. The db adapter resolves `{ error }` instead of throwing, so an unchecked
+          // insert fails SILENTLY — leaving a persisted answer with no spend row, which is precisely the
+          // under-bill this slice exists to close. Loud (thrown → rolled back, logged + the run marked
+          // failed) beats a turn that looks complete but is invisible to the ledger.
+          const { error: logError } = await db.from("query_log").insert({
+            team_id: owner.teamId,
+            member_id: owner.memberId,
+            question,
+            answer_preview: answer.slice(0, 500),
+            cited_item_ids: sources.map((s) => s.item_id).filter(Boolean),
+            input_tokens: chunk.usage.input_tokens,
+            output_tokens: chunk.usage.output_tokens,
+            cache_read_tokens: chunk.usage.cache_read_tokens,
+            cost_usd: chunk.usage.cost_usd,
+            latency_ms: now() - args.startedAt,
+            context_authorization_epoch: args.provenance.epoch,
+          });
+          if (logError) throw new Error(`query_log insert failed: ${logError.message}`);
+          // Flip the run LAST, pointing at the message that now exists.
+          if (runId) await finishRun(db, runId, messageId);
+          return messageId;
         });
+      } catch (e) {
+        if (isRefusal(e) && !accounted) {
+          accounted = true;
+          await accountRefused(chunk.usage);
+        }
+        throw e;
       }
-
-      await fence(); // the answer preview and cited items below are source-bearing
-      // CHECK THE ERROR. The db adapter resolves `{ error }` instead of throwing, so an unchecked
-      // insert fails SILENTLY — leaving a persisted answer with no spend row, which is precisely the
-      // under-bill this slice exists to close. Loud (thrown → logged + the run marked failed) beats a
-      // turn that looks complete but is invisible to the ledger.
-      const { error: logError } = await db.from("query_log").insert({
-        team_id: owner.teamId,
-        member_id: owner.memberId,
-        question,
-        answer_preview: answer.slice(0, 500),
-        cited_item_ids: sources.map((s) => s.item_id).filter(Boolean),
-        input_tokens: chunk.usage.input_tokens,
-        output_tokens: chunk.usage.output_tokens,
-        cache_read_tokens: chunk.usage.cache_read_tokens,
-        cost_usd: chunk.usage.cost_usd,
-        latency_ms: now() - args.startedAt,
-      });
-      if (logError) throw new Error(`query_log insert failed: ${logError.message}`);
       accounted = true;
+      void finalMessageId;
 
       await recordLlmUsage(db, {
         teamId: owner.teamId,
@@ -222,11 +248,6 @@ export async function runAnswerTurn(args: RunAnswerTurnArgs): Promise<void> {
         estimated: chunk.usage.estimated,
       });
 
-      // Flip the run LAST, pointing at the message that now exists — never as a success after a
-      // revocation that committed while the spend was being accounted.
-      await fence();
-      if (runId) await finishRun(db, runId, finalMessageId);
-
       // Everything durable is written — NOW tell the client the turn is complete, still authorized:
       // a refusal here takes the catch, which marks the run failed (overriding `done`) and clears it.
       await fence();
@@ -239,7 +260,7 @@ export async function runAnswerTurn(args: RunAnswerTurnArgs): Promise<void> {
       if (conversationId && args.createdNew) {
         try {
           // The title request carries the answer: gated before its dispatch and before its write.
-          await generateAndSetTitle(db, owner, conversationId, question, answer, keys, gate);
+          await generateAndSetTitle(db, owner, conversationId, question, answer, keys, args.provenance, gate);
         } catch (e) {
           console.warn("[query] title generation failed:", e instanceof Error ? e.message : e);
         }

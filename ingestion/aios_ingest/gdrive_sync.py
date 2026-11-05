@@ -3223,7 +3223,11 @@ async def _run_gdrive_stream_unlocked(
                 else:
                     for root in ([file_id] if direct else ([drive_root] if drive_root else [])):
                         membership_additions.append((file_id, root, drive_id, None))
-                obligations.append((file_id, "upsert", {"file_id": file_id, "metadata": file}))
+                obligations.append((file_id, "upsert", {
+                    "file_id": file_id, "metadata": file,
+                    # Minted where it was observed (R76 F1): only this execution may restore unverified.
+                    "observed_under": _observation_token(execution),
+                }))
             # Ordering (A1): explicit trash later RESTORED within the same page is not trash any more. A
             # restored document this stream cannot place (no local membership, its root unreadable)
             # yields no superseding upsert, so its earlier trash removal is dropped here instead of
@@ -3615,6 +3619,7 @@ async def _enumerate_baseline(
                 ):
                     obligations.append((str(meta["id"]), "upsert", {
                         "file_id": str(meta["id"]), "metadata": meta,
+                        "observed_under": _observation_token(execution),
                     }))
             if meta is not None and bound_drive is not None:
                 # Read by this enumeration: a deferred file root is settled here, and only here — and
@@ -3748,6 +3753,7 @@ async def _enumerate_baseline(
                     if not already_selected:
                         obligations.append((provider_id, "upsert", {
                             "file_id": provider_id, "metadata": meta,
+                            "observed_under": _observation_token(execution),
                         }))
             next_token = response.get("nextPageToken")
             if next_token:
@@ -4128,6 +4134,15 @@ async def _drain_pending(
                     summary.failure_categories.get("membership_changed", 0) + 1
                 )
                 continue
+            if not _retained_upsert_selected(state, execution, source, work, meta):
+                # Retained from an earlier execution and NOT proven selected by current ancestry:
+                # kept pending — neither restored nor discarded — until a replacement enumeration
+                # (whose publication supersedes it if the document is gone) or a fresh observation.
+                state.fail_work(work, _RETAINED_UPSERT_UNVERIFIED, not_before=work.not_before, failure=False)
+                summary.failure_categories["selection_unverified"] = (
+                    summary.failure_categories.get("selection_unverified", 0) + 1
+                )
+                continue
             doc = source._raw_doc(meta)
             if not state.work_membership_current(work):
                 continue
@@ -4310,6 +4325,11 @@ def _selecting_stream(
             for row in state.list_roots(namespace, work.generation, snapshot_id=snapshot)
         }
     drive_id = str(meta.get("driveId") or "my-drive")
+    # A standing provider minimum on an ancestor folder is not read early: the walk is then inconclusive.
+    own = state.get_progress(work.namespace)
+    restricted = set(_standing_document_restrictions(
+        state, connection_id, work.generation, own.key.credential_id,
+    )) if own is not None else set()
     chain: list[str] = []
     for namespace, roots in roots_by_stream.items():
         if ("file", work.item_key) in roots or ("drive", drive_id) in roots:
@@ -4328,6 +4348,8 @@ def _selecting_stream(
             if folder in seen:
                 continue
             seen.add(folder)
+            if folder in restricted:
+                raise _AncestryUnverified()
             try:
                 parent_meta = source._metadata(folder)
             except (BrainError, ProviderDeferred):
@@ -4345,6 +4367,37 @@ def _selecting_stream(
 
 class _AncestryUnverified(Exception):
     """A retained removal's ancestry walk met an inconclusive read or its depth bound."""
+
+
+_RETAINED_UPSERT_UNVERIFIED = "retained upsert awaits current selected ancestry"
+
+
+def _retained_upsert_selected(
+    state: StateStore, execution: GdriveExecution, source: GoogleDriveSource, work: PendingWork,
+    meta: dict[str, Any],
+) -> bool:
+    """Whether a document's upsert may restore it NOW (AIO-1167 R76 F1).
+
+    During DIVERGENT-STATE RECOVERY — the stream is marked ``recovery_required`` because its local
+    state no longer matches the authority (a stale store reacquiring, a replacement worker) and its
+    replacement enumeration has not completed — retained obligations drain against a snapshot whose
+    traversal is as old as they are. A fresh fence proves who may write, not that the document is still
+    selected: another worker may have moved an ANCESTOR folder out of the selected root and retired the
+    claim, leaving the immediate parent — and so the stale traversal — unchanged. So an upsert observed
+    under an EARLIER execution (or a legacy one naming none) restores there only on current positive
+    evidence: the document's parent chain, read through the provider gate, reaches one of THIS stream's
+    configured roots (``_selecting_stream``). Another stream's root, no root, or an inconclusive read is
+    not proof. Outside recovery, and for an upsert observed under this execution, nothing changes."""
+    if (work.payload or {}).get("observed_under") == _observation_token(execution):
+        return True
+    own = state.get_progress(work.namespace)
+    if own is None or not own.recovery_required:
+        return True
+    connection_id = own.key.connection_id if own is not None else execution.integration_id
+    try:
+        return _selecting_stream(state, source, work, meta, connection_id) == work.namespace
+    except _AncestryUnverified:
+        return False
 
 
 def _retained_removal_verdict(

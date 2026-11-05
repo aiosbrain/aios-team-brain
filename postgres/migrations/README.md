@@ -116,3 +116,17 @@ Practical consequences when you add a migration:
   declared with `policy_version` immutable in `schema.sql` and re-created WITHOUT it by
   `20260714090000` on every rollout, so the stated invariant never held in any deployed database —
   found by this lane, fixed by `20260820120000_gateway_lease_policy_version_immutable.sql`.
+
+## Compatibility note — `20261105163000_query_output_authorization_epoch.sql` (AIO-1167 R76)
+
+Adds a nullable `context_authorization_epoch bigint` with a named CHECK (`NULL` or `>= 0`) to
+`chat_turn_runs`, `chat_messages` and `query_log`; mirrored inline in `schema.sql`. Additive only: no
+backfill, index, foreign key or cleanup, so existing rows read as `NULL` (historical, pre-contract).
+Meaning: `NULL` — completed historical messages/previews stay readable, a `NULL` streaming partial is
+never replayed; `0` — new output with no Google-derived model input; positive — the original captured
+context authorization epoch, readable only while the team's revocation epoch still equals it.
+
+Rollout order: apply the schema first, then replace/drain query-serving workers still running the
+previous code before claiming the guarantee — an old worker writes `NULL`, which readers treat as
+historical. Rolling the code back while keeping the column is safe (the column is ignored); rolling
+back the column under new code disables the query path, so do not drop it while new code is deployed.

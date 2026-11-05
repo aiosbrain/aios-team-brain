@@ -29,6 +29,11 @@ import {
   QueryContextAuthorizationChangedError,
   requireContextAuthorization,
 } from "@/lib/query/context-authorization";
+import {
+  NON_GOOGLE_OUTPUT,
+  classifyOutputProvenance,
+  type OutputProvenance,
+} from "@/lib/query/output-provenance";
 
 const SSE_HEADERS = {
   "Content-Type": "text/event-stream",
@@ -253,6 +258,18 @@ export async function POST(req: NextRequest) {
     throw e;
   }
 
+  // AIO-1167 R76: the answer's output provenance — classified ONCE from every input admitted to the
+  // model, re-checked against the original capture, and frozen before any turn state, run or dispatch.
+  let provenance: OutputProvenance;
+  try {
+    provenance = await classifyOutputProvenance(team.id, ctx.modelInputs, authorization);
+  } catch (e) {
+    if (e instanceof QueryContextAuthorizationChangedError) {
+      return errorResponse("temporarily_unavailable", CONTEXT_AUTHORIZATION_CLIENT_MESSAGE, 503);
+    }
+    throw e;
+  }
+
   // Resolve the persistent thread: adopt the caller's conversation if they own it, else start one,
   // then record the user message. The assistant message is persisted once the answer finishes
   // streaming. (PRET-6: the prior-turn LLM memory load retired with the permissive arm — see the
@@ -265,7 +282,7 @@ export async function POST(req: NextRequest) {
     conversationId = created?.id ?? null;
     createdNew = true;
   }
-  if (conversationId) await appendMessage(db, owner, conversationId, "user", question);
+  if (conversationId) await appendMessage(db, owner, conversationId, "user", question, {}, NON_GOOGLE_OUTPUT);
 
   // Per-team provider keys + models + the explicit answering-backend override (null fields → env
   // fallback in streamAnswer; `activeProvider` forces a backend, else selectLlmBackend precedence).
@@ -299,7 +316,7 @@ export async function POST(req: NextRequest) {
   let runId: string | null = null;
   if (conversationId) {
     try {
-      runId = (await createRun(db, owner, conversationId, question))?.id ?? null;
+      runId = (await createRun(db, owner, conversationId, question, provenance))?.id ?? null;
     } catch (e) {
       console.error("[query] could not create turn run:", e instanceof Error ? e.message : e);
     }
@@ -346,6 +363,7 @@ export async function POST(req: NextRequest) {
         createdNew,
         startedAt: started,
         send,
+        provenance,
       });
 
       try {

@@ -1777,6 +1777,10 @@ create table if not exists query_log (
   cache_read_tokens integer not null default 0,
   cost_usd numeric(10, 5) not null default 0,
   latency_ms integer not null default 0,
+  -- AIO-1167 R76: output authorization provenance (NULL historical, 0 non-Google, positive = the
+  -- original captured context epoch). Mirrors migration 20261105163000_query_output_authorization_epoch.
+  context_authorization_epoch bigint
+    constraint query_log_context_authorization_epoch_check check (context_authorization_epoch is null or context_authorization_epoch >= 0),
   created_at timestamptz not null default now()
 );
 create index if not exists query_log_team_time_idx on query_log (team_id, created_at desc);
@@ -3110,6 +3114,10 @@ create table if not exists chat_messages (
   input_tokens integer not null default 0,
   output_tokens integer not null default 0,
   cost_usd numeric(10, 5) not null default 0,
+  -- AIO-1167 R76: output authorization provenance (NULL historical, 0 non-Google, positive = the
+  -- original captured context epoch). Mirrors migration 20261105163000_query_output_authorization_epoch.
+  context_authorization_epoch bigint
+    constraint chat_messages_context_authorization_epoch_check check (context_authorization_epoch is null or context_authorization_epoch >= 0),
   created_at timestamptz not null default now(),
   -- FTS over message bodies so the sidebar search can match conversation CONTENT (mirrors items.search).
   search tsvector generated always as (to_tsvector('english', coalesce(content, ''))) stored
@@ -3147,6 +3155,10 @@ create table if not exists chat_turn_runs (
   -- provider error, which carries the internal model + base URL.
   error_message text,
   final_message_id uuid references chat_messages(id) on delete set null,
+  -- AIO-1167 R76: output authorization provenance (NULL historical, 0 non-Google, positive = the
+  -- original captured context epoch). Mirrors migration 20261105163000_query_output_authorization_epoch.
+  context_authorization_epoch bigint
+    constraint chat_turn_runs_context_authorization_epoch_check check (context_authorization_epoch is null or context_authorization_epoch >= 0),
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );

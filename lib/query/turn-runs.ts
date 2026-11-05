@@ -1,5 +1,13 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
+import { runSql } from "@/lib/db/pg/pool";
+import { CONTEXT_AUTHORIZATION_CLIENT_MESSAGE } from "./stream-retry";
+import {
+  outputReadable,
+  withOutputPublication,
+  withOutputRead,
+  type OutputProvenance,
+} from "./output-provenance";
 
 /**
  * Single writer + reader for `chat_turn_runs` — the in-flight state of one answer attempt (QBGSTREAM-1).
@@ -79,7 +87,10 @@ export async function createRun(
   db: DbClient,
   owner: RunOwner,
   conversationId: string,
-  question: string
+  question: string,
+  // AIO-1167 R76: the answer's FROZEN output provenance (0 or the original positive epoch). Written once
+  // here, before the first partial; heartbeat, finalization and cleanup never change it.
+  provenance: OutputProvenance,
 ): Promise<{ id: string } | null> {
   const { data, error } = await db
     .from("chat_turn_runs")
@@ -89,6 +100,7 @@ export async function createRun(
       member_id: owner.memberId,
       question,
       status: "streaming",
+      context_authorization_epoch: provenance.epoch,
     })
     .select("id")
     .single();
@@ -118,13 +130,23 @@ export async function touchRun(db: DbClient, runId: string): Promise<void> {
  * Heartbeat the run with the answer so far. Also the liveness signal `isRunStale` reads, so this must
  * be called periodically even when the text hasn't grown much — silence is what marks a run dead.
  */
-export async function flushPartial(db: DbClient, runId: string, partial: string): Promise<void> {
-  const { error } = await db
-    .from("chat_turn_runs")
-    .update({ partial_text: partial, updated_at: new Date().toISOString() })
-    .eq("id", runId)
-    .eq("status", "streaming"); // never resurrect a finished run
-  if (error) throw new Error(`flushPartial: ${error.message}`);
+export async function flushPartial(
+  db: DbClient,
+  runId: string,
+  partial: string,
+  // AIO-1167 R76: the run's own team and frozen provenance. A protected flush commits only inside a
+  // short revocation-linearized transaction, and only onto the matching streaming run.
+  expected: { teamId: string; provenance: OutputProvenance },
+): Promise<boolean> {
+  void db;
+  return withOutputPublication(expected.teamId, expected.provenance, async () => {
+    const { rowCount } = await runSql(
+      `update chat_turn_runs set partial_text=$1, updated_at=now()
+        where id=$2 and team_id=$3 and status='streaming' and context_authorization_epoch=$4`,
+      [partial, runId, expected.teamId, expected.provenance.epoch],
+    );
+    return (rowCount ?? 0) === 1;
+  });
 }
 
 /**
@@ -176,16 +198,41 @@ export async function latestRun(
   owner: RunOwner,
   conversationId: string
 ): Promise<TurnRun | null> {
-  const { data } = await db
-    .from("chat_turn_runs")
-    .select("id, conversation_id, question, status, partial_text, error_message, final_message_id, created_at, updated_at")
-    .eq("team_id", owner.teamId)
-    .eq("member_id", owner.memberId)
-    .eq("conversation_id", conversationId)
-    .order("created_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
-  return (data as TurnRun | null) ?? null;
+  // AIO-1167 R76: read at a revocation-linearized epoch and project fail-closed (`projectRun`).
+  return withOutputRead(owner.teamId, async (current) => {
+    const { data } = await db
+      .from("chat_turn_runs")
+      .select(`${RUN_COLUMNS}, context_authorization_epoch`)
+      .eq("team_id", owner.teamId)
+      .eq("member_id", owner.memberId)
+      .eq("conversation_id", conversationId)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    return data ? projectRun(data as StoredRun, current) : null;
+  });
+}
+
+const RUN_COLUMNS =
+  "id, conversation_id, question, status, partial_text, error_message, final_message_id, created_at, updated_at";
+type StoredRun = TurnRun & { context_authorization_epoch?: unknown };
+
+/**
+ * What a reader may see of one stored run (AIO-1167 R76). A run whose output provenance is obsolete,
+ * unverifiable or malformed — or a historical (NULL) run still marked streaming — is reported as a
+ * finished, retryable failure with NO partial text and NO final pointer, whatever its worker is doing.
+ */
+function projectRun(run: StoredRun, current: number | null): TurnRun {
+  const { context_authorization_epoch: stored, ...visible } = run;
+  const kind = run.status === "streaming" ? "partial" : "completed";
+  if (outputReadable(stored, current, kind)) return visible;
+  return {
+    ...visible,
+    status: "error",
+    partial_text: "",
+    final_message_id: null,
+    error_message: CONTEXT_AUTHORIZATION_CLIENT_MESSAGE,
+  };
 }
 
 /**
@@ -197,16 +244,20 @@ export async function latestRun(
  * never resolves. A stale run is reported as no active run.
  */
 export async function activeRun(db: DbClient, owner: RunOwner, now: Date = new Date()): Promise<TurnRun | null> {
-  const { data } = await db
-    .from("chat_turn_runs")
-    .select("id, conversation_id, question, status, partial_text, error_message, final_message_id, created_at, updated_at")
-    .eq("team_id", owner.teamId)
-    .eq("member_id", owner.memberId)
-    .eq("status", "streaming")
-    .order("updated_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
-  const run = (data as TurnRun | null) ?? null;
-  if (!run || isRunStale(run, now)) return null;
-  return run;
+  // AIO-1167 R76: a streaming run whose provenance is not readable now is no active run.
+  return withOutputRead(owner.teamId, async (current) => {
+    const { data } = await db
+      .from("chat_turn_runs")
+      .select(`${RUN_COLUMNS}, context_authorization_epoch`)
+      .eq("team_id", owner.teamId)
+      .eq("member_id", owner.memberId)
+      .eq("status", "streaming")
+      .order("updated_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    const stored = (data as StoredRun | null) ?? null;
+    if (!stored || isRunStale(stored, now)) return null;
+    const run = projectRun(stored, current);
+    return run.status === "streaming" ? run : null;
+  });
 }

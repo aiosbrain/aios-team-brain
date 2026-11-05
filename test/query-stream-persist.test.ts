@@ -20,6 +20,12 @@ vi.mock("@/lib/query/claude", () => ({ streamAnswer: (...a: unknown[]) => stream
 vi.mock("@/lib/chat/store", () => ({ appendMessage: (...a: unknown[]) => appendMessageMock(...a) }));
 vi.mock("@/lib/chat/title", () => ({ generateAndSetTitle: (...a: unknown[]) => generateAndSetTitleMock(...a) }));
 vi.mock("@/lib/costs/llm-usage", () => ({ recordLlmUsage: (...a: unknown[]) => recordLlmUsageMock(...a) }));
+// The unit tier has no database: the R76 publication transaction runs its body directly here (its
+// revocation linearization is pinned against real Postgres in query-output-provenance.datamechanics).
+vi.mock("@/lib/query/output-provenance", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/query/output-provenance")>()),
+  withOutputPublication: async (_team: string, _provenance: unknown, fn: () => Promise<unknown>) => fn(),
+}));
 vi.mock("@/lib/query/turn-runs", () => ({
   flushPartial: (...a: unknown[]) => flushPartialMock(...a),
   finishRun: (...a: unknown[]) => finishRunMock(...a),
@@ -77,6 +83,7 @@ function baseArgs(db: ReturnType<typeof fakeDb>, send: (e: string, d: unknown) =
     startedAt: 0,
     send,
     now: () => 1_000_000,
+    provenance: { epoch: 0 },
   };
 }
 

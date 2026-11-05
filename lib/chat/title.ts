@@ -1,4 +1,5 @@
 import "server-only";
+import { isProtectedOutput, type OutputProvenance } from "@/lib/query/output-provenance";
 import Anthropic from "@anthropic-ai/sdk";
 import type { DbClient } from "@/lib/db/types";
 import type { ProviderKeys } from "@/lib/query/claude";
@@ -127,11 +128,16 @@ export async function generateAndSetTitle(
   conversationId: string,
   question: string,
   answer: string,
-  keys: ProviderKeys = {},
-  // AIO-1167 R67: the answer is source-derived. `gate` is awaited immediately before the title
-  // request and again before the title is written; when it throws, nothing is dispatched or written.
+  keys: ProviderKeys,
+  // AIO-1167 R76: the answer's output provenance. A PROTECTED answer (Google-derived input) never feeds
+  // a title: the question-derived title is kept and no title request is made — titles carry no
+  // provenance column of their own. Only known non-Google answers get an automatic title.
+  provenance: OutputProvenance,
+  // AIO-1167 R67: `gate` is awaited immediately before the title request and again before the title is
+  // written; when it throws, nothing is dispatched or written.
   gate?: () => Promise<void>,
 ): Promise<void> {
+  if (isProtectedOutput(provenance)) return;
   try {
     if (gate) await gate();
     const title = await generateTitle(question, answer, keys, {

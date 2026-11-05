@@ -43,6 +43,9 @@ export type RetrievedContext = {
    *  `retrieve()` entry (`ContextAuthorization.capture`, before the reads it certifies) and checked
    *  before every dispatch of this text. Absent or hand-built, every dispatch refuses. */
   authorization?: import("@/lib/query/context-authorization").ContextAuthorization;
+  /** AIO-1167 R76: every input admitted to the answer model, by item — `complete: false` when that
+   *  cannot be proven (output provenance then protects the answer). Set by the native provider only. */
+  modelInputs?: import("@/lib/query/output-provenance").ModelInputProvenance;
 };
 
 export interface RetrievalRequest {
