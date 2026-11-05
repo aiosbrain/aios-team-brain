@@ -306,6 +306,9 @@ ROOT_DETAIL_LIMIT = 200
 # A binding adopted from authority it CONFLICTED with (AIO-1167 R58): settled coverage is never
 # manufactured from it; it stays uncertain until its root is freshly observed where it is bound.
 ROOT_AUTHORITY_CONFLICT_DETAIL = "root authority conflict: re-observe before coverage"
+# A user-log file root whose routing a Shared Drive membership event invalidated (AIO-1167 R61): it
+# stays uncertain until revalidation PROVES its consuming stream — never settled on an unknown answer.
+ROOT_MEMBERSHIP_EVENT_DETAIL = "shared drive membership changed: revalidate routing before coverage"
 # ``ack_baseline`` of a row this store created that no acknowledged root document has named yet.
 _BASELINE_ABSENT = "absent"
 
@@ -1288,18 +1291,47 @@ class StateStore:
         self, connection_id: str, generation: int, root_kind: str, root_id: str, drive_id: str,
         *, detail: str,
     ) -> None:
-        """``mark_root_uncertain``'s statement, without committing (for a caller's transaction)."""
+        """``mark_root_uncertain``'s statement, without committing (for a caller's transaction).
+
+        A membership-event revalidation debt (``ROOT_MEMBERSHIP_EVENT_DETAIL``, R61) is likewise kept
+        over ordinary uncertainty: an unreadable root is no answer to which stream consumes it."""
         deferred = f"{ROOT_DEFERRED_PREFIX}%"
         self._db.execute(
             "INSERT INTO selection_root_bindings(connection_id,generation,root_kind,root_id,drive_id,status,detail,ack_baseline) "
             "VALUES(?,?,?,?,?,'uncertain',?,'\"absent\"') ON CONFLICT(connection_id,generation,root_kind,root_id) DO UPDATE SET "
             "status='uncertain',detail=CASE WHEN selection_root_bindings.status='uncertain' "
-            "AND coalesce(selection_root_bindings.detail,'') LIKE ? "
+            "AND (coalesce(selection_root_bindings.detail,'') LIKE ? "
+            "OR coalesce(selection_root_bindings.detail,'')=?) "
             "AND coalesce(excluded.detail,'') NOT LIKE ? "
             "THEN selection_root_bindings.detail ELSE excluded.detail END "
             "WHERE selection_root_bindings.status NOT IN ('relocating','unresolved')",
-            (connection_id, generation, root_kind, root_id, drive_id, detail, deferred, deferred),
+            (connection_id, generation, root_kind, root_id, drive_id, detail, deferred,
+             ROOT_MEMBERSHIP_EVENT_DETAIL, deferred),
         )
+
+    def invalidate_user_log_file_roots(self, connection_id: str, generation: int) -> list[tuple[str, str]]:
+        """A Shared Drive membership event reached the user log: revalidate its file roots (R61).
+
+        A file root consumed through the user log (``my-drive``) because its account was not a
+        member of the Shared Drive it lives in is reported there only while that stays true; a
+        membership gain is announced by a DRIVE-level change that names no file. Which drive holds
+        each such root is not recorded, so every ``bound`` user-log file root is made ``uncertain``
+        with ``ROOT_MEMBERSHIP_EVENT_DETAIL`` — a durable, published debt that keeps the connection
+        partial until revalidation proves the consuming stream. Nothing is selected, removed or
+        unbound: its claims and the user log's snapshot stand. Idempotent; returns the roots marked."""
+        rows = self._db.execute(
+            "SELECT root_kind,root_id FROM selection_root_bindings WHERE connection_id=? AND generation=? "
+            "AND root_kind='file' AND drive_id='my-drive' AND status='bound' ORDER BY root_id",
+            (connection_id, generation),
+        ).fetchall()
+        marked = [(str(row["root_kind"]), str(row["root_id"])) for row in rows]
+        for root_kind, root_id in marked:
+            self._write_root_uncertain(
+                connection_id, generation, root_kind, root_id, "my-drive", detail=ROOT_MEMBERSHIP_EVENT_DETAIL,
+            )
+        if marked:
+            self._db.commit()
+        return marked
 
     def mark_root_relocating(
         self, connection_id: str, generation: int, root_kind: str, root_id: str, drive_id: str,
@@ -1321,21 +1353,25 @@ class StateStore:
 
     def settle_root(
         self, connection_id: str, generation: int, root_kind: str, root_id: str,
-        *, enumerated: bool = False,
+        *, enumerated: bool = False, revalidated: bool = False,
     ) -> None:
         """A root read where it is bound is no longer uncertain — nor unavailable (R48 D1): read
         again, it is restored. A relocation is never settled here.
 
         A DEFERRED root (``ROOT_DEFERRED_PREFIX``, AIO-1167 R50 F4) is different: its stream's
         snapshot holds only retained membership for it, so reading its metadata proves where it is,
-        not what is under it. Only the enumeration that lists it again (``enumerated``) settles it."""
+        not what is under it. Only the enumeration that lists it again (``enumerated``) settles it.
+        A membership-event root (``ROOT_MEMBERSHIP_EVENT_DETAIL``, R61) is settled only by the
+        revalidation that PROVED its consuming stream (``revalidated``): an ordinary read where it is
+        bound may rest on an unknown membership, which keeps the user log by default."""
         self._db.execute(
             "UPDATE selection_root_bindings SET status='bound',detail=NULL WHERE connection_id=? "
             "AND generation=? AND root_kind=? AND root_id=? "
             "AND (status='uncertain' OR (status='bound' AND detail IS NOT NULL)) "
-            "AND (? OR NOT (status='uncertain' AND coalesce(detail,'') LIKE ?))",
+            "AND (? OR NOT (status='uncertain' AND coalesce(detail,'') LIKE ?)) "
+            "AND (? OR NOT (status='uncertain' AND coalesce(detail,'')=?))",
             (connection_id, generation, root_kind, root_id, 1 if enumerated else 0,
-             f"{ROOT_DEFERRED_PREFIX}%"),
+             f"{ROOT_DEFERRED_PREFIX}%", 1 if revalidated else 0, ROOT_MEMBERSHIP_EVENT_DETAIL),
         )
         self._db.commit()
 

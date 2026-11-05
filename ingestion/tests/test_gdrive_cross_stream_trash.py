@@ -1,0 +1,234 @@
+"""AIO-1167 R61 fix 1 — an older trash obligation never undoes a later restoration through another stream.
+
+Spec (Astra R61 adjudication, finding 1). One connection selects a folder in Shared Drive A and one in
+Shared Drive B. Stream A records evidence-bearing trash of ``doc-1`` and its removal is refused (or
+committed with the response lost), so it stays owed. The document is then restored and moved into
+B's selected folder, and B ingests it — through its change log, or through a baseline enumeration.
+A's delayed retry runs before A reads the move-out. The brain's claim is one per connection, so
+replaying the historical trash would deactivate the restored claim, and no later complete snapshot
+reactivates it. Through the real coordinator over ``_DriveWorld`` (claims in ``_ClaimLedger``):
+
+  * the delayed retry re-verifies against the provider and is superseded, never sent: the restored
+    claim and content survive, nothing is cleaned up — across a SQLite reopen with a replacement
+    execution fence, and through later complete snapshots and the cleanup drain, without another
+    upsert;
+  * controls: a GENUINELY later trash still removes; another connection's claim survives either
+    way; a restricted document is not read early and its removal is retained until it may be.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+from datetime import timedelta
+
+import pytest
+
+from aios_ingest import gdrive_sync
+from aios_ingest.brain_client import BrainError
+from aios_ingest.state import StateStore
+from test_document_restrictions import clock  # noqa: F401 (a fixture)
+from test_gdrive_upgrade import (
+    _HELD, _SECOND_INTEGRATION, _WORLD_INTEGRATION, _ClaimLedger, _DriveWorld, _owed, _retry_at,
+)
+
+GEN = 9
+
+
+def _world(monkeypatch, *, lost_responses: list | None = None, fences: list | None = None):
+    world = _DriveWorld(folder_ids=["folder-a", "folder-b"]).install(monkeypatch)
+    world.ledger = _ClaimLedger()
+    world.ledger.push(_SECOND_INTEGRATION, "doc-1")  # another connection's valid claim
+    world.put("folder-a", drive="shared-a", folder=True)
+    world.put("folder-b", drive="shared-b", folder=True)
+    world.put("doc-1", drive="shared-a", parent="folder-a")
+    world.put("doc-b", drive="shared-b", parent="folder-b")
+    client = gdrive_sync.BrainClient
+    if lost_responses is not None:
+        # A removal the brain COMMITS whose response is lost: the claim is retired, the sidecar
+        # never learns it, and the obligation stays owed.
+        committed = client.reconcile_gdrive
+
+        async def reconcile(self, execution, **kwargs):
+            result = await committed(self, execution, **kwargs)
+            if kwargs.get("removed_provider_ids") and lost_responses:
+                lost_responses.pop(0)
+                raise BrainError(504, "reconcile_response_lost", "no response arrived")
+            return result
+
+        monkeypatch.setattr(client, "reconcile_gdrive", reconcile)
+    if fences is not None:
+        # Every run is a REPLACEMENT execution: a new, higher fence.
+        acquire = client.acquire_gdrive_execution
+
+        async def acquire_next(self, requested, owner):
+            execution = await acquire(self, requested, owner)
+            fences.append(len(fences) + 2)
+            return dataclasses.replace(execution, fence=fences[-1])
+
+        monkeypatch.setattr(client, "acquire_gdrive_execution", acquire_next)
+    return world
+
+
+def _trash_in_a(world):
+    world.files["doc-1"]["trashed"] = True
+    world.logs.setdefault("shared-a", []).append({"fileId": "doc-1", "file": dict(world.files["doc-1"])})
+
+
+def _restore_into_b(world, *, through: str):
+    """Restore and move doc-1 into B's selected folder. A's log has not been read past it yet."""
+    world.files["doc-1"].update(trashed=False, driveId="shared-b", parents=["folder-b"])
+    if through == "changes":
+        world.logs.setdefault("shared-b", []).append({"fileId": "doc-1", "file": dict(world.files["doc-1"])})
+    else:
+        # No change row: B owes a controlled recovery, and its baseline enumeration lists doc-1.
+        world.progress["streams"]["shared-b"]["checkpoint_id"] = "page-this-sidecar-never-retired"
+        world.revision += 1
+
+
+def _owed_trash(state, world):
+    return [row for row in _owed(state, world.namespace("shared-a")) if row[:2] == ("doc-1", "remove")]
+
+
+async def _refused_trash_then_restored(tmp_path, monkeypatch, name, *, sink, through, reopen=False):
+    lost = [] if sink == "lost" else None
+    fences = [] if reopen else None
+    world = _world(monkeypatch, lost_responses=lost, fences=fences)
+    path = str(tmp_path / name)
+    state = StateStore(path)
+    assert (await world.run(state)).authoritative_complete is True
+    assert world.ledger.claims["doc-1"] == {_WORLD_INTEGRATION, _SECOND_INTEGRATION}
+
+    # A observes explicit trash; its removal is refused, or committed with the response lost.
+    _trash_in_a(world)
+    if sink == "lost":
+        lost.append(True)
+    else:
+        world.removal_faults.append(BrainError(503, "cleanup_unavailable", "the brain refused"))
+    await world.run(state)
+    assert len(_owed_trash(state, world)) == 1, "the trash obligation stays owed and retryable"
+    if sink == "lost":
+        assert world.ledger.claims["doc-1"] == {_SECOND_INTEGRATION}  # committed: our claim retired
+    else:
+        assert world.removed == [] and world.ledger.claims["doc-1"] == {_WORLD_INTEGRATION, _SECOND_INTEGRATION}
+    _retry_at(state, world.namespace("shared-a"), "doc-1", _HELD)
+
+    # Restored into B, which ingests it (change log or baseline enumeration) while A's retry waits.
+    _restore_into_b(world, through=through)
+    if reopen:
+        state.close()
+        state = StateStore(path)
+    pushed_before = world.pushed.count("doc-1")
+    await world.run(state)
+    assert world.pushed.count("doc-1") == pushed_before + 1, "B ingested the restored document"
+    assert _WORLD_INTEGRATION in world.ledger.claims["doc-1"], "B's push restored the connection's claim"
+    assert state.claimed_elsewhere(_WORLD_INTEGRATION, GEN, world.namespace("shared-a"), "doc-1")
+    assert len(_owed_trash(state, world)) == 1, "A's older trash is still owed: B could not cancel it"
+    if reopen:
+        state.close()
+        state = StateStore(path)
+    return world, path, state, fences
+
+
+@pytest.mark.parametrize("through", ["changes", "baseline"])
+@pytest.mark.parametrize("sink", ["refused", "lost"])
+@pytest.mark.parametrize("reopen", [False, True], ids=["same-store", "reopened-replacement-fence"])
+@pytest.mark.asyncio
+async def test_a_delayed_trash_retry_never_undoes_a_later_restoration_through_another_stream(
+    tmp_path, monkeypatch, through, sink, reopen,
+):
+    world, path, state, fences = await _refused_trash_then_restored(
+        tmp_path, monkeypatch, f"{through}-{sink}-{reopen}.sqlite", sink=sink, through=through, reopen=reopen,
+    )
+    removed_before, pushed = list(world.removed), world.pushed.count("doc-1")
+
+    # A's delayed retry comes due, and runs before A reads the move-out.
+    _retry_at(state, world.namespace("shared-a"), "doc-1", None)
+    world.calls.clear()
+    await world.run(state)
+
+    assert ("metadata", "doc-1") in world.calls, "the retained trash is re-verified against the later claim"
+    assert world.removed == removed_before, "the obsolete trash is never sent"
+    assert world.ledger.claims["doc-1"] == {_WORLD_INTEGRATION, _SECOND_INTEGRATION}
+    assert _owed_trash(state, world) == [], "superseded, not left owed"
+    if reopen:
+        assert fences == sorted(set(fences)) and len(fences) >= 4  # each run a fresh, higher fence
+
+    # A later reads the move-out; complete snapshots and the cleanup drain follow. The restoration
+    # stands with no further upsert, and nothing is cleaned up.
+    world.logs["shared-a"].append({"fileId": "doc-1", "removed": True})
+    for _ in range(3):
+        if reopen:
+            state.close()
+            state = StateStore(path)
+        summary = await world.run(state)
+    assert summary.authoritative_complete is True
+    assert "doc-1" in world.reconciled[-1], "the latest complete snapshot holds the restored document"
+    assert world.removed == removed_before
+    assert world.ledger.claims["doc-1"] == {_WORLD_INTEGRATION, _SECOND_INTEGRATION}
+    assert "doc-1" not in world.ledger.deleted
+    assert world.pushed.count("doc-1") == pushed, "preserved without another upsert"
+    assert state.membership_ids(world.namespace("shared-b"), GEN) == ["doc-1", "doc-b"]
+    state.close()
+
+
+@pytest.mark.asyncio
+async def test_control_a_genuinely_later_trash_still_removes_and_another_connection_keeps_its_claim(
+    tmp_path, monkeypatch,
+):
+    world, _path, state, _ = await _refused_trash_then_restored(
+        tmp_path, monkeypatch, "later-trash.sqlite", sink="refused", through="changes",
+    )
+    # After B's restoration the document is trashed AGAIN — current provider truth.
+    world.files["doc-1"]["trashed"] = True
+    world.logs["shared-b"].append({"fileId": "doc-1", "file": dict(world.files["doc-1"])})
+    _retry_at(state, world.namespace("shared-a"), "doc-1", None)
+    await world.run(state)
+
+    assert "doc-1" in world.removed
+    assert (_WORLD_INTEGRATION, "doc-1") in world.ledger.retired
+    assert world.ledger.claims["doc-1"] == {_SECOND_INTEGRATION}, "another connection's claim survives"
+    assert "doc-1" not in world.ledger.deleted
+    assert _owed_trash(state, world) == []
+    state.close()
+
+
+@pytest.mark.asyncio
+async def test_control_a_prompt_trash_with_no_other_claim_is_removed_without_a_read(tmp_path, monkeypatch):
+    world = _world(monkeypatch)
+    state = StateStore(str(tmp_path / "prompt.sqlite"))
+    assert (await world.run(state)).authoritative_complete is True
+    _trash_in_a(world)
+    world.calls.clear()
+    await world.run(state)
+    assert "doc-1" in world.removed
+    assert ("metadata", "doc-1") not in world.calls, "current trash is removed promptly, unread (R51 final 2)"
+    assert world.ledger.claims["doc-1"] == {_SECOND_INTEGRATION}
+    state.close()
+
+
+@pytest.mark.asyncio
+async def test_control_a_restricted_document_is_not_read_early_and_its_removal_is_retained(
+    tmp_path, monkeypatch, clock,
+):
+    world, _path, state, _ = await _refused_trash_then_restored(
+        tmp_path, monkeypatch, "restricted.sqlite", sink="refused", through="changes",
+    )
+    minimum = (clock.at + timedelta(hours=1)).isoformat()
+    state.restrict_document(_WORLD_INTEGRATION, GEN, "account", "doc-1", minimum, "provider_unavailable")
+    _retry_at(state, world.namespace("shared-a"), "doc-1", None)
+    world.calls.clear()
+    held = await world.run(state)
+
+    assert ("metadata", "doc-1") not in world.calls and ("doc", "doc-1") not in world.calls
+    assert world.removed == []
+    assert len(_owed_trash(state, world)) == 1, "retained, neither sent nor superseded"
+    assert held.authoritative_complete is False
+    assert world.ledger.claims["doc-1"] == {_WORLD_INTEGRATION, _SECOND_INTEGRATION}
+
+    # The minimum passes: re-verified, superseded, and the restored claim stands.
+    clock.at += timedelta(hours=2)
+    _retry_at(state, world.namespace("shared-a"), "doc-1", None)
+    await world.run(state)
+    assert world.removed == [] and _owed_trash(state, world) == []
+    assert world.ledger.claims["doc-1"] == {_WORLD_INTEGRATION, _SECOND_INTEGRATION}
+    state.close()

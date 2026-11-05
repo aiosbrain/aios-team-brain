@@ -40,7 +40,7 @@ from .sources.gdrive import (
     ProviderDeferred,
     is_drive_rate_limit,
 )
-from .state import ROOT_AUTHORITY_CONFLICT_DETAIL, StateStore, StreamKey, PendingWork, MaterializedPage
+from .state import ROOT_AUTHORITY_CONFLICT_DETAIL, ROOT_MEMBERSHIP_EVENT_DETAIL, StateStore, StreamKey, PendingWork, MaterializedPage
 from .selections import effective_gdrive_connection
 
 _TERMINAL_AUTHORITY_CODES = {
@@ -874,6 +874,9 @@ class RootObservation:
     state: str
     drive_id: str | None = None
     detail: str | None = None
+    # The drive the root physically is in, when read (R61): differs from ``drive_id`` for a
+    # non-member's file consumed through the user log.
+    physical_drive_id: str | None = dataclasses.field(default=None, compare=False)
 
 
 # The diagnostic a verified-unavailable selected root carries in the fenced root evidence (R48 D1).
@@ -932,7 +935,10 @@ def _observe_root(
     else:
         # Compared by consumed change log (R56), so a non-member's file in the user log is "here".
         actual = _consumed_drive(source, root_kind, meta, drive_id)
-        observed = RootObservation("here" if actual == drive_id else "elsewhere", actual)
+        observed = RootObservation(
+            "here" if actual == drive_id else "elsewhere", actual,
+            physical_drive_id=str(meta.get("driveId") or "my-drive"),
+        )
     seen[root_id] = observed
     return observed
 
@@ -1032,6 +1038,61 @@ def _reobserve_conflicted_roots(
             continue
         if observed.state == "here":
             state.settle_root(integration_id, generation, root_kind, root_id)
+        elif observed.state == "elsewhere" and observed.drive_id:
+            state.mark_root_relocating(
+                integration_id, generation, root_kind, root_id, binding.drive_id,
+                destination=str(observed.drive_id),
+            )
+
+
+def _revalidate_membership_event_roots(
+    source: GoogleDriveSource, state: StateStore, integration_id: str, generation: int,
+    *,
+    restricted: set[str] | frozenset[str] = frozenset(),
+    deferred: list[tuple[str, ProviderDeferred | None]] | None = None,
+    observe: Callable[[str, ProviderDeferred], None] | None = None,
+) -> None:
+    """Revalidate each user-log file root a Shared Drive membership event invalidated (AIO-1167 R61).
+
+    Such a root is ``uncertain`` with ``ROOT_MEMBERSHIP_EVENT_DETAIL``
+    (``StateStore.invalidate_user_log_file_roots``). Its own metadata and its drive's membership are
+    read again through the same probes binding uses (``_observe_root``/``_shared_drive_membership``):
+
+      * now consumed by its Shared Drive's own stream (membership gained) — it RELOCATES there, the
+        ordinary hand-over: start token before enumeration, verified snapshot, then retirement;
+      * provably still the user log's — it is in My Drive, or the drive answers non-membership —
+        it is settled where it is bound;
+      * an unknown membership, an unreadable or absent root, a provider deferral — nothing is
+        concluded: it stays uncertain and the connection partial.
+
+    Nothing else in the drive becomes selected. Admission and deferral follow
+    ``_reobserve_stalled_relocations``.
+    """
+    seen: dict[str, RootObservation] = {}
+    for (root_kind, root_id), binding in state.unsettled_roots(integration_id, generation).items():
+        if binding.status != "uncertain" or binding.detail != ROOT_MEMBERSHIP_EVENT_DETAIL or not binding.drive_id:
+            continue
+        if root_id in restricted:
+            if deferred is not None:
+                deferred.append((root_id, None))
+            continue
+        try:
+            observed = _observe_root(source, root_id, binding.drive_id, seen, root_kind)
+            physical = observed.physical_drive_id
+            proven_here = observed.state == "here" and (
+                physical in (None, "my-drive", binding.drive_id)
+                or _shared_drive_membership(source, str(physical)) == "nonmember"
+            )
+        except ProviderDeferred as exc:
+            if exc.category == "rate_limited" or exc.category in _LOCAL_DEADLINE_CATEGORIES:
+                raise
+            if observe is not None:
+                observe(root_id, exc)
+            if deferred is not None:
+                deferred.append((root_id, exc))
+            continue
+        if proven_here:
+            state.settle_root(integration_id, generation, root_kind, root_id, revalidated=True)
         elif observed.state == "elsewhere" and observed.drive_id:
             state.mark_root_relocating(
                 integration_id, generation, root_kind, root_id, binding.drive_id,
@@ -1871,6 +1932,10 @@ async def run_gdrive_stream(
                     restricted=restricted_now(), deferred=deferred_roots, observe=observe_root_minimum,
                 )
                 _reobserve_conflicted_roots(
+                    source, state, integration_id, generation,
+                    restricted=restricted_now(), deferred=deferred_roots, observe=observe_root_minimum,
+                )
+                _revalidate_membership_event_roots(
                     source, state, integration_id, generation,
                     restricted=restricted_now(), deferred=deferred_roots, observe=observe_root_minimum,
                 )
@@ -2905,6 +2970,13 @@ async def _run_gdrive_stream_unlocked(
                     )
                     if changed_drive_id == drive_id or selected_drive_root:
                         subtree_recovery_required = True
+                    if drive_id == "my-drive" and changed_drive_id and changed_drive_id != drive_id:
+                        # A Shared Drive's membership or access changed (AIO-1167 R61). A file
+                        # root the user log consumes because its account was not that drive's
+                        # member is reported there only while that holds, and this event names
+                        # no file: its routing is revalidated before coverage (durable, before
+                        # this page commits). Nothing in the drive becomes selected.
+                        state.invalidate_user_log_file_roots(execution.integration_id, generation)
                     if confirmed_removed and selected_drive_root:
                         affected, final = state.membership_impacts_for_root(
                             namespace, generation, changed_drive_id,
@@ -3912,6 +3984,14 @@ async def _drain_pending(
                 # membership ended, and that was recorded with the page. Nothing is removed.
                 state.ack_work(work)
                 continue
+            if verdict == "superseded":
+                # Obsolete trash: a later restoration another stream ingested stands (R61).
+                continue
+            if verdict == "unverified":
+                _fail_work(state, work, "explicit trash could not be re-verified against a later claim")
+                summary.failed += 1
+                summary.failure_categories["provider_read"] = summary.failure_categories.get("provider_read", 0) + 1
+                continue
             if verdict == "withheld":
                 summary.failure_categories["cross_stream_move_pending"] = (
                     summary.failure_categories.get("cross_stream_move_pending", 0) + 1
@@ -4043,6 +4123,49 @@ def _document_loss_verified(source: GoogleDriveSource, file_id: str) -> bool:
     return bool(meta.get("trashed"))
 
 
+def _explicit_trash_verdict(
+    state: StateStore, source: GoogleDriveSource, work: PendingWork, connection_id: str,
+    *, restricted: bool,
+) -> str:
+    """Whether a retained explicit-trash removal is still the connection's (AIO-1167 R61).
+
+    The connection's brain claim is one per document, whichever stream made it, while trash evidence
+    is retained per stream — across a refused or lost acknowledgment, a restart, a replacement
+    worker. A document restored and moved into another selected drive is ingested by THAT stream,
+    which claims it; replaying the older trash would deactivate the restored claim, and no later
+    complete snapshot would reactivate it. Opaque tokens of two streams cannot be ordered, so the
+    claim is weighed against the provider instead:
+
+      · no other READABLE stream claims it — ``absent`` at once, with no read (prompt trash, R51
+        final 2). A claim held by a stream that cannot read its change log (``_cannot_read``) is
+        retained history, not an observation of a restoration, and never sends trash to a probe;
+      · claimed by a readable stream — the document's own metadata decides: trashed or not found is
+        ``absent`` (a genuinely later trash); readable and not trashed, the trash is OBSOLETE —
+        superseded, never sent (``superseded``); unreadable otherwise, nothing is concluded
+        (``unverified``);
+      · so claimed under a standing provider minimum — ``restricted``: retained, not read early.
+
+    A deferral of the read is raised for the removal drain's owners, as for any probe."""
+    if all(
+        _cannot_read(state.get_progress(namespace))
+        for namespace in state.streams_claiming(connection_id, work.generation, work.namespace, work.item_key)
+    ):
+        return "absent"
+    if restricted:
+        state.fail_work(work, _RESTRICTED_PROBE_PENDING, not_before=work.not_before, failure=False)
+        return "restricted"
+    try:
+        meta = source._metadata(work.item_key)
+    except (BrainError, ProviderDeferred):
+        raise
+    except Exception as exc:
+        return "absent" if _provider_status(exc) == 404 else "unverified"
+    if meta.get("trashed"):
+        return "absent"
+    state.supersede_pending_trash(work.namespace, work.generation, work.item_key)
+    return "superseded"
+
+
 def _cross_stream_removal(
     state: StateStore, execution: GdriveExecution, source: GoogleDriveSource, work: PendingWork,
     *, restricted: bool = False,
@@ -4085,14 +4208,16 @@ def _cross_stream_removal(
     and a claim is never honoured without the provider's answer.
 
     A removal carrying EXPLICIT trash evidence (``payload["trashed"]``, R51 final 2) is ``absent`` at
-    once: the provider already said the document itself is trashed — the very answer a probe would
-    seek — so no peer, barrier or probe can add to it, and no restriction is consulted (no read is
-    made). An ambiguous ``removed`` hint never carries it.
+    once while no other stream of the connection claims the document: the provider already said the
+    document itself is trashed — the very answer a probe would seek — so no peer, barrier or probe
+    can add to it, and no restriction is consulted (no read is made). An ambiguous ``removed`` hint
+    never carries it. Trash evidence is history, though, and a claim is the trace of a LATER
+    restoration through another stream (R61, ``_explicit_trash_verdict``): then it is re-verified.
     """
-    if (work.payload or {}).get("trashed") is True:
-        return "absent"
     own = state.get_progress(work.namespace)
     connection_id = own.key.connection_id if own is not None else execution.integration_id
+    if (work.payload or {}).get("trashed") is True:
+        return _explicit_trash_verdict(state, source, work, connection_id, restricted=restricted)
     roster_unknown = state.unknown_root_count(connection_id, work.generation) > 0
     local = {
         progress.key.drive_id: progress

@@ -1074,7 +1074,16 @@ there until provider evidence moves it. A file root already bound to a Shared Dr
 unstarted, waiting on a start token it cannot get, or started with its change log refused
 (`stream_access_denied`, AIO-1167 R57 — a member who lost membership keeps a cursor the provider no longer
 serves) is reclassified each run on the same evidence (`_reclassify_nonmember_file_roots`): it is
-recorded relocating toward the user log and keeps its claims through the ordinary hand-over. Every
+recorded relocating toward the user log and keeps its claims through the ordinary hand-over. The
+opposite transition can arrive with no file row: a membership gain is reported in the user log as a
+DRIVE-level change (R61). Any Shared Drive event there makes every bound user-log file root
+`uncertain` with `ROOT_MEMBERSHIP_EVENT_DETAIL` (`StateStore.invalidate_user_log_file_roots`, recorded
+before the page commits and published like any root transition), and each run revalidates it
+(`_revalidate_membership_event_roots`) on the same probes: consumed by its drive's own stream now, it
+relocates there through the ordinary hand-over; in My Drive, or its drive answering non-membership, it
+settles; an unknown membership, an unreadable root or a deferral keeps it uncertain — and completion
+partial. Only that revalidation may settle it (`settle_root(..., revalidated=True)`); nothing else in
+the drive becomes selected. Every
 hand-over UNIONS the drive it left into the root's generation-scoped predecessor set
 (`selection_root_bindings.handoff_sources`, a legacy scalar `handoff_from` read as a one-drive set;
 carried in the checkpoint's roots evidence and unioned back on restore without overwriting a newer local
@@ -1172,6 +1181,13 @@ targeted removal, without a complete snapshot; a readable document or any other 
 nothing. An explicit `file.trashed=true` is persisted in that removal obligation before parent-root
 absence gates, so a standing root/document read restriction blocks reads but does not block the
 claim-aware retirement; ambiguous `removed=true` remains on the cross-stream barrier/probe path.
+Trash evidence is history, though (AIO-1167 R61): the brain claim is one per connection while trash
+obligations are retained per stream, so a retained trash removal settles unread only while no
+READABLE peer stream claims the document (`_explicit_trash_verdict`). A readable peer's claim — the
+trace of a later restoration that stream ingested — sends it to the document's own metadata: trashed
+or not-found removes, readable and not trashed SUPERSEDES the obsolete obligation (never sent, durable
+across reopen and replacement workers), a standing restriction holds it unread, and any other failure
+retries. Tokens of two streams are never ordered.
 An unstarted stream no root needs any more is forgotten locally and leaves the brain's
 checkpoint with the run's next checkpoint. Shared Drive listing, traversal, rescan, and parent-membership checks use the
 provider's actual `driveId` as the root; the former synthetic `root` key is repaired only when the
