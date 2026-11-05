@@ -102,6 +102,23 @@ describe("guard: the candidate predicate's SQL shape", () => {
     expect(sql, "a retracted unit is unrepairable too").toMatch(/u\.state <> 'active'/);
   });
 
+  it("EXCLUDES Drive-owned items by BOTH signals — stored provenance AND the exact same-team mapping", () => {
+    // AIO-1167 X-04 / X-04a. A Drive document's context comes from its audience claims; the sweep
+    // routes by tier and would publish one (stored `external`) to external-shared. The provenance
+    // term alone was the only barrier and no test held it; a row whose stored provenance is missing
+    // or altered passed it. Both terms, inside `scoped` — before any arm can select the row.
+    const scoped = sql.slice(sql.indexOf("scoped as ("), sql.indexOf("select s.id"));
+    expect(scoped.length, "the scoped CTE must be found").toBeGreaterThan(200);
+    expect(scoped).toMatch(/and coalesce\(i\.frontmatter->>'source',''\) <> 'gdrive'/);
+    expect(scoped).toMatch(
+      /and not exists \(\s*select 1 from source_item_mappings dm\s*where dm\.team_id = i\.team_id and dm\.item_id = i\.id and dm\.source = 'gdrive'\s*\)/
+    );
+    // EXACT, and nothing more: ownership does not end with a NULL connection id, a disabled
+    // integration, an inactive claim or a lapsed lease, so none of them may be consulted.
+    expect((sql.match(/source_item_mappings/g) ?? []).length, "one exact mapping term").toBe(1);
+    expect(sql).not.toMatch(/connection_id|gdrive_item_claims|gdrive_connection_authority|\bintegrations\b|lease/);
+  });
+
   it("maps target and opposite to the RIGHT projects — a swap must not pass", () => {
     // The gap a reviewer found: asserting both derivations mention i.access still passes when
     // general_id and external_id are swapped, which would invert every partition decision.

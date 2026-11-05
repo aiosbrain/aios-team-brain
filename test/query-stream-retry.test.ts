@@ -11,6 +11,8 @@ import {
 import { streamAnswer, streamOpenAICompatible, type StreamAnswerEvent } from "@/lib/query/claude";
 import type { LlmBackend } from "@/lib/query/llm-backend";
 import type { RetrievedContext } from "@/lib/query/retrieve";
+import { ContextAuthorization } from "@/lib/query/context-authorization";
+import type { DbClient } from "@/lib/db/types";
 
 type Ev = { type: "delta"; text: string } | { type: "done" };
 const isCommitted = (e: Ev): boolean => e.type === "delta";
@@ -335,7 +337,10 @@ describe("streamOpenAICompatible — a 200 stream carrying only an error frame (
     const fetchMock = vi.fn().mockResolvedValue(streamResponse(frames));
     vi.stubGlobal("fetch", fetchMock);
     const sleep = vi.fn(async () => {});
-    const ctx = { sources: [], structured: "", grounded: true } as unknown as RetrievedContext;
+    const ctx = {
+      sources: [], structured: "", grounded: true,
+      authorization: await ContextAuthorization.capture({} as DbClient, "team-1"),
+    } as unknown as RetrievedContext;
     await expect(
       drainDeltas(streamAnswer(ctx, "q", { openrouterKey: "k", openrouterModel: "m" }, [], undefined, "UTC", { sleep }))
     ).rejects.toThrow(/529/);
@@ -365,7 +370,10 @@ describe("streamAnswer — the retry wiring is actually connected (call-site pin
       .mockResolvedValueOnce(streamResponse([deltaFrame("hello"), "data: [DONE]\n\n"]));
     vi.stubGlobal("fetch", fetchMock);
     const sleep = vi.fn(async () => {});
-    const ctx = { sources: [], structured: "", grounded: true } as unknown as RetrievedContext;
+    const ctx = {
+      sources: [], structured: "", grounded: true,
+      authorization: await ContextAuthorization.capture({} as DbClient, "team-1"),
+    } as unknown as RetrievedContext;
     const keys = { openrouterKey: "k", openrouterModel: "test-model" };
     const out = await drainDeltas(
       streamAnswer(ctx, "q", keys, [], undefined, "UTC", { sleep, delayMs: () => 1 })

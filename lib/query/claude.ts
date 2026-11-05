@@ -290,7 +290,15 @@ export async function* streamAnswer(
 ): AsyncGenerator<StreamAnswerEvent> {
   const { assertCopiedStagingSpendAllowed } = await import("@/lib/staging/runtime-policy");
   assertCopiedStagingSpendAllowed("interactive-query");
+  // AIO-1167 R66: every NEW dispatch of the captured context — the first attempt and each retry after
+  // its backoff — re-checks the revocation epoch the context was captured under. A changed,
+  // unreadable or never-established epoch refuses before the request leaves; the refusal is not a
+  // transient stream error, so the retry owner never re-dispatches it.
+  const { requireContextAuthorization } = await import("./context-authorization");
+  requireContextAuthorization(ctx); // a context without a trusted capture never starts
   yield* withStreamRetry(
+    // Each attempt re-checks immediately before EACH of its provider requests (`streamAnswerOnce`),
+    // the inline size fallback included (R67).
     () => streamAnswerOnce(ctx, question, keys, history, caller, timeZone),
     // ANY yielded event commits the stream: once the client has received anything — a delta OR the
     // terminal `done` — a restart would corrupt the visible answer. Retry only when the attempt threw
@@ -319,11 +327,19 @@ export async function* streamAnswerOnce(
   const note = groundingNote(ctx.grounded);
   const convo = conversationBlock(history);
   const who = callerBlock(caller);
+  // AIO-1167 R66/R67: every provider request carrying this context re-checks the revocation epoch it
+  // was captured under, IMMEDIATELY before it is sent — each attempt, each backend, and the inline
+  // size fallback below. Changed, unreadable or untrusted: the sanitized, non-transient refusal.
+  const { requireContextAuthorization } = await import("./context-authorization");
+  const authorization = requireContextAuthorization(ctx);
+  const beforeDispatch = () => authorization.assertCurrent();
 
   // OpenRouter (per-team) or a local OpenAI-compatible endpoint (LLM_BASE_URL) — same wire shape.
   const backend = selectLlmBackend({ LLM_BASE_URL, LLM_MODEL }, keys);
   if (backend.kind !== "anthropic") {
-    yield* streamOpenAICompatible(backend, note, who, convo, ctx.structured, sourcesBlock, question, timeZone);
+    yield* streamOpenAICompatible(
+      backend, note, who, convo, ctx.structured, sourcesBlock, question, timeZone, beforeDispatch,
+    );
     return;
   }
 
@@ -335,6 +351,7 @@ export async function* streamAnswerOnce(
     maxRetries: 0,
   });
 
+  await beforeDispatch();
   const stream = client.messages.stream({
     model: backend.model,
     max_tokens: 4096,
@@ -407,7 +424,9 @@ export async function* streamOpenAICompatible(
   structured: string,
   sourcesBlock: string,
   question: string,
-  timeZone: string
+  timeZone: string,
+  // AIO-1167 R67: awaited immediately before EACH request (first and size fallback alike).
+  beforeDispatch: () => Promise<void> = async () => undefined,
 ): AsyncGenerator<
   | { type: "delta"; text: string }
   | { type: "done"; usage: QueryUsage }
@@ -424,8 +443,9 @@ export async function* streamOpenAICompatible(
 
   const apiKey = backend.apiKey ?? process.env.OPENAI_API_KEY ?? "local";
   const ANSWER_BUDGET = 4096;
-  const postChat = (maxTokensToSend: number): Promise<Response> =>
-    fetch(`${backend.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+  const postChat = async (maxTokensToSend: number): Promise<Response> => {
+    await beforeDispatch();
+    return fetch(`${backend.baseUrl.replace(/\/$/, "")}/chat/completions`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -449,6 +469,7 @@ export async function* streamOpenAICompatible(
         ],
       }),
     });
+  };
 
   let res = await postChat(ANSWER_BUDGET + STREAM_REASONING_HEADROOM);
   if (!res.ok) {

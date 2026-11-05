@@ -2,6 +2,9 @@ import "server-only";
 import { z } from "zod";
 import type { DbClient } from "@/lib/db/types";
 import { audit } from "@/lib/api/audit";
+import { runSql } from "@/lib/db/pg/pool";
+import { withIdentityMutationBoundary } from "@/lib/identity/authority";
+import { unbindGdriveConnectorMember } from "@/lib/integrations/gdrive-authority";
 
 /**
  * Shared admin primitive: create (or upsert) a member. Used by the admin server
@@ -52,9 +55,17 @@ export async function createMember(
   admin: DbClient,
   teamId: string,
   input: MemberInput,
-  opts: { upsert?: boolean; actor?: ActorContext } = {}
+  opts: {
+    upsert?: boolean;
+    actor?: ActorContext;
+    concurrencyHooks?: {
+      beforeIdentityLock?: () => Promise<void>;
+      afterIdentityLock?: () => Promise<void>;
+    };
+  } = {}
 ): Promise<{ id: string; status: string }> {
   const email = input.email.trim().toLowerCase();
+  return withIdentityMutationBoundary(teamId, async () => {
   // PRET-4 §1c: on the upsert path, read the existing tier BEFORE writing — a tier that
   // CHANGES in an upsert is a deliberate posture move and reconciles the builtin row; an
   // unchanged upsert must never clobber a deliberate cross-enrollment.
@@ -142,7 +153,11 @@ export async function createMember(
   } catch {
     // never fail member creation on access maintenance
   }
-  return { id: data.id, status: data.status };
+    return { id: data.id, status: data.status };
+  }, {
+    beforeAuthorityLocks: opts.concurrencyHooks?.beforeIdentityLock,
+    afterAuthorityLocks: opts.concurrencyHooks?.afterIdentityLock,
+  });
 }
 
 /**
@@ -161,17 +176,40 @@ export async function rollbackMemberCreation(
   admin: DbClient,
   teamId: string,
   memberId: string,
-  opts: { actor?: ActorContext } = {}
+  opts: {
+    actor?: ActorContext;
+    concurrencyHooks?: {
+      beforeIdentityLock?: () => Promise<void>;
+      afterIdentityLock?: () => Promise<void>;
+    };
+  } = {}
 ): Promise<void> {
-  await admin.from("members").delete().eq("id", memberId);
-  await audit(admin, {
-    team_id: teamId,
-    actor_kind: opts.actor?.kind ?? "system",
-    member_id: opts.actor?.memberId ?? null,
-    action: "member.deleted",
-    target_type: "member",
-    target_id: memberId,
-    meta: { reason: "invite-rollback" },
+  await withIdentityMutationBoundary(teamId, async () => {
+    const { rows } = await runSql<{ id: string }>(
+      `select id from members where id=$1 and team_id=$2 for update`,
+      [memberId, teamId],
+    );
+    if (!rows[0]) return;
+    // A Drive connection bound to this member is unbound first, in this same transaction: the
+    // binding is a pair the foreign keys cannot clear one column at a time. A failed delete below
+    // rolls the unbinding back with it.
+    await unbindGdriveConnectorMember(admin, {
+      teamId, memberId, reason: "member-creation-rolled-back", actor: opts.actor,
+    });
+    const { error } = await admin.from("members").delete().eq("id", memberId).eq("team_id", teamId);
+    if (error) throw new Error(`rollback member creation failed: ${error.message}`);
+    await audit(admin, {
+      team_id: teamId,
+      actor_kind: opts.actor?.kind ?? "system",
+      member_id: opts.actor?.memberId ?? null,
+      action: "member.deleted",
+      target_type: "member",
+      target_id: memberId,
+      meta: { reason: "invite-rollback" },
+    });
+  }, {
+    beforeAuthorityLocks: opts.concurrencyHooks?.beforeIdentityLock,
+    afterAuthorityLocks: opts.concurrencyHooks?.afterIdentityLock,
   });
 }
 
@@ -299,53 +337,95 @@ export async function deleteMember(
   admin: DbClient,
   teamId: string,
   email: string,
-  opts: { hard?: boolean; actor?: ActorContext } = {}
+  opts: {
+    hard?: boolean;
+    actor?: ActorContext;
+    concurrencyHooks?: {
+      beforeIdentityLock?: () => Promise<void>;
+      afterIdentityLock?: () => Promise<void>;
+      /** Hard delete only: the identity row and the epoch are held, no member row yet (R93 tests). */
+      afterEpochLock?: () => Promise<void>;
+    };
+  } = {}
 ): Promise<DeleteResult> {
   const e = email.trim().toLowerCase();
-  const { data: m } = await admin
-    .from("members")
-    .select("id, role, status")
-    .eq("team_id", teamId)
-    .eq("email", e)
-    .maybeSingle();
-  const member = m as { id: string; role: string; status: string } | null;
-  if (!member) return { deleted: false, reason: "absent" };
+  return withIdentityMutationBoundary(teamId, async () => {
+    // Roster lifecycle participates in the same order as mapping/correction writers. The trigger
+    // advances identity authority re-entrantly after the row mutation; taking the authority lock
+    // before the member row prevents row->authority inversion against a named correction.
+    await opts.concurrencyHooks?.afterIdentityLock?.();
+    // AIO-1167 R92 — never hold a member lock that blocks a protected answer's foreign-key KEY SHARE
+    // while waiting for the authorization epoch that answer holds `for share` (a 40P01 cycle).
+    //  · SOFT: the member is selected `for no key update` — it still excludes competing updates, the
+    //    Drive principal locks and a hard delete, but admits the answer's key share; the status update's
+    //    trigger then advances the epoch once the answer commits.
+    //  · HARD: deleting the row needs `for update`, which conflicts with that key share. So the global
+    //    order is established BEFORE it: identity authority (above) → its row → the authorization epoch,
+    //    both in a write-compatible exclusive mode (never shared, then upgraded) → the member and its
+    //    dependents. A publication holding the epoch share then blocks the delete before any member lock.
+    //    The trigger still advances the revision and epoch; nothing is pre-bumped (a missing epoch row is
+    //    materialized at the canonical initial epoch, exactly as `lockedRevocationEpoch` does).
+    if (opts.hard) {
+      await runSql(`select team_id from team_identity_authority where team_id=$1 for no key update`, [teamId]);
+      await runSql(
+        `insert into team_authorization_epochs(team_id,epoch) values ($1,1) on conflict (team_id) do nothing`,
+        [teamId],
+      );
+      await runSql(`select epoch from team_authorization_epochs where team_id=$1 for no key update`, [teamId]);
+      await opts.concurrencyHooks?.afterEpochLock?.();
+    }
+    const {rows}=await runSql<{id:string;role:string;status:string}>(
+      opts.hard
+        ? `select id,role,status from members where team_id=$1 and email=$2 for update`
+        : `select id,role,status from members where team_id=$1 and email=$2 for no key update`,
+      [teamId,e],
+    );
+    const member=rows[0] ?? null;
+    if (!member) return { deleted: false, reason: "absent" };
 
-  // Refuse if this is the last non-disabled admin (avoid locking the team out —
-  // counts active AND invited admins; a disabled admin can't administer).
-  if (member.role === "admin" && member.status !== "disabled") {
-    const { data: admins } = await admin
-      .from("members")
-      .select("id")
-      .eq("team_id", teamId)
-      .eq("role", "admin")
-      .neq("status", "disabled");
-    if ((admins ?? []).length <= 1) return { deleted: false, reason: "last-admin" };
-  }
+    // Refuse if this is the last non-disabled admin (avoid locking the team out —
+    // counts active AND invited admins; a disabled admin can't administer).
+    if (member.role === "admin" && member.status !== "disabled") {
+      const { data: admins } = await admin
+        .from("members")
+        .select("id")
+        .eq("team_id", teamId)
+        .eq("role", "admin")
+        .neq("status", "disabled");
+      if ((admins ?? []).length <= 1) return { deleted: false, reason: "last-admin" };
+    }
 
-  if (opts.hard) {
-    const { error } = await admin.from("members").delete().eq("id", member.id);
-    if (error) throw new Error(`delete member failed: ${error.message}`);
-  } else {
-    const { error } = await admin
-      .from("members")
-      .update({ status: "disabled", auth_user_id: null })
-      .eq("id", member.id);
-    if (error) throw new Error(`disable member failed: ${error.message}`);
-  }
+    if (opts.hard) {
+      // A Drive connection bound to this member is unbound first, in this same transaction (see
+      // `unbindGdriveConnectorMember`): the binding is a pair the foreign keys cannot clear one
+      // column at a time. A failed delete below rolls the unbinding back with it. A soft disable
+      // leaves the binding alone — the connection simply stops authorizing a disabled principal.
+      await unbindGdriveConnectorMember(admin, {
+        teamId, memberId: member.id, reason: "member-deleted", actor: opts.actor,
+      });
+      const { error } = await admin.from("members").delete().eq("id", member.id);
+      if (error) throw new Error(`delete member failed: ${error.message}`);
+    } else {
+      const { error } = await admin
+        .from("members")
+        .update({ status: "disabled", auth_user_id: null })
+        .eq("id", member.id);
+      if (error) throw new Error(`disable member failed: ${error.message}`);
+    }
 
-  await audit(admin, {
-    team_id: teamId,
-    actor_kind: opts.actor?.kind ?? "system",
-    member_id: opts.actor?.memberId ?? null,
-    action: opts.hard ? "member.deleted" : "member.disabled",
-    target_type: "member",
-    target_id: member.id,
-    meta: { email: e },
-  });
-  // PRET-4 §1c: no membership recompute on lifecycle. A disabled member's builtin rows stay
-  // in place and are access-inert read-side (the oracle's isPrincipal; auth refuses disabled
-  // principals before posture). A hard delete cascades via the composite FK
-  // (postgres/schema.sql group_members → members on delete cascade).
-  return { deleted: true, mode: opts.hard ? "hard" : "soft", id: member.id };
+    await audit(admin, {
+      team_id: teamId,
+      actor_kind: opts.actor?.kind ?? "system",
+      member_id: opts.actor?.memberId ?? null,
+      action: opts.hard ? "member.deleted" : "member.disabled",
+      target_type: "member",
+      target_id: member.id,
+      meta: { email: e },
+    });
+    // PRET-4 §1c: no membership recompute on lifecycle. A disabled member's builtin rows stay
+    // in place and are access-inert read-side (the oracle's isPrincipal; auth refuses disabled
+    // principals before posture). A hard delete cascades via the composite FK
+    // (postgres/schema.sql group_members → members on delete cascade).
+    return { deleted: true, mode: opts.hard ? "hard" : "soft", id: member.id };
+  }, { beforeAuthorityLocks: opts.concurrencyHooks?.beforeIdentityLock });
 }

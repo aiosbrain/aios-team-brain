@@ -16,6 +16,20 @@ import {
 } from "@/lib/chat/store";
 import { generateAndSetTitle } from "@/lib/chat/title";
 import { recordLlmUsage } from "@/lib/costs/llm-usage";
+import { GraphProvenanceUnavailableError } from "@/lib/graph/provenance-read";
+import { AttributionRepairPendingError } from "@/lib/access/authorization-epoch";
+import {
+  CONTEXT_AUTHORIZATION_CLIENT_MESSAGE,
+  ContextAuthorization,
+  QueryContextAuthorizationChangedError,
+  requireContextAuthorization,
+} from "@/lib/query/context-authorization";
+import {
+  NON_GOOGLE_OUTPUT,
+  classifyOutputProvenance,
+  withOutputPublication,
+  type OutputProvenance,
+} from "@/lib/query/output-provenance";
 
 export const runtime = "nodejs";
 export const maxDuration = 120;
@@ -104,20 +118,6 @@ export async function POST(req: NextRequest) {
     return errorResponse("invalid_payload", "delegated tokens are stateless — conversation_id is not supported", 422);
   }
 
-  // Persistent thread, owned by the key's member — same store as the dashboard chat, so a CLI /
-  // Telegram-via-Hermes turn continues the member's existing conversation; the assistant turn is
-  // persisted once streaming completes. Delegated tokens get NO thread: nothing is read or
-  // written to the member's conversations.
-  const owner = auth ? { teamId: auth.teamId, memberId: auth.memberId } : null;
-  let conversationId = owner && conversation_id && (await ownsConversation(db, owner, conversation_id)) ? conversation_id : null;
-  let createdNew = false;
-  if (owner && !conversationId) {
-    const created = await createConversation(db, owner, question);
-    conversationId = created?.id ?? null;
-    createdNew = true;
-  }
-  if (owner && conversationId) await appendMessage(db, owner, conversationId, "user", question);
-
   // Who the answer is FOR — anchors first-person resolution ("what did I ship?"). For a delegated
   // token that is the REPRESENTED member (on_behalf_of ?? launcher), resolved live.
   let caller: { displayName: string | null; email: string | null; handle: string };
@@ -148,6 +148,17 @@ export async function POST(req: NextRequest) {
   // membership-visible items and its K-capped graph partitions (graphProjectIds, either posture);
   // a legacy connector/offroster key gets no graph scope. Tokens keep the §5.8b omit. Any error
   // fails closed (500).
+  // AIO-1167 R67: the query's one authorization is captured BEFORE the view below — the first input
+  // that selects content — and carried unchanged through retrieval and every output boundary.
+  let authorization: ContextAuthorization;
+  try {
+    authorization = await ContextAuthorization.capture(db, teamId);
+  } catch (e) {
+    if (e instanceof QueryContextAuthorizationChangedError) {
+      return errorResponse("temporarily_unavailable", CONTEXT_AUTHORIZATION_CLIENT_MESSAGE, 503);
+    }
+    throw e;
+  }
   let enforce: import("@/lib/query/retrieve").RetrieveEnforce | null = null;
   try {
     const { delegatedVisibleItemIds } = await import("@/lib/access/enforce");
@@ -182,15 +193,60 @@ export async function POST(req: NextRequest) {
   // current turn's answer is freshly retrieval-grounded and appended to the conversation.
   const historyTurns: import("@/lib/query/claude").ChatTurn[] = [];
 
+  // AIO-1167: retrieval completes BEFORE this turn leaves any trace. A graph context whose
+  // authorization cannot be proven right now is a retryable refusal — never empty context, never a
+  // raw error, and never a conversation, message or query_log row for a turn that did not happen
+  // (so it costs the minute throttle above, not the daily quota).
+  const started = Date.now();
+  let ctx: Awaited<ReturnType<typeof retrieve>>;
+  try {
+    ctx = await retrieve(db, teamId, memberTier, question, project, enforce, authorization);
+  } catch (e) {
+    if (e instanceof GraphProvenanceUnavailableError || e instanceof AttributionRepairPendingError) {
+      return errorResponse("temporarily_unavailable", "query context is temporarily unavailable; retry shortly", 503);
+    }
+    if (e instanceof QueryContextAuthorizationChangedError) {
+      return errorResponse("temporarily_unavailable", CONTEXT_AUTHORIZATION_CLIENT_MESSAGE, 503);
+    }
+    throw e;
+  }
+
+  // AIO-1167 R76: the answer's output provenance — classified ONCE from every input admitted to the
+  // model, re-checked against the original capture, and frozen before any turn state, run or dispatch.
+  let provenance: OutputProvenance;
+  try {
+    provenance = await classifyOutputProvenance(teamId, ctx.modelInputs, authorization);
+  } catch (e) {
+    if (e instanceof QueryContextAuthorizationChangedError) {
+      return errorResponse("temporarily_unavailable", CONTEXT_AUTHORIZATION_CLIENT_MESSAGE, 503);
+    }
+    throw e;
+  }
+
+  // Persistent thread, owned by the key's member — same store as the dashboard chat, so a CLI /
+  // Telegram-via-Hermes turn continues the member's existing conversation; the assistant turn is
+  // persisted once streaming completes. Delegated tokens get NO thread: nothing is read or
+  // written to the member's conversations.
+  const owner = auth ? { teamId: auth.teamId, memberId: auth.memberId } : null;
+  let conversationId = owner && conversation_id && (await ownsConversation(db, owner, conversation_id)) ? conversation_id : null;
+  let createdNew = false;
+  if (owner && !conversationId) {
+    const created = await createConversation(db, owner, question);
+    conversationId = created?.id ?? null;
+    createdNew = true;
+  }
+  if (owner && conversationId) await appendMessage(db, owner, conversationId, "user", question, {}, NON_GOOGLE_OUTPUT);
+
   // Quota integrity (Codex B3 High): write the query_log row BEFORE streaming and UPDATE it on
   // `done` — the daily count and team budget read query_log, and a row written only in the done
   // branch made read-the-deltas-and-disconnect free and uncounted (10/min sustained, forever).
   // An attempt now consumes quota even when the stream errors or is canceled; token/cost fields
   // stay 0 for incomplete streams (the usage numbers only exist at `done`).
-  const started = Date.now();
   const { data: logRow, error: logErr } = await db
     .from("query_log")
-    .insert({ team_id: teamId, member_id: launcherId, question })
+    // R76: the reservation carries the answer's provenance; a protected one may keep its epoch with an
+    // empty preview and no citations when the answer is refused.
+    .insert({ team_id: teamId, member_id: launcherId, question, context_authorization_epoch: provenance.epoch })
     .select("id")
     .single();
   if (logErr || !logRow) {
@@ -198,11 +254,23 @@ export async function POST(req: NextRequest) {
     return errorResponse("internal", "query accounting failed", 500);
   }
   const queryLogId = (logRow as { id: string }).id;
-  const ctx = await retrieve(db, teamId, memberTier, question, project, enforce);
 
   // Per-team provider keys + models + the explicit answering-backend override (same resolver the
   // dashboard route uses, so both honor OpenRouter/OpenAI/local + `teams.answering_provider`).
   const keys = await resolveAnsweringKeys(db, teamId, "interactive-query");
+
+  // AIO-1167 R66: route preparation is done. A Drive revocation committed since retrieval captured
+  // its epoch (another connection may still hold the document) means the captured text is no longer
+  // this reader's: refuse — retryable, sanitized — before any of it is dispatched or streamed. Each
+  // answer attempt re-checks again inside `streamAnswer`.
+  try {
+    await requireContextAuthorization(ctx, teamId).assertCurrent();
+  } catch (e) {
+    if (e instanceof QueryContextAuthorizationChangedError) {
+      return errorResponse("temporarily_unavailable", CONTEXT_AUTHORIZATION_CLIENT_MESSAGE, 503);
+    }
+    throw e;
+  }
 
   const encoder = new TextEncoder();
   const stream = new ReadableStream({
@@ -213,9 +281,16 @@ export async function POST(req: NextRequest) {
       if (conversationId) send("conversation", { id: conversationId });
 
       let answer = "";
+      // AIO-1167 R67: every NEW publication, persistence or downstream dispatch of source-derived
+      // output re-checks the captured authorization first (a single-row epoch read; no lock, no
+      // transaction held while the model streams). Bytes already delivered are not recalled; after a
+      // change nothing further is emitted or stored — only the spend is still metered.
+      const gate = () => authorization.assertCurrent();
+      const isRefusal = (e: unknown) => e instanceof QueryContextAuthorizationChangedError;
       try {
         for await (const chunk of streamAnswer(ctx, question, keys, historyTurns, caller, timeZone)) {
           if (chunk.type === "delta") {
+            await gate();
             answer += chunk.text;
             send("delta", { text: chunk.text });
           } else {
@@ -231,30 +306,68 @@ export async function POST(req: NextRequest) {
                 path: s.path,
                 kind: s.kind,
               }));
-            send("sources", { sources });
-            send("done", chunk.usage);
-
-            if (owner && conversationId) {
-              await appendMessage(db, owner, conversationId, "assistant", answer, {
-                cited_item_ids: sources.map((s) => s.item_id).filter((id): id is string => Boolean(id)),
-                input_tokens: chunk.usage.input_tokens,
-                output_tokens: chunk.usage.output_tokens,
-                cost_usd: chunk.usage.cost_usd,
-              });
-              if (createdNew) {
-                await generateAndSetTitle(db, owner, conversationId, question, answer, keys);
+            // Terminal publication, then the stored answer: each is a boundary of its own.
+            let publish = true;
+            try {
+              await gate();
+            } catch (e) {
+              if (!isRefusal(e)) throw e;
+              publish = false;
+            }
+            if (publish) {
+              send("sources", { sources });
+              send("done", chunk.usage);
+            }
+            let persist = publish;
+            if (persist) {
+              try {
+                await gate();
+              } catch (e) {
+                if (!isRefusal(e)) throw e;
+                persist = false;
               }
             }
 
-            await db.from("query_log").update({
-              answer_preview: answer.slice(0, 500),
-              cited_item_ids: sources.map((s) => s.item_id).filter(Boolean),
+            // R76: the stored answer and its source-bearing preview commit in ONE short transaction that
+            // share-locks the revocation epoch first and re-checks the answer's ORIGINAL epoch (the
+            // checks above are defense only). Refused — a revocation committed first — neither is written
+            // and the reserved row keeps only its accounting; a revocation arriving while it holds the
+            // lock waits, and readers then suppress the now-obsolete output.
+            const accounting = {
               input_tokens: chunk.usage.input_tokens,
               output_tokens: chunk.usage.output_tokens,
               cache_read_tokens: chunk.usage.cache_read_tokens,
               cost_usd: chunk.usage.cost_usd,
               latency_ms: Date.now() - started,
-            }).eq("id", queryLogId);
+            };
+            let stored = false;
+            if (persist) {
+              try {
+                await withOutputPublication(teamId, provenance, async () => {
+                  if (owner && conversationId) {
+                    await appendMessage(db, owner, conversationId, "assistant", answer, {
+                      cited_item_ids: sources.map((s) => s.item_id).filter((id): id is string => Boolean(id)),
+                      input_tokens: chunk.usage.input_tokens,
+                      output_tokens: chunk.usage.output_tokens,
+                      cost_usd: chunk.usage.cost_usd,
+                    }, provenance);
+                  }
+                  const { error: previewError } = await db.from("query_log").update({
+                    ...accounting,
+                    answer_preview: answer.slice(0, 500),
+                    cited_item_ids: sources.map((s) => s.item_id).filter(Boolean),
+                  }).eq("id", queryLogId);
+                  if (previewError) throw new Error(`query_log update failed: ${previewError.message}`);
+                });
+                stored = true;
+              } catch (e) {
+                if (!isRefusal(e)) throw e;
+              }
+            }
+            if (!stored) {
+              // Accounting is kept either way (the provider billed it) — source-free, once.
+              await db.from("query_log").update(accounting).eq("id", queryLogId);
+            }
 
             // Meter this answer's spend into the unified brain-inference ledger (source "query"), so
             // the Pulse Spend KPI + costs breakdown see it alongside every background LLM task.
@@ -269,6 +382,12 @@ export async function POST(req: NextRequest) {
               costUsd: chunk.usage.cost_usd,
               estimated: chunk.usage.estimated,
             });
+            if (stored && createdNew && owner && conversationId) {
+              // Cosmetic: a protected answer keeps its question-derived title (no title request at all);
+              // a non-Google one is gated before the title request and its write.
+              await generateAndSetTitle(db, owner, conversationId, question, answer, keys, provenance, gate);
+            }
+            if (!publish) throw new QueryContextAuthorizationChangedError("changed");
           }
         }
       } catch (e) {
@@ -276,7 +395,9 @@ export async function POST(req: NextRequest) {
         // and upstream body — infrastructure detail no bearer (least of all a delegated one)
         // should receive. Full detail goes to the server log.
         console.error("[query] stream failed:", e instanceof Error ? e.message : e);
-        send("error", { message: "query failed" });
+        send("error", {
+          message: e instanceof QueryContextAuthorizationChangedError ? CONTEXT_AUTHORIZATION_CLIENT_MESSAGE : "query failed",
+        });
       } finally {
         controller.close();
       }

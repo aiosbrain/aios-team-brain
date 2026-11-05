@@ -39,6 +39,13 @@ export type RetrievedContext = {
    * graph stage actually covered — the deliberate own-scope disclosure exception to §5.7. Absent
    * when the graph leg didn't run partitioned (no enforcement view, external omit, no graph). */
   graphScope?: { covered: number; total: number };
+  /** AIO-1167 R66: the revocation epoch this context was captured under — set ONLY by the public
+   *  `retrieve()` entry (`ContextAuthorization.capture`, before the reads it certifies) and checked
+   *  before every dispatch of this text. Absent or hand-built, every dispatch refuses. */
+  authorization?: import("@/lib/query/context-authorization").ContextAuthorization;
+  /** AIO-1167 R76: every input admitted to the answer model, by item — `complete: false` when that
+   *  cannot be proven (output provenance then protects the answer). Set by the native provider only. */
+  modelInputs?: import("@/lib/query/output-provenance").ModelInputProvenance;
 };
 
 export interface RetrievalRequest {
@@ -61,6 +68,10 @@ export interface RetrievalRequest {
    *  omitted `tokenProjectIds` entirely, so this seam could construct a token enforce that silently
    *  closed the hand-typed arm — the drift a duplicated type invites (Codex diff review). */
   enforce?: import("@/lib/query/retrieve").RetrieveEnforce | null;
+  /** AIO-1167 R66: captured by `retrieve()` before the provider reads. The native provider requires
+   *  its graph facts to be certified under the same epoch and re-checks it before any reranker
+   *  receives source text. */
+  authorization?: import("@/lib/query/context-authorization").ContextAuthorization;
 }
 
 /** A context layer. Swap the default by implementing this and selecting via CONTEXT_PROVIDER. */

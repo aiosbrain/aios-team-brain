@@ -1,5 +1,6 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
+import { googleEmailHistory, googleEmailKey, type GoogleEmailState } from "@/lib/identity/google-email-authority";
 
 /**
  * Shared identity resolution: git/provider author identity → roster `member_id` for a team.
@@ -18,10 +19,30 @@ export interface IdentityMap {
   emailDomains: Set<string>;
   /** `<provider>:<external_id_lc>` → member_id, from member_identities (Slack/Linear/… user ids) */
   byProviderId: Map<string, string>;
+  /** Exact keys observed for more than one member. They fail closed instead of last-row-wins. */
+  ambiguousEmails?: ReadonlySet<string>;
+  ambiguousProviderIds?: ReadonlySet<string>;
+  /** Durable mapping authority, including unlink tombstones. Presence blocks heuristic fallback.
+   *  `ambiguous` occurs only for a Google `author-email:` identity with several equivalent histories
+   *  and no canonical decision (AIO-1167 PR743): it blocks provider credit and fallback, but is not an
+   *  unlink. */
+  providerIdentityStates?: ReadonlyMap<string, ProviderIdentityState>;
+  /** Active/invited human-or-connector rows participating in this complete snapshot. */
+  activeMemberIds?: ReadonlySet<string>;
 }
 
+export type ProviderIdentityState = "linked" | "unlinked" | "ambiguous";
+
 function providerKey(provider: string, externalId: string): string {
-  return `${provider.trim().toLowerCase()}:${externalId.trim().toLowerCase()}`;
+  const normalizedProvider = provider.trim().toLowerCase();
+  // Google subject and permission ids are opaque identifiers, not human handles. Preserve their
+  // exact bytes so differently-cased accounts cannot collapse into one attribution authority. A Google
+  // `author-email:` identity alone compares under its canonical key — the writer's one contract
+  // (`google-email-authority`), so every equivalent spelling is one lookup key (AIO-1167 PR743).
+  const normalizedExternalId = normalizedProvider === "gdrive"
+    ? googleEmailKey(normalizedProvider, externalId) ?? externalId.trim()
+    : externalId.trim().toLowerCase();
+  return `${normalizedProvider}:${normalizedExternalId}`;
 }
 
 export interface AuthorIdentity {
@@ -30,63 +51,250 @@ export interface AuthorIdentity {
   key?: string | null;
 }
 
-/** Build lookup tables mapping author identity → member_id for the team. */
+/**
+ * Build lookup tables mapping author identity → member_id for the team.
+ *
+ * `includeDeactivated` (AIO-1167 R44 C4) separates two questions the roster status answers
+ * differently. Who may be NEWLY linked or authenticated excludes a deactivated member — the default,
+ * used by account linking and identity sync. Whose work the SOURCE says this is does not: offboarding
+ * is not an unlink, so attribution writers (ingest, repair, author resolution) and contribution display
+ * pass `includeDeactivated` and keep resolving a deactivated member through their EXISTING identity
+ * mappings — explicit aliases and provider identities — and only those: their roster email, handle
+ * and domain are heuristics and resolve nothing once they are offboarded. Deliberate unlink tombstones
+ * and remaps still apply. `activeMemberIds` lists active members only, in both modes.
+ */
 export async function buildIdentityMap(
   db: DbClient,
-  teamId: string
+  teamId: string,
+  opts: { strict?: boolean; includeDeactivated?: boolean } = {},
 ): Promise<IdentityMap> {
-  const { data } = await db
+  const { data, error: membersError } = await db
     .from("members")
-    .select("id, email, actor_handle")
+    .select("id, email, actor_handle, status")
     .eq("team_id", teamId);
+  if (opts.strict && membersError) throw new Error(`identity members read failed: ${membersError.message}`);
   const byEmail = new Map<string, string>();
   const byHandle = new Map<string, string>();
   const emailDomains = new Set<string>();
+  const ambiguousEmails = new Set<string>();
+  const activeMemberIds = new Set<string>();
+  /** Members whose identities resolve in this map: the active ones, plus deactivated ones on request. */
+  const resolvableMemberIds = new Set<string>();
+  const assignUnique = (
+    target: Map<string, string>, ambiguous: Set<string>, key: string, memberId: string,
+  ) => {
+    if (ambiguous.has(key)) return;
+    const prior = target.get(key);
+    if (prior && prior !== memberId) {
+      target.delete(key);
+      ambiguous.add(key);
+      return;
+    }
+    target.set(key, memberId);
+  };
   for (const r of (data ?? []) as {
     id: string;
     email: string | null;
     actor_handle: string | null;
+    status?: string | null;
   }[]) {
+    if (r.status === "disabled") {
+      // A deactivated member resolves ONLY through an existing identity mapping (an explicit alias
+      // or a provider identity, below) — never through roster heuristics (primary email, handle,
+      // email domain), which identify nobody once the person is offboarded.
+      if (opts.includeDeactivated) resolvableMemberIds.add(r.id);
+      continue;
+    }
+    activeMemberIds.add(r.id);
+    resolvableMemberIds.add(r.id);
     if (r.email) {
       const email = r.email.toLowerCase();
-      byEmail.set(email, r.id);
+      assignUnique(byEmail, ambiguousEmails, email, r.id);
       const domain = email.split("@", 2)[1];
       if (domain) emailDomains.add(domain);
     }
     if (r.actor_handle) byHandle.set(r.actor_handle.toLowerCase(), r.id);
   }
 
+  // A deactivated member's mapped emails are kept apart and only fill addresses NO active member
+  // holds (AIO-1167 R44 C4). An offboarded person's address is routinely reassigned; sharing one
+  // ambiguity set would make that address ambiguous for the ACTIVE member who holds it now and drop
+  // their new work's attribution, while the deactivated member keeps their stable provider ids.
+  const deactivatedByEmail = new Map<string, string>();
+  const deactivatedAmbiguousEmails = new Set<string>();
+  const assignEmail = (email: string, memberId: string) => {
+    if (activeMemberIds.has(memberId)) assignUnique(byEmail, ambiguousEmails, email, memberId);
+    else assignUnique(deactivatedByEmail, deactivatedAmbiguousEmails, email, memberId);
+  };
+
   // Fold in explicit git-author aliases (e.g. GitHub noreply emails) as EXACT byEmail matches.
   // Deliberately NOT added to emailDomains — alias domains like users.noreply.github.com are
   // shared, so widening the handle heuristic with them would re-introduce cross-author
   // misattribution (the bug PR #11 closed).
-  const { data: aliases } = await db
+  const { data: aliases, error: aliasesError } = await db
     .from("member_emails")
     .select("email, member_id")
     .eq("team_id", teamId);
+  if (opts.strict && aliasesError) throw new Error(`identity aliases read failed: ${aliasesError.message}`);
   for (const a of (aliases ?? []) as { email: string; member_id: string }[]) {
-    if (a.email) byEmail.set(a.email.toLowerCase(), a.member_id);
+    if (a.email && resolvableMemberIds.has(a.member_id)) assignEmail(a.email.toLowerCase(), a.member_id);
   }
 
   // Cross-provider identities (Slack/Linear/… user ids). Keyed by (provider, external_id); any
   // email carried on the row is also folded into byEmail as a secondary exact match.
   const byProviderId = new Map<string, string>();
-  const { data: identities } = await db
+  const ambiguousProviderIds = new Set<string>();
+  const { data: identities, error: identitiesError } = await db
     .from("member_identities")
     .select("provider, external_id, email, member_id")
     .eq("team_id", teamId);
+  if (opts.strict && identitiesError) throw new Error(`provider identities read failed: ${identitiesError.message}`);
   for (const i of (identities ?? []) as { provider: string; external_id: string; email: string | null; member_id: string }[]) {
-    if (i.provider && i.external_id) byProviderId.set(providerKey(i.provider, i.external_id), i.member_id);
-    if (i.email) byEmail.set(i.email.toLowerCase(), i.member_id);
+    if (!resolvableMemberIds.has(i.member_id)) continue;
+    if (i.provider && i.external_id) {
+      assignUnique(byProviderId, ambiguousProviderIds, providerKey(i.provider, i.external_id), i.member_id);
+    }
+    if (i.email) assignEmail(i.email.toLowerCase(), i.member_id);
+  }
+  for (const [email, memberId] of deactivatedByEmail) {
+    if (!byEmail.has(email) && !ambiguousEmails.has(email)) byEmail.set(email, memberId);
+  }
+  for (const email of deactivatedAmbiguousEmails) {
+    if (!byEmail.has(email)) ambiguousEmails.add(email);
   }
 
-  return { byEmail, byHandle, emailDomains, byProviderId };
+  const providerIdentityStates = new Map<string, ProviderIdentityState>();
+  const { data: mappingStates, error: mappingStatesError } = await db
+    .from("member_identity_mapping_state")
+    .select("provider, external_id, state")
+    .eq("team_id", teamId);
+  if (opts.strict && mappingStatesError) {
+    throw new Error(`provider identity authority read failed: ${mappingStatesError.message}`);
+  }
+  // Google `author-email:` histories are GROUPED by canonical key and decided once, order-independently,
+  // by the writer's own rule — never last-row-wins (AIO-1167 PR743). Every other key is exact, as before.
+  const googleEmailStates = new Map<string, GoogleEmailState[]>();
+  for (const state of (mappingStates ?? []) as {
+    provider: string;
+    external_id: string;
+    state: "linked" | "unlinked";
+  }[]) {
+    if (!state.provider || !state.external_id || (state.state !== "linked" && state.state !== "unlinked")) continue;
+    const canonical = googleEmailKey(state.provider, state.external_id);
+    if (canonical) {
+      const group = googleEmailStates.get(canonical) ?? [];
+      group.push({ externalId: state.external_id, state: state.state });
+      googleEmailStates.set(canonical, group);
+      continue;
+    }
+    providerIdentityStates.set(providerKey(state.provider, state.external_id), state.state);
+  }
+  for (const [canonical, states] of googleEmailStates) {
+    const key = `gdrive:${canonical}`;
+    const { history } = googleEmailHistory(canonical, states);
+    if (history === "none") continue;
+    providerIdentityStates.set(key, history);
+    // An applicable unlink or an ambiguity blocks this identity's Google provider credit as well as its
+    // email/handle fallback — even if an equivalent legacy row is still live. A different-owner
+    // conflict between live spellings is already fail-closed (`ambiguousProviderIds`).
+    if (history !== "linked") byProviderId.delete(key);
+  }
+
+  return {
+    byEmail, byHandle, emailDomains, byProviderId, ambiguousEmails, ambiguousProviderIds,
+    providerIdentityStates, activeMemberIds,
+  };
 }
 
 /** Resolve a provider's stable user id (e.g. a Slack `Uxxx`) to a roster member_id, or null. */
 export function resolveByProviderId(map: IdentityMap, provider: string, externalId: string): string | null {
   if (!externalId) return null;
-  return map.byProviderId.get(providerKey(provider, externalId)) ?? null;
+  const key = providerKey(provider, externalId);
+  if (map.ambiguousProviderIds?.has(key)) return null;
+  return map.byProviderId.get(key) ?? null;
+}
+
+export function providerIdentityState(
+  map: IdentityMap,
+  provider: string,
+  externalId: string,
+): ProviderIdentityState | null {
+  if (!externalId) return null;
+  return map.providerIdentityStates?.get(providerKey(provider, externalId)) ?? null;
+}
+
+/**
+ * Whether a Google evidence email's OWN `author-email:` identity holds an applicable unlink or an
+ * ambiguity (AIO-1167 PR743). The email attribution bridge for that address is then held: Google
+ * evidence must not reach the member through a roster/alias email match. Only Google consumers ask
+ * this; roster email itself, and every other provider, are unaffected.
+ */
+export function googleEmailAttributionHeld(map: IdentityMap, email: string | null | undefined): boolean {
+  const address = (email ?? "").trim();
+  if (!address) return false;
+  const state = providerIdentityState(map, "gdrive", `author-email:${address}`);
+  return state === "unlinked" || state === "ambiguous";
+}
+
+/**
+ * THE Google email-bridge decision (AIO-1167 R53): whether a Google observation's EMAIL — the only
+ * evidence of a permission id nobody has decided, or of a bare-email observation — names one member.
+ * Shared by contribution persistence, the dashboard/Timeline read, Google author attribution and
+ * permission discovery, so all four answer alike. It is asked only AFTER the observation's own exact
+ * provider authority (a decided permission id, a linked `author-email:` key), which it never replaces.
+ *
+ *   · `held` — the address's own `author-email:` identity is unlinked or ambiguous (PR743) — including
+ *     live legacy spellings mapped to different members with no decided state (R54): no bridge.
+ *   · `conflict` — the address's `author-email:` identity is LINKED (a decided link, or a live legacy
+ *     mapping), and its owner is not
+ *     the one confirmed roster/alias owner of the address (another member holds it, the address is
+ *     ambiguous, or the linked owner does not resolve in this map — e.g. deactivated, for linking — or
+ *     the decided link's live spellings belong to different members, R55: `linkedMemberId` null).
+ *     Neither member is credited and no permission id is linked to either.
+ *   · `member` — exactly one owner: the linked `author-email:` owner and the confirmed owner agree, or
+ *     only one of them exists (a legacy link with no stored email still counts as the owner).
+ *   · `none` — no authority and no confirmed owner.
+ *
+ * Confirmed ownership is exact roster/alias email only (`byEmail`, ambiguity refused) — never a handle,
+ * domain or display name. `author-email:` stays non-stable: this decides the bridge, not identity.
+ */
+export type GoogleEmailBridge =
+  | { outcome: "member"; memberId: string }
+  | { outcome: "held" }
+  | { outcome: "conflict"; linkedMemberId: string | null; emailMemberId: string | null }
+  | { outcome: "none" };
+
+export function googleEmailBridge(map: IdentityMap, email: string | null | undefined): GoogleEmailBridge {
+  const address = (email ?? "").trim().toLowerCase();
+  if (!address) return { outcome: "none" };
+  const key = `author-email:${address}`;
+  const state = providerIdentityState(map, "gdrive", key);
+  if (state === "unlinked" || state === "ambiguous") return { outcome: "held" };
+  const ambiguous = map.ambiguousEmails?.has(address) ?? false;
+  const emailMemberId = ambiguous ? null : map.byEmail.get(address) ?? null;
+  // Live spellings of this address mapped to DIFFERENT members: the map dropped the owner as ambiguous.
+  // Undecided (R54), that is ambiguous authority — held, never a roster fallback. Under a decided
+  // `linked` state (R55) the decision stands but names no owner the map can resolve: an actionable
+  // conflict, beside the address's one confirmed owner if any — no owner is invented, no mapping touched.
+  if (map.ambiguousProviderIds?.has(providerKey("gdrive", key))) {
+    return state === "linked" ? { outcome: "conflict", linkedMemberId: null, emailMemberId } : { outcome: "held" };
+  }
+  // The address's `author-email:` owner: a decided link, or a live mapping (a legacy row with no state).
+  const linkedMemberId = resolveByProviderId(map, "gdrive", key);
+  if (state !== "linked" && !linkedMemberId) {
+    return emailMemberId ? { outcome: "member", memberId: emailMemberId } : { outcome: "none" };
+  }
+  if (linkedMemberId && !ambiguous && (!emailMemberId || emailMemberId === linkedMemberId)) {
+    return { outcome: "member", memberId: linkedMemberId };
+  }
+  if (!linkedMemberId && !ambiguous && !emailMemberId) return { outcome: "none" };
+  return { outcome: "conflict", linkedMemberId, emailMemberId };
+}
+
+/** The member a Google email bridges to, or null (`googleEmailBridge`). */
+export function googleEmailBridgeMember(map: IdentityMap, email: string | null | undefined): string | null {
+  const bridge = googleEmailBridge(map, email);
+  return bridge.outcome === "member" ? bridge.memberId : null;
 }
 
 /** How an identity resolved — the attribution CONFIDENCE. `email`/`handle` are exact matches;
@@ -107,7 +315,11 @@ export function resolveMemberDetailed(
   const email = (identity.email ?? "").trim().toLowerCase();
   const keyLc = (identity.key ?? "").trim().toLowerCase();
   const [localPart, domain] = email.includes("@") ? email.split("@", 2) : ["", ""];
-  const byEmail = map.byEmail.get(email) ?? (keyLc ? map.byEmail.get(keyLc) : undefined);
+  const byEmail = !map.ambiguousEmails?.has(email)
+    ? map.byEmail.get(email) ?? (
+      keyLc && !map.ambiguousEmails?.has(keyLc) ? map.byEmail.get(keyLc) : undefined
+    )
+    : undefined;
   if (byEmail) return { memberId: byEmail, method: "email" };
   if (localPart && domain && map.emailDomains.has(domain)) {
     const h = map.byHandle.get(localPart);

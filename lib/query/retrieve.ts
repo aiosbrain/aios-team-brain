@@ -3,6 +3,8 @@ export { buildFtsQuery, significantTerms, conjunctiveTerms, toOrQuery } from "./
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { GraphitiClient, type GraphFact } from "@/lib/graph/graphiti-client";
+import { GraphProvenanceUnavailableError, readAuthorizedGraphFactsResult } from "@/lib/graph/provenance-read";
+import { ContextAuthorization, QueryContextAuthorizationChangedError } from "./context-authorization";
 import { selectEnforcedGraphPartitions } from "@/lib/graph/partition-read";
 import { runSql } from "@/lib/db/pg/pool";
 import {
@@ -32,6 +34,7 @@ export type { Source, RetrievedContext };
 
 const MAX_SOURCE_CHARS = 8_000;
 const MAX_TOTAL_CHARS = 160_000; // ~40k tokens context cap
+const GRAPH_FACT_LIMIT = 20;
 // How many ranked keyword candidates to pull before the char budget truncates. Was 20 — too small
 // once many channels make a broad query legitimately match dozens of items; the top-20 then dropped
 // relevant evidence. `MAX_TOTAL_CHARS` is the real output ceiling (it truncates large corpora), so a
@@ -69,7 +72,11 @@ type AugmentHit = { path?: string; text?: string; score?: number; project?: stri
  * misconfig it returns the input order unchanged. sids are reassigned so the
  * most relevant source is S1 (keeps the LLM's citations stable & meaningful).
  */
-async function rerankSources(question: string, sources: Source[]): Promise<Source[]> {
+export async function rerankSources(
+  question: string,
+  sources: Source[],
+  authorization?: ContextAuthorization,
+): Promise<Source[]> {
   if (!RERANK_URL || sources.length < 2) return sources;
   // AC-07 (M4): the reranker is a RAW transport with its own URL and token — it never passes
   // through `resolveAnsweringKeys`, so the central spend policy could not see it. A staging image
@@ -77,6 +84,10 @@ async function rerankSources(question: string, sources: Source[]): Promise<Sourc
   // a database that is supposed to cost nothing. Return the Postgres ordering BEFORE the fetch;
   // an explicit interactive budget re-enables it through the same policy every other path uses.
   if (!copiedStagingSpendAllowed("interactive-query")) return sources;
+  // AIO-1167 R66: the reranker RECEIVES the captured source text, so it is a dispatch like the
+  // answer: the capture epoch must still be current. A change is a refusal, never a quiet degrade.
+  if (!authorization) throw new QueryContextAuthorizationChangedError("inconsistent");
+  await authorization.assertCurrent();
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), RERANK_TIMEOUT_MS);
   try {
@@ -149,8 +160,6 @@ async function fetchAugmentedSources(
 // Graphiti graph-memory blend (temporal knowledge graph over ALL ingestions). Best-effort:
 // tier-scoped via group_ids, short timeout, never throws — a clean [] when GRAPHITI_URL is unset
 // or the call fails, so retrieval degrades to Postgres-only. Facts join the structured digest.
-const GRAPH_FACTS_LIMIT = Number(process.env.GRAPH_QUERY_FACTS ?? 12);
-const GRAPH_QUERY_TIMEOUT_MS = Number(process.env.GRAPH_QUERY_TIMEOUT_MS ?? 4000);
 
 
 /**
@@ -214,15 +223,38 @@ export type RetrieveEnforce =
 export async function fetchGraphFactsForGroups(
   question: string,
   groupIds: readonly string[],
-  client?: GraphitiClient
+  client?: GraphitiClient,
+  authority?: {
+    db: DbClient;
+    teamId: string;
+    authorization?: ContextAuthorization;
+    /** AIO-1167 R76: receives the items behind the returned facts (model-input provenance). */
+    onItems?: (items: { itemIds: string[]; complete: boolean }) => void;
+  },
 ): Promise<GraphFact[]> {
-  const c = client ?? new GraphitiClient({ timeoutMs: GRAPH_QUERY_TIMEOUT_MS });
-  if (!c.configured || groupIds.length === 0) return [];
-  try {
-    return await c.search(question, [...groupIds], GRAPH_FACTS_LIMIT);
-  } catch {
-    return [];
+  // The REST /search payload still lacks relationship episodes. Production retrieval therefore
+  // uses the direct, provenance-complete Neo4j path; keeping the client parameter preserves the
+  // injectable public seam without ever dispatching an unsafe /search request.
+  void client;
+  if (groupIds.length === 0) return [];
+  if (!authority) return [];
+  const result = await readAuthorizedGraphFactsResult(authority.db, {
+    teamId: authority.teamId, groupIds, query: question, limit: GRAPH_FACT_LIMIT,
+  });
+  // AIO-1167 R66: the facts were authorized under the epoch their read observed. A context captured
+  // under a DIFFERENT epoch would carry facts its own epoch never certified: inconsistent, refused.
+  if (authority.authorization && result.facts.length > 0 && !authority.authorization.certifies(result.epoch)) {
+    throw new QueryContextAuthorizationChangedError("changed");
   }
+  const facts = result.facts;
+  authority.onItems?.({ itemIds: result.itemIds ?? [], complete: result.itemsComplete === true });
+  return facts.map((fact) => ({
+    uuid: fact.id,
+    fact: fact.fact,
+    valid_at: fact.at,
+    source_node_name: fact.subject,
+    target_node_name: fact.object,
+  }));
 }
 
 /**
@@ -472,6 +504,23 @@ async function peopleActivityDigest(db: DbClient, teamId: string): Promise<strin
   return ["", `## Activity by person (Slack/issues/docs, last ${PEOPLE_WINDOW_DAYS}d)`, ...lines].join("\n");
 }
 
+/** A settled outcome: the exact value, or the original rejection reason. */
+type Settled<T> = { ok: true; value: T } | { ok: false; error: unknown };
+
+/** Observe a started operation NOW (it never rejects), keeping its outcome for a later consumer. */
+function settle<T>(operation: Promise<T>): Promise<Settled<T>> {
+  return operation.then(
+    (value): Settled<T> => ({ ok: true, value }),
+    (error: unknown): Settled<T> => ({ ok: false, error }),
+  );
+}
+
+/** The value, or the ORIGINAL error rethrown unchanged — never translated into an empty result. */
+function unwrapSettled<T>(outcome: Settled<T>): T {
+  if (!outcome.ok) throw outcome.error;
+  return outcome.value;
+}
+
 /**
  * Tier-filtered retrieval: recall-friendly FTS + always-include structured context
  * (recent decisions, open/blocked tasks, projects, compact graph digest, Graphiti temporal facts,
@@ -484,7 +533,8 @@ async function nativeRetrieve(
   tier: "team" | "external",
   question: string,
   projectSlug?: string | null,
-  enforce?: RetrieveEnforce | null
+  enforce?: RetrieveEnforce | null,
+  authorization?: ContextAuthorization,
 ): Promise<RetrievedContext> {
   // Access enforcement (Phase B slice 2): `enforcing` supplies the principal's membership-visible
   // item set. `visible(id)` gates the item legs (FTS/recency/dense) + source-linked decisions/tasks.
@@ -530,7 +580,12 @@ async function nativeRetrieve(
   // tier arm. Delegated tokens keep the §5.8b omit (no graphProjectIds). Permissive keeps the
   // two-bucket path with POSTURE as its input.
   let graphScope: { covered: number; total: number } | undefined;
-  const graphFactsP = (async (): Promise<GraphFact[]> => {
+  // AIO-1167 R76: the items behind the graph facts admitted to the model (output provenance).
+  let graphItems: { itemIds: string[]; complete: boolean } = { itemIds: [], complete: true };
+  // OWNED from creation: unrelated retrieval legs are awaited before this one is consumed, and a
+  // rejection settling in between would be an unhandled rejection. `settle` observes it at once and
+  // carries the exact value or the ORIGINAL error to the consumption point below, where it is rethrown.
+  const graphFactsP = settle((async (): Promise<GraphFact[]> => {
     // Configured check FIRST (review Medium 8): a default no-Graphiti install must not pay team,
     // project, arming, or aggregate reads — let alone latch WRITES — for a leg that cannot run.
     if (!new GraphitiClient().configured) return [];
@@ -539,8 +594,11 @@ async function nativeRetrieve(
     try {
       const scope = await selectEnforcedGraphPartitions(db, { teamId, visibleProjectIds: enforce.graphProjectIds });
       graphScope = { covered: scope.covered, total: scope.total };
-      return fetchGraphFactsForGroups(q, scope.groups);
+      return fetchGraphFactsForGroups(q, scope.groups, undefined, {
+        db, teamId, authorization, onItems: (items) => { graphItems = items; },
+      });
     } catch (err) {
+      if (err instanceof GraphProvenanceUnavailableError || err instanceof QueryContextAuthorizationChangedError) throw err;
       // Fail CLOSED and gracefully (review Medium 6) — but never SILENTLY (review-2 Medium 6): a
       // wedged arming path must be distinguishable from the healthy omit for operators.
       console.error(
@@ -548,7 +606,7 @@ async function nativeRetrieve(
       );
       return [];
     }
-  })();
+  })());
   // Optional dense (semantic) passage search — pgvector. Runs concurrently; resolves to [] unless
   // EMBEDDINGS_URL is set AND the pgvector schema is loaded (default installs stay pure-FTS).
   // Enforcement is IN-QUERY (visArr), like the FTS leg — see denseSearch (Codex B3 Medium).
@@ -836,7 +894,7 @@ async function nativeRetrieve(
   // 2c. Semantic expansion via Graphiti (the graph search ran in parallel above). Use the facts'
   // entity/relationship terms to expand the FTS and surface items the literal keyword search missed.
   // No-op when Graphiti is unconfigured / returned nothing → pure keyword behavior, no regression.
-  const graphFacts = await graphFactsP;
+  const graphFacts = unwrapSettled(await graphFactsP);
   const expansion = graphExpansionQuery(graphFacts);
   if (expansion) {
     const semHits = await rankedFtsSearch(teamId, tier, expansion, 10, channel, visArr);
@@ -996,9 +1054,33 @@ async function nativeRetrieve(
   // 4. Optional cross-encoder rerank (local llama-server or cloud). No-op when
   // RERANK_URL is unset; reorders so the most relevant source is cited first.
   // (Runs on the RRF-fused order when dense retrieval contributed, else the FTS/recency order.)
-  const ranked = await rerankSources(question, orderedSources);
+  const ranked = await rerankSources(question, orderedSources, authorization);
 
-  return { sources: ranked, structured: structuredWithGraph, grounded, ...(graphScope ? { graphScope } : {}) };
+  // AIO-1167 R76: everything admitted to the answer model, by item — sources, the items behind task and
+  // decision lines, and the episodes behind graph facts. Org-structural legs (actors, reporting lines)
+  // carry no item. Any leg whose items are not known here (a source without an item, commitments, the
+  // aggregate digests, unresolved graph episodes) makes the set incomplete: the answer is protected.
+  const inputItemIds: string[] = [];
+  let inputsComplete = graphItems.complete || graphFacts.length === 0;
+  for (const source of ranked) {
+    if (source.item_id) inputItemIds.push(source.item_id);
+    else inputsComplete = false;
+  }
+  for (const decision of [...recencyDecisions, ...olderMatches]) {
+    if (decision.source_item_id) inputItemIds.push(decision.source_item_id);
+  }
+  for (const task of tasks ?? []) {
+    const sourceItemId = (task as { source_item_id?: string | null }).source_item_id;
+    if (sourceItemId) inputItemIds.push(sourceItemId);
+  }
+  if (graphFacts.length) inputItemIds.push(...graphItems.itemIds);
+  if ((commitments ?? []).length || gitDigest.trim() || peopleDigest.trim()) inputsComplete = false;
+  const modelInputs = { itemIds: [...new Set(inputItemIds)], complete: inputsComplete };
+
+  return {
+    sources: ranked, structured: structuredWithGraph, grounded, modelInputs,
+    ...(graphScope ? { graphScope } : {}),
+  };
 }
 
 /**
@@ -1007,7 +1089,7 @@ async function nativeRetrieve(
  */
 export const nativeProvider: RetrievalProvider = {
   name: "native",
-  retrieve: (r) => nativeRetrieve(r.db, r.teamId, r.tier, r.question, r.projectSlug, r.enforce ?? null),
+  retrieve: (r) => nativeRetrieve(r.db, r.teamId, r.tier, r.question, r.projectSlug, r.enforce ?? null, r.authorization),
 };
 
 /**
@@ -1034,9 +1116,21 @@ export async function retrieve(
   // would run the item legs UNFILTERED (fail open), so a caller without a principal's view is a
   // bug and throws (the timeline's memberId==null rule, applied here). Both query routes
   // construct the view or 500 before calling.
-  enforce?: RetrieveEnforce | null
+  enforce?: RetrieveEnforce | null,
+  // AIO-1167 R67: the query's ONE authorization, captured by the route BEFORE it resolved the view
+  // (`enforce`) — the first authorization input that selects content. Carried, never recaptured: an
+  // epoch read after the view was accepted would certify a view it never saw. Absent only for a
+  // direct caller that dispatches nothing; then it is captured here, before any read.
+  captured?: ContextAuthorization,
 ): Promise<RetrievedContext> {
   if (enforce == null) throw new Error("retrieve without an enforcement view (fail closed)");
   const provider = selectedProviderName() === "external" ? externalProvider : nativeProvider;
-  return provider.retrieve({ db, teamId, tier, question, projectSlug: projectSlug ?? null, enforce });
+  // AIO-1167 R66: the revocation epoch is captured BEFORE any read it certifies, and the context
+  // carries exactly that capture — never one read afterwards. Every dispatch re-checks it.
+  const authorization = captured ?? await ContextAuthorization.capture(db, teamId);
+  if (authorization.teamId !== teamId) throw new QueryContextAuthorizationChangedError("inconsistent");
+  const ctx = await provider.retrieve({
+    db, teamId, tier, question, projectSlug: projectSlug ?? null, enforce, authorization,
+  });
+  return { ...ctx, authorization };
 }

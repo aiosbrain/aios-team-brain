@@ -1,6 +1,6 @@
 import { NextRequest, after } from "next/server";
 import { adminClient } from "@/lib/db/admin";
-import { authenticateApiKey, authenticateAgentToken, isAgentBearer } from "@/lib/api/auth";
+import { authenticateApiKey, authenticateAgentToken, isAgentBearer, type AgentApiAuth } from "@/lib/api/auth";
 import { isRestrictedTier } from "@/lib/auth/visibility";
 import { rateLimit } from "@/lib/api/rate-limit";
 import {
@@ -10,15 +10,46 @@ import {
   TierViolationError,
 } from "@/lib/api/schemas";
 import { MAX_PAYLOAD_ROWS, wireItemPayloadSchema } from "@/lib/api/item-payload-schema";
-import { ingestItem } from "@/lib/ingest";
+import { ingestApiItem } from "@/lib/ingest";
 import { attributeIncomingItem } from "@/lib/attribution/resolve-authors";
 import { projectChangedTasksAfterWrite } from "@/lib/pm-sync";
 import {
   meetingBackfillScheduler,
   shouldScheduleMeetingBackfill,
 } from "@/lib/meetings/schedule-backfill";
+import { GdriveAuthorityError } from "@/lib/integrations/gdrive-authority";
+import { discoverGdriveContributorIdentities } from "@/lib/integrations/gdrive-identity-discovery";
+import { IdentitySnapshotChangedError } from "@/lib/identity/authority";
+import { ProjectPlanChangedError } from "@/lib/projects/project-row-locks";
+import { GdriveIngestStateChangedError } from "@/lib/ingest/gdrive-commit-locks";
 
 export const runtime = "nodejs";
+
+/**
+ * A push that lost a race, not a broken push: the identity revision or a planned project changed
+ * under its locks, a Drive plan stayed stale after its one re-plan, or a bounded lock wait ran out
+ * (55P03). Each attempt rolled back whole, so the same push may simply be sent again. The sidecar
+ * retries 429/5xx within its own bound and treats every other 4xx as permanent, so this is a 503,
+ * never a 409 — and the route itself does not retry. The transaction layer may wrap the PostgreSQL
+ * error, so the cause chain is searched (bounded).
+ */
+function isRetryableIngestConflict(error: unknown): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < 5 && current && typeof current === "object"; depth++) {
+    if (
+      current instanceof IdentitySnapshotChangedError ||
+      current instanceof ProjectPlanChangedError ||
+      current instanceof GdriveIngestStateChangedError ||
+      (current as { code?: unknown }).code === "55P03"
+    ) {
+      return true;
+    }
+    const cause = (current as { cause?: unknown }).cause;
+    if (cause === current) break;
+    current = cause;
+  }
+  return false;
+}
 
 /** The per-item `body` cap. Also enforced by `commonItemFields.body` in the payload schema. */
 const MAX_PAYLOAD = 1_000_000; // 1 MB per contract
@@ -48,6 +79,18 @@ const MAX_PAYLOAD = 1_000_000; // 1 MB per contract
  */
 const MAX_REQUEST_BYTES = Math.ceil((MAX_PAYLOAD + MAX_PAYLOAD_ROWS * 700) * 1.2);
 const PAGE_SIZE = 200;
+
+function gdriveExecution(req: NextRequest) {
+  const integrationId = req.headers.get("x-aios-integration-id") ?? "";
+  const owner = req.headers.get("x-aios-execution-owner") ?? "";
+  const generation = Number(req.headers.get("x-aios-execution-generation"));
+  const fence = Number(req.headers.get("x-aios-execution-fence"));
+  if (!/^[0-9a-f-]{36}$/i.test(integrationId) || !/^[0-9a-f-]{36}$/i.test(owner)
+      || !Number.isSafeInteger(generation) || generation < 1 || !Number.isSafeInteger(fence) || fence < 1) {
+    throw new GdriveAuthorityError("connector_principal_required", "current Google Drive execution authority is required", 403);
+  }
+  return { integrationId, owner, generation, fence };
+}
 
 export async function POST(req: NextRequest) {
   const auth = await authenticateApiKey(req);
@@ -104,16 +147,30 @@ export async function POST(req: NextRequest) {
   }
 
   try {
+    const hasExecutionHeaders = req.headers.has("x-aios-integration-id")
+      || req.headers.has("x-aios-execution-owner")
+      || req.headers.has("x-aios-execution-generation")
+      || req.headers.has("x-aios-execution-fence");
+    const execution = hasExecutionHeaders ? gdriveExecution(req) : undefined;
+    // A Drive commit first turns observed stable collaborator ids into durable identity links
+    // (AIO-1167 R44 F1) — only under the caller's LIVE execution (validated in the same transaction)
+    // and BEFORE the attribution snapshot below, which then sees them. Never for an external key.
+    if (execution && !isRestrictedTier(auth.memberTier)
+        && String(parsed.data.frontmatter?.source ?? "").toLowerCase() === "gdrive") {
+      await discoverGdriveContributorIdentities(db, auth, execution, parsed.data.frontmatter ?? {});
+    }
     // Resolve the item's author from its frontmatter at INGEST → attribute to the real human, never
     // silently to the ingesting connector. ONLY for trusted team-tier keys: an external (client) key
     // must not be able to attribute content to a team member (spoofing) — it keeps actor attribution.
     const { opts } = isRestrictedTier(auth.memberTier)
-      ? {}
+      ? { opts: undefined }
       : await attributeIncomingItem(db, auth.teamId, parsed.data, auth.memberId);
     // Pass the key's tier: ingestItem resolves the item's tier from it on BOTH write paths, so an
     // external key can neither reclassify an existing item nor declare `team` on a new one.
     const pusherTier = isRestrictedTier(auth.memberTier) ? "external" : "team";
-    const result = await ingestItem(db, auth, parsed.data, tier, opts, pusherTier);
+    const result = await ingestApiItem(
+      db,auth,parsed.data,tier,opts,pusherTier,execution,
+    );
 
     // Reactive auto-projection (brain-api v1.2 Phase 2): on a task push that actually changed
     // projected fields, schedule a bounded projection of ONLY the changed rows into the team's
@@ -154,7 +211,9 @@ export async function POST(req: NextRequest) {
     // §11 first-create/repair hook: new content keeps the existing post-response placement path,
     // with the scheduler as backstop. Existing-item access changes already moved item + context in
     // ingestItem's transaction; this idempotent hook may reconfirm them after commit.
-    if (result.status !== "unchanged" || result.accessChanged) {
+    // Never for Google Drive: its context is derived solely from the surviving audience claims
+    // inside the ingest transaction, so the system-project routing here would widen it.
+    if ((result.status !== "unchanged" || result.accessChanged) && parsed.data.frontmatter?.source !== "gdrive") {
       const teamId = auth.teamId;
       const itemId = result.id;
       // Scheduling the post-response work must never fail the push — not the work (best-effort
@@ -191,20 +250,27 @@ export async function POST(req: NextRequest) {
     if (e instanceof TierViolationError) {
       return errorResponse("forbidden_tier", e.message, 403);
     }
-    return errorResponse("internal", e instanceof Error ? e.message : "ingest failed", 500);
+    if (e instanceof GdriveAuthorityError) {
+      return errorResponse(e.code, e.message, e.status);
+    }
+    // Fixed messages from here on: an exception's own text can carry SQL, lock and relation detail.
+    if (isRetryableIngestConflict(e)) {
+      return errorResponse("temporarily_unavailable", "ingest conflicted with a concurrent change; retry shortly", 503);
+    }
+    // Full detail stays in the server log; the caller gets the fixed message.
+    console.error("[items] push failed:", e instanceof Error ? e.message : e);
+    return errorResponse("internal", "ingest failed", 500);
   }
 }
 
 export async function GET(req: NextRequest) {
   // Phase A (spec §10/§17-A): this is the ONE route that honors delegated agent tokens.
   // An agent principal gets the oracle filter below; member keys behave exactly as before.
-  let agentProjects: ReadonlySet<string> | null = null;
+  let agent: AgentApiAuth | null = null;
   let auth: { teamId: string; memberId: string; memberTier: "team" | "external"; apiKeyId: string };
   if (isAgentBearer(req)) {
-    const agent = await authenticateAgentToken(req);
+    agent = await authenticateAgentToken(req);
     if (!agent) return errorResponse("unauthorized", "invalid agent token or team", 401);
-    const { effectiveVisibleProjects } = await import("@/lib/access/oracle");
-    agentProjects = await effectiveVisibleProjects(adminClient(), agent);
     auth = { teamId: agent.teamId, memberId: agent.memberId, memberTier: agent.memberTier, apiKeyId: `agent:${agent.agentTokenId}` };
   } else {
     const memberAuth = await authenticateApiKey(req);
@@ -224,60 +290,77 @@ export async function GET(req: NextRequest) {
   const kinds = url.searchParams.get("kinds")?.split(",").filter(Boolean);
   const pathPrefix = url.searchParams.get("path_prefix");
 
-  // Tier filtering re-applied server-side: external-tier keys see only external.
-  let q = db
-    .from("items")
-    .select("id, path, kind, access, frontmatter, body, content_sha256, actor, updated_at, projects(slug)")
-    .eq("team_id", auth.teamId)
-    .gt("updated_at", cursor || since)
-    .order("updated_at", { ascending: true })
-    .order("id", { ascending: true })
-    .limit(PAGE_SIZE);
-  // Enforced read (Phase B slice 1, spec §5/§11; wall re-ruled by PRET-4 §1b): visibility is
-  // MODE-keyed — enforcing → the ORACLE alone (the legacy posture conjunct is gone: an external
-  // member granted a project must see its access='team' rows, ruling 2, and the conjunct was
-  // the only thing blocking that); permissive → the posture wall alone (applied below, after
-  // the mode is known). When the team is 'enforcing', BOTH member and agent reads intersect
-  // with the membership-visible item set (an agent must never exceed its launcher — slice-B1
-  // Fable HIGH; the agent's Phase-A project_id proxy is used ONLY under permissive).
-  // A flag-read error throws → 500 (fail closed, never a wrong mode).
-  // PRET-6: enforcing is the only behavior — the oracle decides, unconditionally (the mode
-  // branch, the permissive posture wall, and the agent Phase-A project_id proxy all retired).
-  {
-    const { visibleItemIdsForProjects } = await import("@/lib/access/enforce");
-    let projectSet: ReadonlySet<string>;
-    if (agentProjects !== null) {
-      projectSet = agentProjects; // the agent's effective set (already oracle-attenuated)
-    } else {
-      const { visibleProjects } = await import("@/lib/access/oracle");
-      projectSet = (await visibleProjects(db, { teamId: auth.teamId, memberId: auth.memberId })).projectIds;
+  // AIO-1167 R95 — one attempt = the revocation epoch, THEN the principal's scope (the agent's
+  // effective set or the member's oracle projects), its visible ids and the page; the page (and its
+  // cursor) is published only while that epoch still holds (`lib/access/direct-read-epoch`). A changed
+  // epoch re-runs the whole attempt, so nothing read under a revoked scope — rows or cursor — escapes.
+  const { DirectReadUnavailableError, directReadContent, directReadFinal, withEpochBoundDirectRead } =
+    await import("@/lib/access/direct-read-epoch");
+  try {
+    return await withEpochBoundDirectRead<Response>(db, auth.teamId, async () => {
+      // Tier filtering re-applied server-side: external-tier keys see only external.
+      let q = db
+        .from("items")
+        .select("id, path, kind, access, frontmatter, body, content_sha256, actor, updated_at, projects(slug)")
+        .eq("team_id", auth.teamId)
+        .gt("updated_at", cursor || since)
+        .order("updated_at", { ascending: true })
+        .order("id", { ascending: true })
+        .limit(PAGE_SIZE);
+      // Enforced read (Phase B slice 1, spec §5/§11; wall re-ruled by PRET-4 §1b): visibility is
+      // MODE-keyed — enforcing → the ORACLE alone (the legacy posture conjunct is gone: an external
+      // member granted a project must see its access='team' rows, ruling 2, and the conjunct was
+      // the only thing blocking that); permissive → the posture wall alone (applied below, after
+      // the mode is known). When the team is 'enforcing', BOTH member and agent reads intersect
+      // with the membership-visible item set (an agent must never exceed its launcher — slice-B1
+      // Fable HIGH; the agent's Phase-A project_id proxy is used ONLY under permissive).
+      // A flag-read error throws → 500 (fail closed, never a wrong mode).
+      // PRET-6: enforcing is the only behavior — the oracle decides, unconditionally (the mode
+      // branch, the permissive posture wall, and the agent Phase-A project_id proxy all retired).
+      {
+        const { visibleItemIdsForProjects } = await import("@/lib/access/enforce");
+        let projectSet: ReadonlySet<string>;
+        if (agent !== null) {
+          // The agent's effective set (already oracle-attenuated), resolved INSIDE the attempt.
+          const { effectiveVisibleProjects } = await import("@/lib/access/oracle");
+          projectSet = await effectiveVisibleProjects(adminClient(), agent);
+        } else {
+          const { visibleProjects } = await import("@/lib/access/oracle");
+          projectSet = (await visibleProjects(db, { teamId: auth.teamId, memberId: auth.memberId })).projectIds;
+        }
+        const { ids, empty } = await visibleItemIdsForProjects(db, auth.teamId, projectSet);
+        if (empty) return directReadFinal(Response.json({ items: [], next_cursor: null }));
+        q = q.in("id", [...ids]);
+      }
+      if (kinds?.length) q = q.in("kind", kinds);
+      // On-demand fetch of one skill/deliverable folder: match path by prefix.
+      if (pathPrefix) q = q.like("path", `${pathPrefix.replace(/[%_\\]/g, "\\$&")}%`);
+
+      const { data, error } = await q;
+      if (error) return directReadFinal(errorResponse("internal", error.message, 500));
+
+      let items = (data ?? []).map((i) => ({
+        id: i.id,
+        project: (i.projects as unknown as { slug: string })?.slug,
+        path: i.path,
+        kind: i.kind,
+        access: i.access,
+        frontmatter: i.frontmatter,
+        body: i.body,
+        content_sha256: i.content_sha256,
+        actor: i.actor,
+        updated_at: i.updated_at,
+      }));
+      if (project) items = items.filter((i) => i.project === project);
+
+      const next_cursor =
+        (data?.length ?? 0) === PAGE_SIZE ? data![data!.length - 1].updated_at : null;
+      return directReadContent(Response.json({ items, next_cursor }));
+    });
+  } catch (e) {
+    if (e instanceof DirectReadUnavailableError) {
+      return errorResponse("temporarily_unavailable", "item authorization changed or is unavailable; retry shortly", 503);
     }
-    const { ids, empty } = await visibleItemIdsForProjects(db, auth.teamId, projectSet);
-    if (empty) return Response.json({ items: [], next_cursor: null });
-    q = q.in("id", [...ids]);
+    throw e;
   }
-  if (kinds?.length) q = q.in("kind", kinds);
-  // On-demand fetch of one skill/deliverable folder: match path by prefix.
-  if (pathPrefix) q = q.like("path", `${pathPrefix.replace(/[%_\\]/g, "\\$&")}%`);
-
-  const { data, error } = await q;
-  if (error) return errorResponse("internal", error.message, 500);
-
-  let items = (data ?? []).map((i) => ({
-    id: i.id,
-    project: (i.projects as unknown as { slug: string })?.slug,
-    path: i.path,
-    kind: i.kind,
-    access: i.access,
-    frontmatter: i.frontmatter,
-    body: i.body,
-    content_sha256: i.content_sha256,
-    actor: i.actor,
-    updated_at: i.updated_at,
-  }));
-  if (project) items = items.filter((i) => i.project === project);
-
-  const next_cursor =
-    (data?.length ?? 0) === PAGE_SIZE ? data![data!.length - 1].updated_at : null;
-  return Response.json({ items, next_cursor });
 }

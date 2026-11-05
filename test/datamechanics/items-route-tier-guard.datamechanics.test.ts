@@ -136,7 +136,9 @@ describe("items route tier guard (real handler, real Postgres — the boundary l
     const ext = await issueKeyFor(seed, "external");
     // Give the team member a resolvable email, then have the external key name it as the author.
     await db().from("member_emails").insert({ team_id: seed.teamId, member_id: team.memberId, email: "victim@corp.com" });
-    const authored = { ...itemBody("external", "d/spoof.md"), frontmatter: { source: "gdrive", authors: [{ role: "author", email: "victim@corp.com" }] } };
+    // Drive now has a stronger connector-execution boundary; use Notion to exercise the generic
+    // attribution-spoof rule independently of that dedicated authority.
+    const authored = { ...itemBody("external", "d/spoof.md"), frontmatter: { source: "notion", authors: [{ role: "author", email: "victim@corp.com" }] } };
 
     const res = await post(ext.key, seed.teamSlug, authored);
     expect(res.status).toBe(201);

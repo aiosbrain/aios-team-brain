@@ -22,9 +22,18 @@ import {
   setExtractionSmallModel,
   setEmbeddingModel,
   setMeetingTaskStatus,
+  testGoogleDriveConnection,
+  provisionGoogleDriveConnector,
+  saveGoogleDrivePickerSelection,
+  runGoogleDriveNow,
   type PrimaryPmProvider,
 } from "@/app/t/[team]/admin/integrations/actions";
 import type { AnsweringProvider, ExtractionProvider } from "@/lib/query/llm-backend";
+import type { GdriveRunStatus } from "@/lib/integrations/gdrive-run-status";
+import {
+  driveConnections, latchDriveSelection, resolveDriveSelection, valueFor, type ForConnection,
+} from "@/lib/integrations/gdrive-admin-selection";
+import { GoogleDrivePanel } from "@/components/admin/google-drive-panel";
 import { EMBEDDING_MODELS, EMBEDDING_PROVIDER_TYPES, type EmbeddingProvider } from "@/lib/api/schemas";
 import {
   MEETING_TASK_STATUSES,
@@ -284,6 +293,7 @@ type IntegrationType =
   | "openrouter"
   | "google"
   | "notion"
+  | "gdrive"
   | "clickup";
 
 export interface IntegrationRow {
@@ -298,7 +308,7 @@ export interface IntegrationRow {
 // Data-source connectors shown in the generic "Add an integration" form. Provider keys get their
 // own panel (PROVIDER_TYPES); GitHub gets its own repo panel (GithubReposPanel) — so both are
 // excluded here to avoid two places to manage the same thing.
-const TYPES: IntegrationType[] = ["slack", "notion", "linear", "plane", "clickup"];
+const TYPES: IntegrationType[] = ["slack", "notion", "gdrive", "linear", "plane", "clickup"];
 
 // LLM provider API keys — one set for the team, managed in the dedicated "AI provider keys" panel.
 const PROVIDER_TYPES = ["anthropic", "openai", "google"] as const;
@@ -318,6 +328,7 @@ const SELECTION_HINT: Partial<Record<IntegrationType, string>> = {
   // plus EITHER page ids or a database id. Pages are the common case, so that's what this field holds;
   // a `databaseId=<id>` entry is accepted for the whole-database case.
   notion: "page IDs (comma-separated), or databaseId=<id>",
+  gdrive: "fileIds=A|B, folderIds=F, audienceProjectIds=<project-uuid>|<project-uuid>, recursive=true, authMode=oauth",
   linear: "teamId=..., projectId=..., doneStateName=Done",
   plane: "workspaceSlug=..., projectId=..., doneStateName=DONE, externalSource=aios-backlog",
   // `,` separates entries, so a multi-value entry uses `|` (see lib/integrations/build-config).
@@ -331,6 +342,12 @@ function summarizeConfig(type: IntegrationType, config: Record<string, unknown>)
   if (type === "notion") {
     if (config.databaseId) return `database ${config.databaseId}`;
     return `${arr("pageIds").length} page(s)`;
+  }
+  if (type === "gdrive") {
+    const files = arr("fileIds").length;
+    const folders = arr("folderIds").length;
+    const drives = arr("sharedDriveIds").length;
+    return `${config.selectionState ?? "absent"} · ${files} file(s) · ${folders} folder(s) · ${drives} Shared Drive(s)${config.recursive ? " · recursive" : ""}`;
   }
   if (type === "linear") {
     return [
@@ -365,6 +382,8 @@ export function IntegrationsManager({
   meetingTaskStatus,
   answering,
   embedding,
+  gdrivePicker,
+  gdriveStatus,
 }: {
   teamSlug: string;
   integrations: IntegrationRow[];
@@ -372,6 +391,9 @@ export function IntegrationsManager({
   meetingTaskStatus: MeetingTaskStatus;
   answering: AnsweringState;
   embedding: EmbeddingState;
+  gdrivePicker: { clientId: string; apiKey: string; appId: string } | null;
+  /** Per Drive connection id: latest attempt, latest progress, latest authoritative success. */
+  gdriveStatus: Record<string, GdriveRunStatus>;
 }) {
   const router = useRouter();
   const [pending, startTransition] = useTransition();
@@ -462,6 +484,161 @@ export function IntegrationsManager({
       i.type !== "openrouter" && // OpenRouter has its own dedicated panel (key + model)
       !(PROVIDER_TYPES as readonly string[]).includes(i.type)
   );
+  // Every Drive status line and action binds to ONE selected named connection, by immutable id —
+  // never `find` the first, and never fall back to another (`lib/integrations/gdrive-admin-selection`).
+  const drives = driveConnections(integrations);
+  const [selectedDriveId, setSelectedDriveId] = useState<string | null>(() => latchDriveSelection(null, drives));
+  // The first connection the Admin is shown is latched by id exactly once (the first non-empty list,
+  // e.g. after the first connect + refresh); from then on a refresh can only find it or report it
+  // missing — it never re-picks whichever connection is first now. Updating state during render is
+  // React's derived-state pattern, and it fires at most once (only from null).
+  const latchedDriveId = latchDriveSelection(selectedDriveId, drives);
+  if (latchedDriveId !== selectedDriveId) setSelectedDriveId(latchedDriveId);
+  const driveSelection = resolveDriveSelection(drives, latchedDriveId);
+  // Each per-connection result remembers whose it is, so switching connections (or a result that
+  // lands after the switch) never shows one connection's preview or one-time key under another.
+  const [driveTest, setDriveTest] = useState<ForConnection<string> | null>(null);
+  const [drivePreviewContinuation, setDrivePreviewContinuation] = useState<ForConnection<number> | null>(null);
+  const [driveConnectorKey, setDriveConnectorKey] = useState<ForConnection<string> | null>(null);
+
+  function selectDrive(connectionId: string) {
+    setSelectedDriveId(connectionId);
+    setDriveTest(null);
+    setDrivePreviewContinuation(null);
+    setDriveConnectorKey(null);
+    setError(null);
+    setNotice(null);
+    setWarning(null);
+  }
+
+  async function chooseDriveFiles(drive: IntegrationRow) {
+    if (!gdrivePicker) return;
+    setError(null);
+    setDriveTest(null);
+    try {
+      const load = (id: string, src: string) => new Promise<void>((resolve, reject) => {
+        const existing = document.getElementById(id) as HTMLScriptElement | null;
+        if (existing?.dataset.loaded === "true") return resolve();
+        const script = existing ?? Object.assign(document.createElement("script"), { id, src, async: true });
+        script.addEventListener("load", () => { script.dataset.loaded = "true"; resolve(); }, { once: true });
+        script.addEventListener("error", () => reject(new Error("Google Picker failed to load")), { once: true });
+        if (!existing) document.head.appendChild(script);
+      });
+      await Promise.all([
+        load("google-api-js", "https://apis.google.com/js/api.js"),
+        load("google-gis-js", "https://accounts.google.com/gsi/client"),
+      ]);
+      type PickerDoc = { id?: string };
+      type PickerData = { action?: string; docs?: PickerDoc[] };
+      type PickerApi = {
+        Action: { PICKED: string; CANCEL: string };
+        Feature: { MULTISELECT_ENABLED: string };
+        DocsView: new () => { setMimeTypes(value: string): unknown; setIncludeFolders(value: boolean): unknown };
+        PickerBuilder: new () => {
+          addView(view: unknown): unknown; enableFeature(feature: string): unknown;
+          setOAuthToken(token: string): unknown; setDeveloperKey(key: string): unknown;
+          setAppId(id: string): unknown; setOrigin(origin: string): unknown;
+          setCallback(callback: (data: PickerData) => void): unknown;
+          build(): { setVisible(visible: boolean): void };
+        };
+      };
+      type GoogleGlobal = {
+        accounts: { oauth2: { initTokenClient(config: {
+          client_id: string; scope: string; callback: (response: { access_token?: string; error?: string }) => void;
+        }): { requestAccessToken(input: { prompt: string }): void } } };
+        picker: PickerApi;
+      };
+      const browser = window as typeof window & {
+        gapi?: { load(name: string, callback: () => void): void };
+        google?: GoogleGlobal;
+      };
+      await new Promise<void>((resolve, reject) => {
+        if (!browser.gapi) return reject(new Error("Google Picker API did not initialize"));
+        browser.gapi.load("picker", resolve);
+      });
+      const google = browser.google;
+      if (!google) throw new Error("Google Identity Services did not initialize");
+      const tokenClient = google.accounts.oauth2.initTokenClient({
+        client_id: gdrivePicker.clientId,
+        scope: "https://www.googleapis.com/auth/drive.file",
+        callback: (response) => {
+          if (!response.access_token || response.error) {
+            setError("Google file authorization was cancelled or denied");
+            return;
+          }
+          const view = new google.picker.DocsView();
+          view.setIncludeFolders(false);
+          view.setMimeTypes("application/vnd.google-apps.document");
+          const builder = new google.picker.PickerBuilder();
+          builder.addView(view);
+          builder.enableFeature(google.picker.Feature.MULTISELECT_ENABLED);
+          builder.setOAuthToken(response.access_token);
+          builder.setDeveloperKey(gdrivePicker.apiKey);
+          builder.setAppId(gdrivePicker.appId);
+          builder.setOrigin(window.location.origin);
+          builder.setCallback((data) => {
+            if (data.action === google.picker.Action.CANCEL) {
+              setDriveTest({ connectionId: drive.id, value: "Selection cancelled; the saved scope was unchanged." });
+              return;
+            }
+            if (data.action !== google.picker.Action.PICKED) return;
+            const ids = (data.docs ?? []).map((doc) => doc.id ?? "").filter(Boolean);
+            startTransition(async () => {
+              // Saved to the connection the Picker was opened for, even if the selection changed since.
+              const result = await saveGoogleDrivePickerSelection(teamSlug, drive.name, ids);
+              if (!result.ok) setError(result.error ?? "Google Picker selection could not be saved");
+              else {
+                setNotice(result.message ?? "Google Drive selection saved.");
+                router.refresh();
+              }
+            });
+          });
+          builder.build().setVisible(true);
+        },
+      });
+      tokenClient.requestAccessToken({ prompt: "consent" });
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "Google Picker could not be opened");
+    }
+  }
+
+  function testDrive(drive: IntegrationRow, continuation = 0) {
+    setDriveTest(null);
+    setError(null);
+    startTransition(async () => {
+      const result = await testGoogleDriveConnection(teamSlug, drive.name, continuation);
+      setDriveTest({ connectionId: drive.id, value: result.message ?? result.error ?? "Google Drive test did not return a result" });
+      setDrivePreviewContinuation(result.continuation == null ? null : { connectionId: drive.id, value: result.continuation });
+      if (!result.ok) setError(result.error ?? "Google Drive test failed");
+    });
+  }
+
+  function provisionDriveConnector(drive: IntegrationRow) {
+    setError(null);
+    setDriveConnectorKey(null);
+    startTransition(async () => {
+      const result = await provisionGoogleDriveConnector(teamSlug, drive.id);
+      if (!result.ok || !result.key) setError(result.error ?? "Google Drive connector provisioning failed");
+      else {
+        setDriveConnectorKey({ connectionId: drive.id, value: result.key });
+        setNotice(result.rotated
+          ? `Connector key for ${drive.name} rotated. Replace the sidecar key now.`
+          : `Connector key for ${drive.name} provisioned.`);
+      }
+    });
+  }
+
+  function runDriveNow(drive: IntegrationRow, trigger: "manual" | "retry" = "manual") {
+    setError(null);
+    startTransition(async () => {
+      const result = await runGoogleDriveNow(teamSlug, drive.id, trigger);
+      if (!result.ok) setError(result.error ?? "Google Drive run could not be queued");
+      else {
+        setNotice(result.message ?? "Google Drive run queued.");
+        router.refresh();
+      }
+    });
+  }
 
   // Answer-model drafts for the editable provider keys (anthropic/openai), seeded from saved config.
   const [modelDraft, setModelDraft] = useState<Record<"anthropic" | "openai", string>>({
@@ -897,11 +1074,31 @@ export function IntegrationsManager({
         </div>
       </div>
 
+      <GoogleDrivePanel
+        teamSlug={teamSlug}
+        connections={drives}
+        selection={driveSelection}
+        gdriveStatus={gdriveStatus}
+        pickerConfigured={gdrivePicker !== null}
+        pending={pending}
+        testMessage={valueFor(driveTest, driveSelection)}
+        previewContinuation={valueFor(drivePreviewContinuation, driveSelection)}
+        connectorKey={valueFor(driveConnectorKey, driveSelection)}
+        summarize={(config) => summarizeConfig("gdrive", config)}
+        onSelect={selectDrive}
+        onChooseFiles={(drive) => { void chooseDriveFiles(drive); }}
+        onRun={runDriveNow}
+        onTest={testDrive}
+        onProvision={provisionDriveConnector}
+      />
+
       <form
         onSubmit={(e) => {
           e.preventDefault();
           run(async () => {
-            const res = await saveIntegration(teamSlug, form);
+            // Drive takes no pasted credential (the server refuses one); drop any value left in
+            // the hidden field from another type so a Drive save is never refused for it.
+            const res = await saveIntegration(teamSlug, form.type === "gdrive" ? { ...form, secret: "" } : form);
             if (res.ok)
               setForm({ type: form.type, name: "", selection: "", secret: "", inboundApply: false });
             return res;
@@ -960,14 +1157,22 @@ export function IntegrationsManager({
             lands.
           </p>
         ) : null}
-        <input
-          className="prism-input"
-          type="password"
-          autoComplete="off"
-          placeholder="secret token (e.g. xoxb-… for Slack) — stored encrypted, never shown again"
-          value={form.secret}
-          onChange={(e) => setForm({ ...form, secret: e.target.value })}
-        />
+        {form.type === "gdrive" ? (
+          <p className="text-xs text-ink-secondary">
+            Save the non-secret selection and approved audience project IDs here, then authorize
+            above. OAuth credentials are written only by the verified callback and are never accepted
+            in this form. Drive content is not placed in General automatically.
+          </p>
+        ) : (
+          <input
+            className="prism-input"
+            type="password"
+            autoComplete="off"
+            placeholder="secret token (e.g. xoxb-… for Slack) — stored encrypted, never shown again"
+            value={form.secret}
+            onChange={(e) => setForm({ ...form, secret: e.target.value })}
+          />
+        )}
         <button type="submit" disabled={pending} className="btn-prism justify-center">
           <Plug className="size-4" /> Save integration
         </button>
@@ -1018,26 +1223,33 @@ export function IntegrationsManager({
                       : "border-border-default text-ink-tertiary"
                   }`}
                 >
-                  {i.status === "enabled" ? "Enabled" : "Disabled"}
+                  {i.type === "gdrive"
+                    ? (i.status === "enabled" ? "Pause" : "Resume")
+                    : (i.status === "enabled" ? "Enabled" : "Disabled")}
                 </button>
+                {i.type !== "gdrive" ? (
+                  <button
+                    onClick={() => {
+                      const s = window.prompt(`New secret for ${i.name}:`);
+                      if (s) run(() => rotateSecret(teamSlug, i.id, s));
+                    }}
+                    disabled={pending}
+                    className="rounded-lg border border-border-default p-1.5 text-ink-secondary hover:text-ink"
+                    aria-label="Rotate secret"
+                  >
+                    <KeyRound className="size-4" />
+                  </button>
+                ) : null}
                 <button
                   onClick={() => {
-                    const s = window.prompt(`New secret for ${i.name}:`);
-                    if (s) run(() => rotateSecret(teamSlug, i.id, s));
-                  }}
-                  disabled={pending}
-                  className="rounded-lg border border-border-default p-1.5 text-ink-secondary hover:text-ink"
-                  aria-label="Rotate secret"
-                >
-                  <KeyRound className="size-4" />
-                </button>
-                <button
-                  onClick={() => {
-                    if (window.confirm(`Delete integration "${i.name}"?`)) run(() => removeIntegration(teamSlug, i.id));
+                    const message = i.type === "gdrive"
+                      ? `Disconnect "${i.name}"? Imported content is retained; disconnecting does not purge it or claim it is current.`
+                      : `Delete integration "${i.name}"?`;
+                    if (window.confirm(message)) run(() => removeIntegration(teamSlug, i.id));
                   }}
                   disabled={pending}
                   className="rounded-lg border border-border-default p-1.5 text-ink-secondary hover:text-red"
-                  aria-label="Delete integration"
+                  aria-label={i.type === "gdrive" ? "Disconnect Google Drive" : "Delete integration"}
                 >
                   <Trash2 className="size-4" />
                 </button>

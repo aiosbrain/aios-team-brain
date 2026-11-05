@@ -26,42 +26,57 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ id: string 
 
   const NOT_FOUND = () => errorResponse("not_found", "no such item (or not visible to you)", 404);
 
-  // The by-id membership probe (shared-predicate §2.1) — fail closed BEFORE the row is read.
-  const { canSeeItem } = await import("@/lib/access/enforce");
-  if (!(await canSeeItem(db, { teamId: auth.teamId, memberId: auth.memberId }, id))) {
-    return NOT_FOUND();
-  }
-  let labelTier: "team" | "external";
+  // AIO-1167 R95 — the revocation epoch is captured BEFORE the membership probe and the admission, and
+  // the row is published only while it still holds (`lib/access/direct-read-epoch`): a revocation after
+  // the probe re-runs the whole attempt, which then answers the same 404 as an absent id.
+  const { DirectReadUnavailableError, directReadContent, directReadFinal, withEpochBoundDirectRead } =
+    await import("@/lib/access/direct-read-epoch");
   try {
-    const { resolveContentAdmission, contentLabelTier } = await import("@/lib/access/admission");
-    labelTier = contentLabelTier(await resolveContentAdmission(db, auth.teamId, auth.memberId));
-  } catch {
-    return errorResponse("internal", "access resolution failed", 500); // fail closed, never a default
+    return await withEpochBoundDirectRead<Response>(db, auth.teamId, async () => {
+      // The by-id membership probe (shared-predicate §2.1) — fail closed BEFORE the row is read.
+      const { canSeeItem } = await import("@/lib/access/enforce");
+      if (!(await canSeeItem(db, { teamId: auth.teamId, memberId: auth.memberId }, id))) {
+        return directReadFinal(NOT_FOUND());
+      }
+      let labelTier: "team" | "external";
+      try {
+        const { resolveContentAdmission, contentLabelTier } = await import("@/lib/access/admission");
+        labelTier = contentLabelTier(await resolveContentAdmission(db, auth.teamId, auth.memberId));
+      } catch {
+        // fail closed, never a default
+        return directReadFinal(errorResponse("internal", "access resolution failed", 500));
+      }
+
+      let q = db
+        .from("items")
+        .select("id, path, kind, access, frontmatter, body, content_sha256, actor, updated_at, projects(slug)")
+        .eq("team_id", auth.teamId)
+        .eq("id", id)
+        .limit(1);
+      if (isRestrictedTier(labelTier)) q = q.eq("access", "external");
+
+      const { data, error } = await q;
+      if (error) return directReadFinal(errorResponse("internal", error.message, 500));
+      const row = data?.[0];
+      if (!row) return directReadFinal(NOT_FOUND());
+
+      return directReadContent(Response.json({
+        id: row.id,
+        project: (row.projects as unknown as { slug: string })?.slug,
+        path: row.path,
+        kind: row.kind,
+        access: row.access,
+        frontmatter: row.frontmatter,
+        body: row.body,
+        content_sha256: row.content_sha256,
+        actor: row.actor,
+        updated_at: row.updated_at,
+      }));
+    });
+  } catch (e) {
+    if (e instanceof DirectReadUnavailableError) {
+      return errorResponse("temporarily_unavailable", "item authorization changed or is unavailable; retry shortly", 503);
+    }
+    throw e;
   }
-
-  let q = db
-    .from("items")
-    .select("id, path, kind, access, frontmatter, body, content_sha256, actor, updated_at, projects(slug)")
-    .eq("team_id", auth.teamId)
-    .eq("id", id)
-    .limit(1);
-  if (isRestrictedTier(labelTier)) q = q.eq("access", "external");
-
-  const { data, error } = await q;
-  if (error) return errorResponse("internal", error.message, 500);
-  const row = data?.[0];
-  if (!row) return NOT_FOUND();
-
-  return Response.json({
-    id: row.id,
-    project: (row.projects as unknown as { slug: string })?.slug,
-    path: row.path,
-    kind: row.kind,
-    access: row.access,
-    frontmatter: row.frontmatter,
-    body: row.body,
-    content_sha256: row.content_sha256,
-    actor: row.actor,
-    updated_at: row.updated_at,
-  });
 }

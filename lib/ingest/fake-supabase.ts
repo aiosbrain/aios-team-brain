@@ -148,6 +148,7 @@ class Builder implements PromiseLike<{ data: unknown; error: null }> {
   private conflict: string[] = [];
   private filters: Filter[] = [];
   private wantSelect = false;
+  private maxRows: number | null = null;
 
   constructor(private rows: Row[]) {}
 
@@ -198,6 +199,11 @@ class Builder implements PromiseLike<{ data: unknown; error: null }> {
   }
   order(_col: string, _opts?: { ascending?: boolean }) {
     return this; // ordering is irrelevant to these unit tests
+  }
+  /** `.limit(n)` on a select — the Drive provider-identity lookup asks for at most 2 matches. */
+  limit(n: number) {
+    this.maxRows = n;
+    return this;
   }
 
   // -- terminals ----------------------------------------------------------
@@ -252,8 +258,10 @@ class Builder implements PromiseLike<{ data: unknown; error: null }> {
         return [];
       }
       case "select":
-      default:
-        return this.rows.filter((r) => this.match(r));
+      default: {
+        const matched = this.rows.filter((r) => this.match(r));
+        return this.maxRows === null ? matched : matched.slice(0, this.maxRows);
+      }
     }
   }
 }

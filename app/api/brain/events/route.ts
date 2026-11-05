@@ -3,9 +3,12 @@ import { serverClient } from "@/lib/db/server";
 import { adminClient } from "@/lib/db/admin";
 import { getSessionUser } from "@/lib/auth/session";
 import { errorResponse } from "@/lib/api/schemas";
-import { recentEvents } from "@/lib/graph/learning";
+import { recentEventsWithStatus, type GraphEvent } from "@/lib/graph/learning";
 import { resolveHumanActorsByItem } from "@/lib/graph/human-actors";
 import { attributeEventParticipants } from "@/lib/graph/arc-attribution";
+import { AttributionRepairPendingError, authorizationEpoch } from "@/lib/access/authorization-epoch";
+import { visibleItemIdsForProjects } from "@/lib/access/enforce";
+import { GraphProvenanceUnavailableError, GraphScopeEpochChangedError, readAuthorizedGraphFacts } from "@/lib/graph/provenance-read";
 
 export const runtime = "nodejs";
 
@@ -36,31 +39,108 @@ export async function GET(req: NextRequest) {
     .maybeSingle();
   if (!me) return errorResponse("forbidden", "not a member of this team", 403);
 
-  // ENFB-3: the ONE partition read model — the member's ORACLE scope through the STORED
-  // pointers (`selectEnforcedGraphPartitions`, the path graph-query/arcs/retrieve adopted in
-  // ENFB-1), replacing the legacy tier-pair resolution. Measured no-op for a stock member
-  // (the system pointers ARE the legacy pair). arm:false — a 60s-polling feed must not be an
-  // arming heartbeat; k uncapped — no silent truncation. Discrimination (design round 2):
-  //   oracle read ERROR            → degraded JSON (the panels' existing tolerance);
-  //   genuinely-empty scope        → empty feed (incl. General debt-suppressed — fail closed);
-  //   visible system project + zero pointers + NOT suppressed → a WIRING FAULT, loud 500.
-  // Deliberately not carried from the legacy resolver (spec §1): the slug-derived
-  // unbootstrapped fallback (stored path = one owner), assertDirection (PRET-4 ruling 2:
-  // grants ARE the scope), assertNoForeignHistory (pointer-only resolution never reaches the
-  // slug-reuse state).
+  // The member's partition scope (ENFB-3) is resolved INSIDE each attempt (`resolveEventScope`).
   const admin = adminClient();
   const since = new Date(Date.now() - WINDOW_HOURS * 3600 * 1000).toISOString();
+  const memberId = (me as { id: string }).id;
+  let attributed: Omit<GraphEvent, "factEvidence">[] = [];
+  try {
+    let settled = false;
+    // AIO-1167 R94 — each attempt owns its WHOLE authority chain: the epoch is captured FIRST, then
+    // the member's oracle projects, their stored partitions and the item visibility are resolved
+    // fresh under it. A changed epoch restarts all of it — the principal's revoked scope is never
+    // re-certified under the newer epoch (the provenance read is bound to this attempt's epoch).
+    for (let attempt = 0; attempt < 2 && !settled; attempt += 1) {
+      const epoch = await authorizationEpoch(admin, team.id);
+      const scope = await resolveEventScope(admin, team.id, teamSlug, memberId);
+      if ("response" in scope) return scope.response;
+      const visible = await visibleItemIdsForProjects(admin, team.id, scope.projectIds);
+      if (visible.error) throw new GraphProvenanceUnavailableError("event item authorization read failed");
+      const graph = await recentEventsWithStatus(scope.groups, since, LIMIT);
+      if (!graph.ok) throw new GraphProvenanceUnavailableError("graph event read failed");
+      let authorizedFacts: Awaited<ReturnType<typeof readAuthorizedGraphFacts>>;
+      try {
+        authorizedFacts = await readAuthorizedGraphFacts(admin, {
+          teamId: team.id, groupIds: scope.groups, sinceISO: since, limit: LIMIT * 20, expectedEpoch: epoch,
+        });
+      } catch (error) {
+        if (error instanceof GraphScopeEpochChangedError) continue; // re-resolve the principal's scope
+        throw error;
+      }
+      const authorizedFactIds = new Set(authorizedFacts.map((fact) => fact.id));
+      const events = graph.events.flatMap((event) => {
+        // Titles and participants are episode-derived prose too: the event's canonical item must
+        // remain visible. Facts additionally require their complete relationship dependency set.
+        if (!event.itemId || !visible.ids.has(event.itemId)) return [];
+        const facts = (event.factEvidence ?? [])
+          .filter((evidence) => authorizedFactIds.has(evidence.id))
+          .map((evidence) => evidence.fact);
+        const { factEvidence: _privateEvidence, ...wire } = event;
+        return [{ ...wire, facts, factCount: facts.length }];
+      });
+      // Tag any recognized AI-agent participant name with the human behind that event's item, or
+      // "(unattributed AI agent)" when none resolves — same attribution as narrative arcs (Layer 3);
+      // see docs/design/brain-learning-panel.md. Attribution is one more await, so it belongs to
+      // this attempt: a revocation that lands while it runs must invalidate the whole candidate.
+      const itemIds = [...new Set(events.map((e) => e.itemId).filter((id): id is string => !!id))];
+      const humanByItem = await resolveHumanActorsByItem(admin, team.id, itemIds);
+      const candidate = attributeEventParticipants(events, humanByItem);
+      // The LAST await before publication. Nothing asynchronous may follow this check, or the
+      // candidate built above could be served across a revocation it never observed.
+      if (await authorizationEpoch(admin, team.id) !== epoch) continue;
+      attributed = candidate;
+      settled = true;
+    }
+    if (!settled) throw new GraphProvenanceUnavailableError("event authorization changed repeatedly");
+  } catch (error) {
+    if (error instanceof GraphProvenanceUnavailableError) {
+      return errorResponse("temporarily_unavailable", "graph provenance authorization is temporarily unavailable", 503);
+    }
+    // Participants are attributed to people, so a pending attribution repair withholds the feed —
+    // as a retryable refusal, never a 500 or a plausible-but-partial attribution.
+    if (error instanceof AttributionRepairPendingError) {
+      return errorResponse("temporarily_unavailable", "attribution repair is in progress; retry shortly", 503);
+    }
+    throw error;
+  }
+
+  // `degraded` on EVERY branch (additive): a field that appears only on the failure path is a
+  // branch-dependent wire shape, and it leaves a genuinely quiet week indistinguishable from a
+  // resolution failure — the ambiguity this whole change exists to remove.
+  return Response.json({ events: attributed, as_of: new Date().toISOString(), degraded: false });
+}
+
+/**
+ * ENFB-3: the ONE partition read model — the member's ORACLE scope through the STORED pointers
+ * (`selectEnforcedGraphPartitions`, the path graph-query/arcs/retrieve adopted in ENFB-1), replacing the
+ * legacy tier-pair resolution. Measured no-op for a stock member (the system pointers ARE the legacy
+ * pair). arm:false — a 60s-polling feed must not be an arming heartbeat; k uncapped — no silent
+ * truncation. Discrimination (design round 2):
+ *   oracle read ERROR            → degraded JSON (the panels' existing tolerance);
+ *   genuinely-empty scope        → empty feed (incl. General debt-suppressed — fail closed);
+ *   visible system project + zero pointers + NOT suppressed → a WIRING FAULT, loud 500.
+ * Deliberately not carried from the legacy resolver (spec §1): the slug-derived unbootstrapped fallback
+ * (stored path = one owner), assertDirection (PRET-4 ruling 2: grants ARE the scope),
+ * assertNoForeignHistory (pointer-only resolution never reaches the slug-reuse state).
+ * R94: resolved once PER ATTEMPT, after that attempt's epoch capture.
+ */
+async function resolveEventScope(
+  admin: ReturnType<typeof adminClient>,
+  teamId: string,
+  teamSlug: string,
+  memberId: string,
+): Promise<{ projectIds: ReadonlySet<string>; groups: string[] } | { response: Response }> {
   const { visibleProjectsWithError } = await import("@/lib/access/oracle");
   const { selectEnforcedGraphPartitions } = await import("@/lib/graph/partition-read");
-  const oracle = await visibleProjectsWithError(admin, { teamId: team.id, memberId: (me as { id: string }).id });
+  const degraded = () => ({ response: Response.json({ events: [], as_of: new Date().toISOString(), degraded: true }) });
+  const oracle = await visibleProjectsWithError(admin, { teamId, memberId });
   if (oracle.error) {
     console.error(`[events] oracle resolution failed for team ${teamSlug}`);
-    return Response.json({ events: [], as_of: new Date().toISOString(), degraded: true });
+    return degraded();
   }
-  let groups: string[];
   try {
     const scope = await selectEnforcedGraphPartitions(admin, {
-      teamId: team.id,
+      teamId,
       visibleProjectIds: [...oracle.set.projectIds],
       k: Number.MAX_SAFE_INTEGER,
       arm: false,
@@ -68,7 +148,7 @@ export async function GET(req: NextRequest) {
     const { data: sysVisible, error: sysErr } = await admin
       .from("projects")
       .select("id")
-      .eq("team_id", team.id)
+      .eq("team_id", teamId)
       .eq("kind", "system")
       .in("id", [...oracle.set.projectIds])
       .limit(1);
@@ -76,29 +156,16 @@ export async function GET(req: NextRequest) {
     // benign empty here would mask exactly the wiring fault the loud arm exists to surface.
     if (sysErr) {
       console.error(`[feed] system-project discriminator read failed for team ${teamSlug}:`, sysErr.message);
-      return Response.json({ events: [], as_of: new Date().toISOString(), degraded: true });
+      return degraded();
     }
     const seesSystem = ((sysVisible ?? []) as unknown[]).length > 0;
     if (scope.groups.length === 0 && seesSystem && !scope.generalSuppressed) {
       console.error(`[events] zero partitions for a system-visible member on team ${teamSlug} — stored pointers missing (wiring fault)`);
-      return errorResponse("internal", "graph partition resolution failed", 500);
+      return { response: errorResponse("internal", "graph partition resolution failed", 500) };
     }
-    groups = scope.groups;
+    return { projectIds: oracle.set.projectIds, groups: scope.groups };
   } catch (e) {
     console.error(`[events] partition resolution failed for team ${teamSlug}:`, e);
-    return Response.json({ events: [], as_of: new Date().toISOString(), degraded: true });
+    return degraded();
   }
-  const events = await recentEvents(groups, since, LIMIT);
-
-  // Tag any recognized AI-agent participant name with the human behind that event's item, or
-  // "(unattributed AI agent)" when none resolves — same attribution as narrative arcs (Layer 3);
-  // see docs/design/brain-learning-panel.md.
-  const itemIds = [...new Set(events.map((e) => e.itemId).filter((id): id is string => !!id))];
-  const humanByItem = await resolveHumanActorsByItem(admin, team.id, itemIds);
-  const attributed = attributeEventParticipants(events, humanByItem);
-
-  // `degraded` on EVERY branch (additive): a field that appears only on the failure path is a
-  // branch-dependent wire shape, and it leaves a genuinely quiet week indistinguishable from a
-  // resolution failure — the ambiguity this whole change exists to remove.
-  return Response.json({ events: attributed, as_of: new Date().toISOString(), degraded: false });
 }

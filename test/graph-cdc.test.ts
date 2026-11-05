@@ -828,6 +828,28 @@ describe("CDCAPPEND-1: append churn is a bound, not a number", { timeout: 30_000
   /** THE literal the `append at end` scenario applies, not a copy of it. */
   const SCENARIO_APPEND = APPEND_AT_END;
 
+  /** Characters a chunking admitted. Both chunkers return a pure PREFIX of the body (contiguous slices
+   *  from 0, cut off at their cap), so equal admitted lengths mean equal admitted text. */
+  const admitted = (chunks: string[]): number => chunks.reduce((n, c) => n + c.length, 0);
+
+  /**
+   * The cross-algorithm `+1` envelope compares like with like ONLY when both chunkings admitted the same
+   * text of BOTH versions. The legacy byte-offset chunker stops at `CHUNK_CHARS × MAX_EPISODE_CHUNKS` =
+   * 200,000 characters; CDC stops at 80 chunks of VARIABLE length, so past 200,000 characters the two
+   * admit different text. There, an append CDC still admits churns its last chunks while legacy — which
+   * truncated both versions to the same 200,000 characters — reports churn 0: the comparison measures
+   * unequal coverage, not worse chunking (`docs/OPS.md` at 201,953 characters: CDC 2 vs legacy 0, PR #759
+   * CI). Such a pair is `excluded` (reported); a comparable pair is `within` or `violated`.
+   */
+  const envelopeVerdict = (t: string, app: string) => {
+    const [c0, c1, l0, l1] = [chunkContent(t), chunkContent(t + app), legacy(t), legacy(t + app)];
+    const cdc = changedCount(c0, c1);
+    const leg = changedCount(l0, l1);
+    const comparable = admitted(c0) === admitted(l0) && admitted(c1) === admitted(l1);
+    const verdict = !comparable ? "excluded" : cdc <= leg + 1 ? "within" : "violated";
+    return { cdc, leg, verdict };
+  };
+
   it("LIVE CORPUS: set churn never exceeds the bound, per document and per append content", () => {
     const docs = repoDocs();
     // A bound assertion over an empty or single-document corpus is green by construction.
@@ -1024,22 +1046,65 @@ describe("CDCAPPEND-1: append churn is a bound, not a number", { timeout: 30_000
     // Scoped to appends shorter than `min`, where the +1 envelope is measured on BOTH the live corpus and
     // 300 synthetic documents. For longer appends the gap reaches +2 synthetically, so it is reported by
     // the sweep and not gated here — this file does not gate on a lower bound.
+    //
+    // …and scoped to COMPARABLE ADMITTED COVERAGE (see `envelopeVerdict`). The absolute ceiling still
+    // gates every document, excluded or not.
     const docs = repoDocs();
     expect(docs.length).toBeGreaterThan(5);
     let worse = 0;
+    let compared = 0;
+    let excluded = 0;
     for (const t of docs)
       for (const len of APPEND_LENGTHS.filter((n) => n < CDC_PARAMS.min))
         for (const [name, make] of CONTENTS) {
-          const app = make(len);
-          const cdc = changedCount(chunkContent(t), chunkContent(t + app));
-          const leg = changedCount(legacy(t), legacy(t + app));
-          expect(cdc, `${name} append of ${len}: CDC is more than one chunk worse than byte offsets`).toBeLessThanOrEqual(
-            leg + 1
-          );
-          if (cdc > leg) worse++;
+          const v = envelopeVerdict(t, make(len));
+          expect(v.cdc, `${name} append of ${len} passed the absolute ceiling`).toBeLessThanOrEqual(absoluteCeiling(len));
+          if (v.verdict === "excluded") {
+            excluded++; // REPORTED, not gated: the two algorithms admitted different text
+            continue;
+          }
+          compared++;
+          expect(v.verdict, `${name} append of ${len}: CDC is more than one chunk worse than byte offsets`).toBe("within");
+          if (v.cdc > v.leg) worse++;
         }
+    // The exclusion must not swallow the corpus: the envelope still compares (nearly) every document.
+    expect(compared, "the coverage condition excluded everything — the envelope is measuring nothing").toBeGreaterThan(
+      excluded
+    );
     // The trade is real and visible rather than asserted away: CDC IS worse than byte offsets on append.
     expect(worse, "no document is worse under CDC — the envelope is measuring nothing").toBeGreaterThan(0);
+  });
+
+  it("CAP-MISMATCH WITNESS: past the legacy 200,000-char cap the comparison is excluded, never gated", () => {
+    // Pinned, deterministic: the regime `docs/OPS.md` entered at 201,953 characters (PR #759 CI), rebuilt
+    // from the fixed-seed prose generator so it does not depend on what the docs happen to weigh today.
+    const t = doc(201_953, 3);
+    const app = prose(700);
+    const legacyCap = CHUNK_CHARS * MAX_EPISODE_CHUNKS;
+    expect(legacyCap).toBe(200_000);
+    // Legacy admits the same first 200,000 characters of BOTH versions, so the append is invisible to it…
+    expect(admitted(legacy(t))).toBe(legacyCap);
+    expect(admitted(legacy(t + app))).toBe(legacyCap);
+    // …while CDC (73 chunks, under its 80-chunk cap) admits the whole of both, including the append.
+    expect(admitted(chunkContent(t))).toBe(t.length);
+    expect(admitted(chunkContent(t + app))).toBe(t.length + app.length);
+    const v = envelopeVerdict(t, app);
+    // Unconditionally applied, the +1 envelope would fail here (2 > 0 + 1) — on unequal coverage, not on
+    // worse CDC behaviour. The verdict excludes it; the absolute ceiling still bounds it.
+    expect([v.cdc, v.leg]).toEqual([2, 0]);
+    expect(v.cdc).toBeGreaterThan(v.leg + 1);
+    expect(v.verdict).toBe("excluded");
+    expect(v.cdc).toBeLessThanOrEqual(absoluteCeiling(app.length));
+    // At EXACTLY the legacy cap the original version is comparable (both admit all 200,000 characters);
+    // only the appended version's coverage diverges. BOTH versions must be compared, not just the first.
+    const atCap = doc(legacyCap, 3);
+    expect(admitted(chunkContent(atCap))).toBe(admitted(legacy(atCap)));
+    expect(admitted(chunkContent(atCap + app))).toBeGreaterThan(admitted(legacy(atCap + app)));
+    expect(envelopeVerdict(atCap, app)).toMatchObject({ leg: 0, verdict: "excluded" });
+    expect(envelopeVerdict(atCap, app).cdc).toBeGreaterThan(1);
+    // Control: the same generator below the cap is comparable, and gated — within the envelope.
+    const below = envelopeVerdict(doc(190_000, 3), app);
+    expect(below).toEqual({ cdc: 2, leg: 1, verdict: "within" });
   });
 
   it("THE ROW'S OWN CLAIM: the scenario append does not churn a constant", () => {

@@ -16,6 +16,7 @@ import {
   checkAuthSecret,
   checkDatabaseUrl,
   checkEmbeddings,
+  checkGraphStores,
   checkMailer,
   checkModelProvider,
   checkNode,
@@ -192,6 +193,64 @@ describe("embeddings width — a mismatch degrades silently at query time", () =
 
   it("accepts a configured backend at the shipped width", () => {
     expect(checkEmbeddings({ EMBEDDINGS_URL: "https://api.openai.com/v1", EMBEDDINGS_DIM: "1536" }).status).toBe(OK);
+  });
+});
+
+describe("graph stores — GRAPHITI_URL alone now fails every graph-scoped query closed", () => {
+  it("WARNS (not fails) when GRAPHITI_URL is set without NEO4J_URL, and names the fix", () => {
+    const r = checkGraphStores({ GRAPHITI_URL: "http://graphiti.railway.internal:8000" });
+    expect(r.status).toBe(WARN);
+    expect(r.detail).toMatch(/without NEO4J_URL/);
+    expect(r.detail).toMatch(/503/);
+    expect(r.fix).toMatch(/NEO4J_URL/);
+    expect(r.fix).toMatch(/README §2\.8c/);
+    // A warning alone never blocks an otherwise valid install.
+    expect(summarize([r]).exitCode).toBe(0);
+  });
+
+  it("is quiet when both stores are set", () => {
+    expect(
+      checkGraphStores({ GRAPHITI_URL: "http://localhost:8000", NEO4J_URL: "bolt://localhost:7687" }).status
+    ).toBe(OK);
+  });
+
+  it("is quiet when the graph is off, or only direct Neo4j reads are configured", () => {
+    expect(checkGraphStores({}).status).toBe(OK);
+    expect(checkGraphStores({ NEO4J_URL: "bolt://localhost:7687" }).status).toBe(OK);
+  });
+
+  it("uses the runtime's Graphiti predicate: an unparseable or non-http GRAPHITI_URL is graph-off, said as such", () => {
+    const bad = checkGraphStores({ GRAPHITI_URL: "graphiti:8000" });
+    expect(bad.status).toBe(WARN);
+    expect(bad.detail).toMatch(/not an http\(s\) URL/);
+    expect(bad.detail).not.toMatch(/NEO4J_URL/);
+    // An empty NEO4J_URL is unset to the runtime (neo4jConfigured is `!!NEO4J_URL`).
+    expect(checkGraphStores({ GRAPHITI_URL: "https://g.example.com", NEO4J_URL: "" }).status).toBe(WARN);
+  });
+
+  it("never echoes either URL — a bolt URL can carry credentials", () => {
+    for (const env of [
+      { GRAPHITI_URL: "http://user:s3cret@graphiti.internal:8000" },
+      { GRAPHITI_URL: "http://user:s3cret@graphiti.internal:8000", NEO4J_URL: "bolt://neo4j:s3cret@neo4j:7687" },
+      { GRAPHITI_URL: "s3cret-not-a-url" },
+      { NEO4J_URL: "bolt://neo4j:s3cret@neo4j:7687" },
+    ]) {
+      const r = checkGraphStores(env);
+      expect(`${r.detail} ${r.fix ?? ""}`).not.toContain("s3cret");
+    }
+  });
+
+  it("the boot hook reports the same check, as a warning that never fails boot", () => {
+    const boot = readFileSync(path.join(ROOT, "instrumentation.ts"), "utf8");
+    expect(boot).toContain('await import("@/lib/graph/config-check.mjs")');
+    expect(boot).toMatch(/checkGraphStores\(process\.env\)/);
+    const at = boot.indexOf("checkGraphStores(process.env)");
+    // After the copied-staging return (which disables every boot side effect) and before any
+    // scheduler starts, and reported with console.warn — not a throw.
+    expect(at).toBeGreaterThan(boot.indexOf("if (isCopiedStagingRuntime())"));
+    expect(at).toBeLessThan(boot.indexOf("startIngestScheduler"));
+    expect(boot.slice(at, at + 300)).toMatch(/console\.warn\(/);
+    expect(boot.slice(at, at + 300)).not.toMatch(/\bthrow\b/);
   });
 });
 

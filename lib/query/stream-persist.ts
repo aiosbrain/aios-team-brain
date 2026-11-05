@@ -7,6 +7,8 @@ import { appendMessage } from "@/lib/chat/store";
 import { generateAndSetTitle } from "@/lib/chat/title";
 import { recordLlmUsage } from "@/lib/costs/llm-usage";
 import { flushPartial, finishRun, failRun, touchRun } from "./turn-runs";
+import { QueryContextAuthorizationChangedError, requireContextAuthorization } from "./context-authorization";
+import { NON_GOOGLE_OUTPUT, withOutputPublication, type OutputProvenance } from "./output-provenance";
 
 /**
  * Run ONE answer turn to completion and persist it — independently of whether the client is still
@@ -50,6 +52,8 @@ export interface RunAnswerTurnArgs {
   now?: () => number;
   /** Liveness heartbeat interval; tests shorten it. Defaults to HEARTBEAT_MS. */
   heartbeatMs?: number;
+  /** AIO-1167 R76: the answer's FROZEN output provenance (classified before the run was created). */
+  provenance: OutputProvenance;
 }
 
 /** Partial-text flush cadence: often enough for a returning tab to see progress, rare enough to be cheap. */
@@ -97,7 +101,38 @@ export async function runAnswerTurn(args: RunAnswerTurnArgs): Promise<void> {
   // Don't hold the process open just for a heartbeat (Node-only; harmless where absent).
   heartbeat?.unref?.();
 
+  // AIO-1167 R67: every NEW publication or persistence of source-derived output — a delta and its
+  // partial flush, the stored answer and its log preview, the title request and its write — re-checks
+  // the captured authorization first. A single-row epoch read: no lock or transaction is held while
+  // the model streams. Bytes already delivered are not recalled; after a change nothing further is
+  // emitted or stored, the spend is still metered, and the run is failed with its partial CLEARED.
+  let gate: () => Promise<void> = async () => undefined;
+  const isRefusal = (e: unknown) => e instanceof QueryContextAuthorizationChangedError;
+  const accountRefused = async (usage: import("./claude").QueryUsage) => {
+    // The provider billed the answer even though it is not published: keep the accounting, never
+    // the answer (no preview, no cited items). Best-effort, so the refusal itself still surfaces.
+    try {
+      const { error } = await db.from("query_log").insert({
+        team_id: owner.teamId, member_id: owner.memberId, question,
+        input_tokens: usage.input_tokens, output_tokens: usage.output_tokens,
+        cache_read_tokens: usage.cache_read_tokens, cost_usd: usage.cost_usd, latency_ms: now() - args.startedAt,
+        // Source-free accounting: no answer, no citations — provenance 0 (R76).
+        context_authorization_epoch: NON_GOOGLE_OUTPUT.epoch,
+      });
+      if (error) throw new Error(error.message);
+      await recordLlmUsage(db, {
+        teamId: owner.teamId, memberId: owner.memberId, source: "query", provider: usage.provider,
+        model: usage.model, inputTokens: usage.input_tokens, outputTokens: usage.output_tokens,
+        costUsd: usage.cost_usd, estimated: usage.estimated,
+      });
+    } catch (e) {
+      console.error("[query] refused-turn accounting failed:", e instanceof Error ? e.message : e);
+    }
+  };
+
   try {
+    const authorization = requireContextAuthorization(ctx, owner.teamId);
+    gate = () => authorization.assertCurrent();
     for await (const chunk of streamAnswer(ctx, question, keys, historyTurns, caller, timeZone, {
       onRetry: ({ attempt, delayMs, error }) =>
         console.warn(
@@ -106,6 +141,7 @@ export async function runAnswerTurn(args: RunAnswerTurnArgs): Promise<void> {
         ),
     })) {
       if (chunk.type === "delta") {
+        await gate(); // outside the best-effort flush below, so a refusal ends the turn
         answer += chunk.text;
         send("delta", { text: chunk.text });
         // Heartbeat the run so a returning tab sees progress AND so `isRunStale` can tell a live run
@@ -114,8 +150,11 @@ export async function runAnswerTurn(args: RunAnswerTurnArgs): Promise<void> {
         if (runId && now() - lastFlush >= PARTIAL_FLUSH_MS) {
           lastFlush = now();
           try {
-            await flushPartial(db, runId, answer);
+            // R76: a protected flush commits only inside a revocation-linearized transaction, onto the
+            // run's own frozen provenance.
+            await flushPartial(db, runId, answer, { teamId: owner.teamId, provenance: args.provenance });
           } catch (e) {
+            if (isRefusal(e)) throw e; // an authorization refusal ends the turn; it is not a flush hiccup
             console.warn("[query] partial flush failed:", e instanceof Error ? e.message : e);
           }
         }
@@ -133,33 +172,69 @@ export async function runAnswerTurn(args: RunAnswerTurnArgs): Promise<void> {
       // `done`, marked the run failed even though the model had succeeded (and been billed), and left
       // the turn unlogged — resurrecting the under-bill through the DB-failure edge. Now a persistence
       // failure takes the catch below BEFORE any `done` was claimed, so the client is told the truth.
+      // R69: an authorization check is a read, not a lock — a success authorizes nothing past the next
+      // await. So EACH source-bearing step that follows an await re-checks first. Before the spend is
+      // accounted, a refusal accounts it (source-free, once); after, it only refuses.
+      let accounted = false;
+      const fence = async () => {
+        try {
+          await gate();
+        } catch (e) {
+          if (isRefusal(e) && !accounted) {
+            accounted = true;
+            await accountRefused(chunk.usage);
+          }
+          throw e;
+        }
+      };
+      await fence(); // preliminary defense only — the transaction below is the linearization point
+      // R76: the completed answer — assistant message, source-bearing log preview and the run's success —
+      // commits in ONE short transaction that share-locks the revocation epoch first and re-checks the
+      // answer's ORIGINAL epoch. A revocation that commits first means none of it is written; one that
+      // arrives while it holds the lock waits, and readers then suppress the now-obsolete output.
       let finalMessageId: string | null = null;
-      if (conversationId) {
-        finalMessageId = await appendMessage(db, owner, conversationId, "assistant", answer, {
-          cited_item_ids: sources.map((s) => s.item_id).filter((id): id is string => Boolean(id)),
-          input_tokens: chunk.usage.input_tokens,
-          output_tokens: chunk.usage.output_tokens,
-          cost_usd: chunk.usage.cost_usd,
+      try {
+        finalMessageId = await withOutputPublication(owner.teamId, args.provenance, async () => {
+          let messageId: string | null = null;
+          if (conversationId) {
+            messageId = await appendMessage(db, owner, conversationId, "assistant", answer, {
+              cited_item_ids: sources.map((s) => s.item_id).filter((id): id is string => Boolean(id)),
+              input_tokens: chunk.usage.input_tokens,
+              output_tokens: chunk.usage.output_tokens,
+              cost_usd: chunk.usage.cost_usd,
+            }, args.provenance);
+          }
+          // CHECK THE ERROR. The db adapter resolves `{ error }` instead of throwing, so an unchecked
+          // insert fails SILENTLY — leaving a persisted answer with no spend row, which is precisely the
+          // under-bill this slice exists to close. Loud (thrown → rolled back, logged + the run marked
+          // failed) beats a turn that looks complete but is invisible to the ledger.
+          const { error: logError } = await db.from("query_log").insert({
+            team_id: owner.teamId,
+            member_id: owner.memberId,
+            question,
+            answer_preview: answer.slice(0, 500),
+            cited_item_ids: sources.map((s) => s.item_id).filter(Boolean),
+            input_tokens: chunk.usage.input_tokens,
+            output_tokens: chunk.usage.output_tokens,
+            cache_read_tokens: chunk.usage.cache_read_tokens,
+            cost_usd: chunk.usage.cost_usd,
+            latency_ms: now() - args.startedAt,
+            context_authorization_epoch: args.provenance.epoch,
+          });
+          if (logError) throw new Error(`query_log insert failed: ${logError.message}`);
+          // Flip the run LAST, pointing at the message that now exists.
+          if (runId) await finishRun(db, runId, messageId);
+          return messageId;
         });
+      } catch (e) {
+        if (isRefusal(e) && !accounted) {
+          accounted = true;
+          await accountRefused(chunk.usage);
+        }
+        throw e;
       }
-
-      // CHECK THE ERROR. The db adapter resolves `{ error }` instead of throwing, so an unchecked
-      // insert fails SILENTLY — leaving a persisted answer with no spend row, which is precisely the
-      // under-bill this slice exists to close. Loud (thrown → logged + the run marked failed) beats a
-      // turn that looks complete but is invisible to the ledger.
-      const { error: logError } = await db.from("query_log").insert({
-        team_id: owner.teamId,
-        member_id: owner.memberId,
-        question,
-        answer_preview: answer.slice(0, 500),
-        cited_item_ids: sources.map((s) => s.item_id).filter(Boolean),
-        input_tokens: chunk.usage.input_tokens,
-        output_tokens: chunk.usage.output_tokens,
-        cache_read_tokens: chunk.usage.cache_read_tokens,
-        cost_usd: chunk.usage.cost_usd,
-        latency_ms: now() - args.startedAt,
-      });
-      if (logError) throw new Error(`query_log insert failed: ${logError.message}`);
+      accounted = true;
+      void finalMessageId;
 
       await recordLlmUsage(db, {
         teamId: owner.teamId,
@@ -173,10 +248,9 @@ export async function runAnswerTurn(args: RunAnswerTurnArgs): Promise<void> {
         estimated: chunk.usage.estimated,
       });
 
-      // Flip the run LAST, pointing at the message that now exists.
-      if (runId) await finishRun(db, runId, finalMessageId);
-
-      // Everything durable is written — NOW tell the client the turn is complete.
+      // Everything durable is written — NOW tell the client the turn is complete, still authorized:
+      // a refusal here takes the catch, which marks the run failed (overriding `done`) and clears it.
+      await fence();
       send("sources", { sources });
       send("done", chunk.usage);
 
@@ -185,7 +259,8 @@ export async function runAnswerTurn(args: RunAnswerTurnArgs): Promise<void> {
       // (or failing) title never delays or fails a turn that is already safely persisted.
       if (conversationId && args.createdNew) {
         try {
-          await generateAndSetTitle(db, owner, conversationId, question, answer, keys);
+          // The title request carries the answer: gated before its dispatch and before its write.
+          await generateAndSetTitle(db, owner, conversationId, question, answer, keys, args.provenance, gate);
         } catch (e) {
           console.warn("[query] title generation failed:", e instanceof Error ? e.message : e);
         }
@@ -200,7 +275,8 @@ export async function runAnswerTurn(args: RunAnswerTurnArgs): Promise<void> {
     send("error", { message });
     if (runId) {
       try {
-        await failRun(db, runId, message);
+        // A refused turn keeps no readable partial answer (R67): cleared through the run owner.
+        await failRun(db, runId, message, isRefusal(e) ? { clearPartial: true } : {});
       } catch (err) {
         console.error("[query] failed to record run failure:", err instanceof Error ? err.message : err);
       }

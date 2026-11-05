@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { NON_GOOGLE_OUTPUT } from "@/lib/query/output-provenance";
 import { randomUUID } from "node:crypto";
 import { db, seedTeam } from "./helpers";
 import {
@@ -34,10 +35,10 @@ describe("chat search (data-mechanics)", () => {
     const seed = await seedTeam();
     const owner = { teamId: seed.teamId, memberId: seed.memberId };
     const target = await createConversation(db(), owner, "Deploy chat");
-    await appendMessage(db(), owner, target!.id, "user", "how do I fix the photosynthesis pipeline?");
-    await appendMessage(db(), owner, target!.id, "assistant", "adjust the chlorophyll settings");
+    await appendMessage(db(), owner, target!.id, "user", "how do I fix the photosynthesis pipeline?", {}, NON_GOOGLE_OUTPUT);
+    await appendMessage(db(), owner, target!.id, "assistant", "adjust the chlorophyll settings", {}, NON_GOOGLE_OUTPUT);
     const other = await createConversation(db(), owner, "Unrelated");
-    await appendMessage(db(), owner, other!.id, "user", "something about railway deploys");
+    await appendMessage(db(), owner, other!.id, "user", "something about railway deploys", {}, NON_GOOGLE_OUTPUT);
 
     const hits = await searchConversations(db(), owner, "photosynthesis");
     expect(hits.map((c) => c.id)).toEqual([target!.id]);
@@ -47,7 +48,7 @@ describe("chat search (data-mechanics)", () => {
     const seed = await seedTeam();
     const owner = { teamId: seed.teamId, memberId: seed.memberId };
     const c = await createConversation(db(), owner, "Kubernetes migration plan");
-    await appendMessage(db(), owner, c!.id, "user", "hi");
+    await appendMessage(db(), owner, c!.id, "user", "hi", {}, NON_GOOGLE_OUTPUT);
     const hits = await searchConversations(db(), owner, "kubernetes");
     expect(hits.map((x) => x.id)).toContain(c!.id);
   });
@@ -58,7 +59,7 @@ describe("chat search (data-mechanics)", () => {
     const otherId = await secondMember(seed.teamId);
     const other = { teamId: seed.teamId, memberId: otherId };
     const theirs = await createConversation(db(), other, "Theirs");
-    await appendMessage(db(), other, theirs!.id, "user", "the photosynthesis secret plan");
+    await appendMessage(db(), other, theirs!.id, "user", "the photosynthesis secret plan", {}, NON_GOOGLE_OUTPUT);
 
     expect(await searchConversations(db(), owner, "photosynthesis")).toEqual([]);
   });

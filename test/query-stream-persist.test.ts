@@ -1,5 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { RetrievedContext } from "@/lib/query/retrieve";
+import { ContextAuthorization } from "@/lib/query/context-authorization";
+import type { DbClient } from "@/lib/db/types";
 
 // Spec: docs/design/query-background-stream.md — acceptance criteria 2 and 5.
 // The turn must complete and persist EXACTLY ONCE even when the client vanishes mid-answer (which
@@ -18,6 +20,12 @@ vi.mock("@/lib/query/claude", () => ({ streamAnswer: (...a: unknown[]) => stream
 vi.mock("@/lib/chat/store", () => ({ appendMessage: (...a: unknown[]) => appendMessageMock(...a) }));
 vi.mock("@/lib/chat/title", () => ({ generateAndSetTitle: (...a: unknown[]) => generateAndSetTitleMock(...a) }));
 vi.mock("@/lib/costs/llm-usage", () => ({ recordLlmUsage: (...a: unknown[]) => recordLlmUsageMock(...a) }));
+// The unit tier has no database: the R76 publication transaction runs its body directly here (its
+// revocation linearization is pinned against real Postgres in query-output-provenance.datamechanics).
+vi.mock("@/lib/query/output-provenance", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/query/output-provenance")>()),
+  withOutputPublication: async (_team: string, _provenance: unknown, fn: () => Promise<unknown>) => fn(),
+}));
 vi.mock("@/lib/query/turn-runs", () => ({
   flushPartial: (...a: unknown[]) => flushPartialMock(...a),
   finishRun: (...a: unknown[]) => finishRunMock(...a),
@@ -53,7 +61,11 @@ function fakeDb(opts: { failInsertOn?: string } = {}) {
   };
 }
 
-const ctx = { sources: [], structured: "", grounded: true } as unknown as RetrievedContext;
+// A context really captured for the owner's team (R66/R67): `runAnswerTurn` refuses any other.
+const ctx = {
+  sources: [], structured: "", grounded: true,
+  authorization: await ContextAuthorization.capture({} as DbClient, "team-1"),
+} as unknown as RetrievedContext;
 
 function baseArgs(db: ReturnType<typeof fakeDb>, send: (e: string, d: unknown) => void) {
   return {
@@ -71,6 +83,7 @@ function baseArgs(db: ReturnType<typeof fakeDb>, send: (e: string, d: unknown) =
     startedAt: 0,
     send,
     now: () => 1_000_000,
+    provenance: { epoch: 0 },
   };
 }
 

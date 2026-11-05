@@ -38,9 +38,40 @@ export async function issueKeyFor(seed: Seed, tier: "team" | "external"): Promis
     const { placeMemberByTier } = await import("../datamechanics/helpers");
     await placeMemberByTier(seed.teamId, data.id as string, "external");
     memberId = (data as { id: string }).id;
+    // An active roster mutation marks the team's identity authority repair PENDING (by design: until it
+    // converges, attribution-dependent reads answer 503). Converge it before handing the viewer back.
+    await convergeIdentityRepairComplete(seed);
   }
   const { key } = await issueApiKey(db(), seed.teamId, memberId, `${tier} key`);
   return { key };
+}
+
+/** The team's identity authority repair status (`complete` when no authority row exists yet). */
+export async function identityRepairStatus(seed: Seed): Promise<string> {
+  const { data, error } = await db().from("team_identity_authority").select("repair_status")
+    .eq("team_id", seed.teamId).maybeSingle();
+  if (error) throw new Error(`identity authority read failed: ${error.message}`);
+  return (data as { repair_status?: string } | null)?.repair_status ?? "complete";
+}
+
+/**
+ * Drive the team's identity repair to `complete` through the PRODUCTION repair owner — the
+ * data-mechanics `convergeIdentityAttribution` pattern — and fail the fixture if it does not get there.
+ *
+ * One call is not enough over a real socket: the running server is a second repair owner (a write it
+ * served kicks a background turn), and while it holds the team's turn this process's call returns
+ * `continuing` with the row still `pending`/`awaiting_cache`. So the call is repeated, bounded, until
+ * the authority row reads `complete`; anything else is a fixture failure, never a silent 503 later.
+ */
+export async function convergeIdentityRepairComplete(seed: Seed): Promise<void> {
+  const { convergeIdentityAttribution } = await import("../datamechanics/helpers");
+  let status = await identityRepairStatus(seed);
+  for (let attempt = 0; status !== "complete" && attempt < 40; attempt++) {
+    if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, 50));
+    await convergeIdentityAttribution(seed);
+    status = await identityRepairStatus(seed);
+  }
+  if (status !== "complete") throw new Error(`identity repair fixture did not converge: ${status}`);
 }
 
 /** Issue a key for a fresh team-tier ADMIN member on the seeded team (for admin-gated route tests). */

@@ -29,6 +29,7 @@ export const INGEST_LEG_SOURCES: readonly string[] = [
   "context_backfill_all",
   "dense",
   "doc_task_infer",
+  "gdrive",
   "github",
   "graph_health",
   "graph_project",
@@ -134,6 +135,7 @@ export const BEAT_SCOPE_BY_SOURCE: Readonly<Record<string, BeatScope>> = {
   context_backfill_all: "global",
   dense: "global",
   doc_task_infer: "team",
+  gdrive: "team", // scheduled/manual/retry coordinator outcomes are all recorded per team
   github: "global",
   graph_health: "global",
   graph_project: "global",

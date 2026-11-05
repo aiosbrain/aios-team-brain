@@ -1,0 +1,976 @@
+"""Bounded, cancellable Drive watch renewal under the execution fence (AIO-1167 R41, AC-04/AC-07).
+
+The scheduler's renewal sweep calls :func:`renew_watches`. For every enabled Drive connection it
+acquires the same execution authority as polling, then:
+
+1. **Recovers** what earlier sweeps left: an intent never marked dispatched is retired (nothing was
+   sent); a ``dispatched`` record nobody owns any more is ``uncertain``; an uncertain attempt with a
+   resource id observed for it (an early notification, a late response) becomes ``cleanup_pending``;
+   anything past the bound of its life is ``expired``.
+2. **Creates** a channel for each stream whose newest active channel is missing or due — at most a
+   bounded number per sweep, never while a stream already has the maximum of unresolved attempts
+   (polling covers it meanwhile), and always: durable ``prepared`` intent → fenced ``dispatched``
+   marker → ONE provider request in a worker thread → validated, fenced ``active``. The account hold
+   and the drive's creation minimum are re-checked after each publication, on the event loop before
+   the worker starts the request, and once more after the manager's live authority check returns —
+   immediately before ``request.execute``, because that check can block while an abandoned worker
+   journals a restriction. The authority answer keeps its precedence; a refused attempt was never
+   sent and retires as such.
+3. **Cleans up** known channels that must be stopped, within a reserved allowance. The account hold
+   and the channel's stop minimum are checked the same way — before the worker starts and again after
+   the live authority check. A refused stop was never sent: the channel stays ``cleanup_pending``
+   with its stop attempts unchanged; an account hold ends that account's cleanup for the sweep, a
+   channel's minimum defers only that channel. The manager enforces the run's absolute deadline
+   after its gate and immediately before the request; a stop that reaches the deadline — refused by
+   that guard, or still queued, blocked or in flight — is not a failed attempt: nothing is published
+   and cleanup ends.
+
+Every lifecycle change is published to the brain under the fence via the renewal-owned ``watches``
+section (``connector_state.renewal_document``): renewal can never touch a cursor, and a stale
+renewal can publish nothing. The local ``webhook_channels`` rows are written only after a
+publication the brain acknowledged — they are a projection, rebuilt from the brain at the start of
+every sweep.
+
+Blocking work — client construction, credential refresh, the live authority check, the provider
+call — runs in a small pool OWNED by this module, under one absolute run deadline, so the event loop
+and every other scheduler job stay responsive. SQLite is touched only from the event loop. A worker
+that is still running when its deadline passes cannot be stopped; it is abandoned, not trusted: its
+result can only ever add cleanup evidence for its attempt (never activation) or, for a quota answer,
+the verified account's local hold (published later, under fresh authority), and the resources it
+uses are closed only once it has finished.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import dataclasses
+import logging
+import secrets
+import threading
+import time
+import uuid
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Callable
+
+from . import brain_client
+from .brain_client import BrainClient, BrainError
+from .config import BrainSettings, Connection
+from .connector_state import renewal_document
+from .engine import IngestSummary
+from .gdrive_sync import (
+    WATCH_CREATE_RESOURCE, WATCH_STOP_RESOURCE,
+    ServiceAccountBindingRefused, _adopt_remote_restriction_evidence, _flush_restriction_evidence,
+    _operation_restricted, _restrict_operation,
+    _standing_account_hold, oauth_account_namespace, provider_source_options, service_account_namespace,
+)
+from .selections import bind_local_gdrive, effective_gdrive_connection
+from .state import StateStore, StreamKey, verification_hash
+from .watch_lifecycle import (
+    ACTIVE, CLEANUP_PENDING, DISPATCHED, EXPIRED, PENDING_STATES, PREPARED, RETIRED, UNCERTAIN,
+    InvalidWatchResponse, WatchNotDispatched, WatchProviderMinimum, WatchQuotaLimited, WatchRecord, WatchRefused,
+    WatchStopSetupFailed,
+    from_section, now_iso, parse_instant, requested_expiry, to_section, transition,
+    validate_watch_response,
+)
+
+log = logging.getLogger(__name__)
+
+# One connection's whole renewal — authority, broker, recovery, creation, cleanup and every
+# checkpoint delivery — fits in this absolute budget.
+WATCH_RUN_SECONDS = 60.0
+# The last part of that budget is reserved for stopping known channels.
+WATCH_CLEANUP_SECONDS = 10.0
+# Creations and stops a single sweep may start, across all connections.
+MAX_CREATES_PER_SWEEP = 4
+MAX_STOPS_PER_SWEEP = 2
+# A stream with this many attempts whose outcome is unknown gets no new one until they resolve.
+MAX_UNRESOLVED_PER_STREAM = 2
+# Stop attempts per channel; afterwards it is left to expire at the bound of its life.
+MAX_STOP_ATTEMPTS = 5
+RENEWAL_SKEW_SECONDS = 600
+# The scheduler's default sweep interval (`schedule --renewal-interval`).
+DEFAULT_SWEEP_SECONDS = 1800
+
+
+def renewal_window_seconds(sweep_seconds: float) -> float:
+    """How long before expiry a channel must be renewed (AIO-1167 R44 C8).
+
+    The NEXT sweep may start up to one interval later and needs one run budget to publish a
+    successor, so the window is interval + run budget + the safety skew. With the default 1800 s
+    sweep a channel is renewed with ~41 minutes left, and the following sweep still lands at least
+    the skew before expiry. A skew-only window let a sweep 11 minutes out skip it and the next one
+    arrive after the channel had already expired.
+    """
+    return max(0.0, float(sweep_seconds)) + WATCH_RUN_SECONDS + RENEWAL_SKEW_SECONDS
+
+_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="gdrive-watch")
+
+
+async def _wait_bounded(awaitable: Any, timeout: float) -> Any:
+    """Wait for a worker's result for at most ``timeout`` seconds (``asyncio.TimeoutError`` after).
+
+    The one place a blocking step's deadline is enforced — a seam, so tests decide exactly when
+    the deadline passes instead of racing a wall clock.
+    """
+    return await asyncio.wait_for(awaitable, timeout=timeout)
+
+
+class _AccountQuotaHeld(Exception):
+    """A watch creation or stop met the account's quota (R51 final 3): no further watch call is made
+    for this account in this sweep. ``deferral`` is the polling owner's ``ProviderDeferred``."""
+
+    def __init__(self, deferral: Any):
+        super().__init__("watch account quota")
+        self.deferral = deferral
+
+
+async def _publish_watch_restrictions(run: "_Run", conn: Connection, account_id: str) -> None:
+    """Publish the account's standing provider minimums from renewal through the coordinator's ONE
+    restriction owner (R51 final 3): onto the latest acknowledged document, under this execution's
+    fence and progress revision, adding or extending only. A failed or lost acknowledgment keeps the
+    local journal and is reported unpublished; under the uncertainty latch nothing is sent; a terminal
+    authority refusal is reported, not raised. One attempt, never a loop."""
+    report = IngestSummary(conn.name, failure_categories={}, integration_id=run.execution.integration_id)
+    try:
+        await run.bounded(_flush_restriction_evidence(
+            run.client, run.execution, run.state, account_id, report,
+        ))
+    except WatchStepTimeout:
+        report.failure_categories["account_hold_unpublished"] = 1
+    if report.failure_categories:
+        log.warning(
+            "Drive watch renewal for %s: restriction evidence %s",
+            conn.name, ", ".join(sorted(report.failure_categories)),
+        )
+
+
+async def _publish_watch_operation_minima(run: "_Run", conn: Connection, account_id: str) -> None:
+    """Publish the OPERATION minima a sweep journaled (AIO-1167 final review A4) — and nothing else.
+
+    Account holds keep their own publication rule: a timely quota answer publishes through
+    ``_publish_watch_restrictions``; a late (abandoned-worker) quota answer is journaled locally, blocks
+    every later call at once, and publishes only on the next fresh acquisition. So this carries the
+    acknowledged account holds unchanged and adds only local resource/operation minima, under this
+    execution's live fence. One attempt: a failed or lost acknowledgment, a timeout or a terminal
+    authority refusal keeps the local journal and is reported unpublished, never raised; under the
+    uncertainty latch nothing is sent. A no-op when no operation minimum is outstanding."""
+    from .gdrive_sync import _RESOURCE_UNPUBLISHED, _publish_restriction_evidence, _restriction_outstanding
+
+    if _RESOURCE_UNPUBLISHED not in _restriction_outstanding(run.state, run.execution):
+        return
+    report = IngestSummary(conn.name, failure_categories={}, integration_id=run.execution.integration_id)
+    try:
+        await run.bounded(_publish_restriction_evidence(
+            run.client, run.execution, run.state, account_id, report, local_holds=False,
+        ))
+    except WatchStepTimeout:
+        report.failure_categories[_RESOURCE_UNPUBLISHED] = 1
+    except BrainError as error:  # a terminal authority refusal: kept locally, reported, not raised
+        report.failure_categories[_RESOURCE_UNPUBLISHED] = 1
+        report.failure_categories[error.code] = 1
+    if report.failure_categories:
+        log.warning(
+            "Drive watch renewal for %s: operation minima %s",
+            conn.name, ", ".join(sorted(report.failure_categories)),
+        )
+
+
+class WatchStepTimeout(Exception):
+    """A blocking step outlived the run deadline. ``started``: whether it ever began."""
+
+    def __init__(self, started: bool):
+        super().__init__("watch step deadline exceeded")
+        self.started = started
+
+
+@dataclass
+class _Budget:
+    creates: int = MAX_CREATES_PER_SWEEP
+    stops: int = MAX_STOPS_PER_SWEEP
+    # The configured sweep interval: decides how early a channel is due (R44 C8).
+    sweep_seconds: float = DEFAULT_SWEEP_SECONDS
+
+
+@dataclass
+class _Run:
+    """One connection's renewal: its deadline, its fenced publication and its workers."""
+
+    client: BrainClient
+    execution: Any
+    state: StateStore
+    team: str
+    deadline: float
+    records: dict[str, WatchRecord]
+    running: list[Future] = field(default_factory=list)
+
+    def remaining(self) -> float:
+        return self.deadline - time.monotonic()
+
+    async def bounded(self, awaitable: Any) -> Any:
+        remaining = self.remaining()
+        if remaining <= 0:
+            if asyncio.iscoroutine(awaitable):
+                awaitable.close()
+            raise WatchStepTimeout(started=False)
+        try:
+            return await asyncio.wait_for(awaitable, timeout=remaining)
+        except asyncio.TimeoutError:
+            raise WatchStepTimeout(started=True) from None
+
+    async def offload(
+        self, fn: Callable[[], Any], *, on_late: Callable[[Future], None] | None = None,
+        deadline: float | None = None,
+    ) -> Any:
+        """Run one blocking step in the owned pool, bounded by ``deadline`` (default: the run's).
+
+        A step that never started is cancelled outright — nothing was done. A step already running
+        cannot be interrupted: it is abandoned, its outcome handed to ``on_late`` (from its own
+        thread) and its resources kept open until it ends. Cancellation of this coroutine is never
+        swallowed.
+        """
+        remaining = (deadline if deadline is not None else self.deadline) - time.monotonic()
+        if remaining <= 0:
+            raise WatchStepTimeout(started=False)
+        future = _POOL.submit(fn)
+        self.running.append(future)
+        future.add_done_callback(lambda done: self.running.remove(done) if done in self.running else None)
+        try:
+            return await _wait_bounded(asyncio.shield(asyncio.wrap_future(future)), remaining)
+        except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+            started = not future.cancel()
+            if started and on_late is not None:
+                future.add_done_callback(on_late)
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            raise WatchStepTimeout(started=started) from None
+
+    async def publish(self, *changed: WatchRecord) -> None:
+        """Publish lifecycle changes under the fence, then project them locally.
+
+        Raises when the brain refuses (stale authority) or cannot be reached in time: nothing is
+        projected then, and the next sweep starts again from what the brain holds.
+        """
+        updated = dict(self.records)
+        for record in changed:
+            updated[record.attempt_id] = record
+        document = renewal_document(self.execution.progress, to_section(updated))
+        ack = await self.bounded(self.client.checkpoint_gdrive_execution(self.execution, document)) or {}
+        acknowledged = dict(ack.get("progress") or document)
+        self.execution.progress.clear()
+        self.execution.progress.update(acknowledged)
+        self.records = updated
+        for record in changed:
+            self.state.save_watch_record(record)
+
+
+def _close_when_idle(run: _Run | None, closers: list[Callable[[], None]]) -> None:
+    """Close shared resources now, or once the last abandoned worker using them has finished."""
+    pending = [future for future in (run.running if run else []) if not future.done()]
+    lock = threading.Lock()
+    closed = [False]
+
+    def close_all(*_args: Any) -> None:
+        if any(not future.done() for future in pending):
+            return
+        with lock:
+            if closed[0]:
+                return
+            closed[0] = True
+        for close in closers:
+            try:
+                close()
+            except Exception:
+                pass
+
+    if not pending:
+        close_all()
+        return
+    for future in pending:
+        future.add_done_callback(close_all)
+
+
+def _on_loop(loop: asyncio.AbstractEventLoop, fn: Callable[..., Any], *args: Any) -> None:
+    """Hand one SQLite step from a worker thread back to the event loop that owns the StateStore."""
+    try:
+        loop.call_soon_threadsafe(fn, *args)
+    except RuntimeError:  # the loop is gone; nothing can be journaled from here
+        pass
+
+
+def _journal_late_hold(
+    state: StateStore, connection_id: str, generation: int, account_id: str, deferral: Any,
+) -> None:
+    """Journal an abandoned watch worker's quota answer as the account's hold (AIO-1167 final review).
+
+    Runs on the event loop. The existing monotonic owner (``hold_connection``) is used, so a later,
+    shorter answer never shortens a standing hold, and only the verified account the worker's
+    transport used is held. Nothing is published, activated, retired or advanced here: the hold is
+    published by the next acquisition that holds fresh authority (``_publish_watch_restrictions``)."""
+    not_before = getattr(deferral, "not_before", None)
+    if not not_before or not account_id:
+        return
+    try:
+        state.hold_connection(
+            connection_id, generation, account_id, str(not_before),
+            str(getattr(deferral, "category", None) or "rate_limited"),
+        )
+    except Exception as exc:  # a closed store: the evidence is lost, never misreported
+        log.warning("Drive watch late quota evidence could not be journaled: %s", type(exc).__name__)
+
+
+def _journal_late_restriction(
+    state: StateStore, connection_id: str, generation: int, account_id: str, resource: str, deferral: Any,
+) -> None:
+    """Journal an abandoned watch worker's NON-quota provider minimum for its operation (A4), on the
+    event loop, through the monotonic resource owner. Nothing is published or activated here."""
+    not_before = getattr(deferral, "not_before", None)
+    if not getattr(deferral, "provider_deadline", False) or not not_before or not account_id:
+        return
+    try:
+        state.restrict_document(
+            connection_id, generation, account_id, resource, str(not_before),
+            str(getattr(deferral, "category", None) or "provider_unavailable"),
+            unrepresentable=getattr(deferral, "diagnostic", None) == "retry_after_unrepresentable",
+        )
+    except Exception as exc:  # a closed store: the evidence is lost, never misreported
+        log.warning("Drive watch late operation minimum could not be journaled: %s", type(exc).__name__)
+
+
+def _late_evidence(
+    loop: asyncio.AbstractEventLoop, state: StateStore, record: WatchRecord | None,
+    *, hold: tuple[str, int, str] | None = None,
+    operation: tuple[str, int, str, str] | None = None,
+) -> Callable[[Future], None]:
+    """What an abandoned worker's eventual result may do — creation or stop.
+
+    It runs in the worker's thread, so every SQLite write is handed back to the event loop. A late
+    creation response can show that a channel exists (and how to stop it); it can never activate
+    one. A late ``WatchQuotaLimited`` — from a creation or a stop — is the ACCOUNT's quota: it is
+    journaled as a hold for ``hold`` = ``(connection_id, generation, account_id)``, the verified
+    account of the transport that made the call (captured when it was dispatched, never derived from
+    an older channel record). A cancelled future, a non-quota error, or a worker that never started
+    adds nothing.
+    """
+    def deliver(future: Future) -> None:
+        if future.cancelled():
+            return
+        error = future.exception()
+        if isinstance(error, WatchQuotaLimited):
+            if hold is not None:
+                _on_loop(loop, _journal_late_hold, state, *hold, error.deferral)
+            return
+        if isinstance(error, WatchProviderMinimum):
+            # A named non-quota minimum for THIS operation (A4): `operation` =
+            # `(connection_id, generation, account_id, resource)`, captured at dispatch.
+            if operation is not None:
+                _on_loop(loop, _journal_late_restriction, state, *operation, error.deferral)
+            return
+        if error is not None or record is None:
+            return
+        response = future.result()
+        resource_id = response.get("resourceId") if isinstance(response, dict) else None
+        if not isinstance(resource_id, str) or not resource_id:
+            return
+        # The record stays uncertain until the next owner sees this and stops the channel.
+        _on_loop(loop, state.record_watch_evidence, record.connection, record.attempt_id, resource_id)
+    return deliver
+
+
+def _account_held(run: "_Run", account_id: str) -> bool:
+    """Whether a hold now stands for this account — including one a late worker's quota answer just
+    journaled on this loop — so the sweep makes no further watch call for it."""
+    return _standing_account_hold(
+        run.state, run.execution.integration_id, run.execution.generation, account_id,
+    ) is not None
+
+
+def _creation_refusal(run: "_Run", account_id: str, drive_id: str) -> str | None:
+    """Why a channel may NOT be requested for this account/drive right now, or ``None`` (R51 AC-04).
+
+    Event loop only: it reads the one restriction owner — the account hold and the
+    `watch-create:<drive>` minimum — including evidence a late worker's callback journaled on this
+    loop a moment ago. The answer is the not-dispatched reason the attempt is retired with."""
+    if _account_held(run, account_id):
+        return "not dispatched: the account's provider quota hold stands"
+    if _operation_restricted(run.state, run.execution, account_id, f"{WATCH_CREATE_RESOURCE}{drive_id}"):
+        return "not dispatched: a provider minimum for creating a channel on this drive stands"
+    return None
+
+
+class _StopNotSent(Exception):
+    """A cleanup stop refused by restriction admission before its request was executed (R51 AC-04).
+
+    ``scope`` is ``"account"`` (the account's quota hold — no further same-account cleanup this
+    sweep), ``"operation"`` (this channel's stop minimum — the other channels go on) or
+    ``"unconfirmed"`` (admission could not be answered in time — cleanup ends for this sweep)."""
+
+    def __init__(self, scope: str):
+        super().__init__(f"stop not sent: {scope}")
+        self.scope = scope
+
+
+def _stop_refusal(run: "_Run", account_id: str, stop_operation: str) -> str | None:
+    """Event loop only: why a stop may NOT be sent now under the one restriction owner, or ``None``."""
+    if _account_held(run, account_id):
+        return "account"
+    if _operation_restricted(run.state, run.execution, account_id, stop_operation):
+        return "operation"
+    return None
+
+
+def _ask_loop(loop: asyncio.AbstractEventLoop, fn: Callable[[], Any], timeout: float) -> Any:
+    """From a worker thread: run ``fn`` on the event loop that owns the StateStore and wait for its
+    answer, at most ``timeout`` seconds. Raises when the loop is gone or does not answer in time; the
+    request is then withdrawn, so ``fn`` never runs late."""
+    answer: Future = Future()
+
+    def evaluate() -> None:
+        if not answer.set_running_or_notify_cancel():
+            return
+        try:
+            answer.set_result(fn())
+        except BaseException as exc:  # handed back to the worker, never lost
+            answer.set_exception(exc)
+
+    loop.call_soon_threadsafe(evaluate)
+    try:
+        return answer.result(timeout=max(0.0, timeout))
+    except BaseException:
+        answer.cancel()
+        raise
+
+
+def _past(instant: str | None, now: datetime) -> bool:
+    parsed = parse_instant(instant)
+    return parsed is not None and parsed <= now
+
+
+async def _recover(run: _Run, connection: str, now: datetime) -> None:
+    changed: list[WatchRecord] = []
+    for record in sorted(run.records.values(), key=lambda r: r.attempt_id):
+        if record.connection != connection or record.terminal:
+            continue
+        if record.state == PREPARED:
+            # Never marked dispatched under the fence, so it was never sent.
+            changed.append(transition(record, RETIRED, detail="intent abandoned before dispatch"))
+        elif record.state == DISPATCHED:
+            # This sweep holds the lease, so the worker that dispatched it is gone without a
+            # published outcome: the channel may exist — and if Google has already named its
+            # resource (early notification, late response), it does, and is stopped.
+            evidence = run.state.watch_evidence(record.connection, record.attempt_id)
+            if evidence:
+                changed.append(transition(
+                    record, CLEANUP_PENDING, resource_id=evidence,
+                    detail="observed after its outcome was lost; stopping",
+                ))
+            else:
+                changed.append(transition(record, UNCERTAIN, detail="dispatch outcome lost"))
+        elif record.state == UNCERTAIN:
+            evidence = run.state.watch_evidence(record.connection, record.attempt_id)
+            if evidence:
+                changed.append(transition(
+                    record, CLEANUP_PENDING, resource_id=evidence,
+                    detail="observed after an unknown outcome; stopping",
+                ))
+            elif _past(record.requested_expiry, now):
+                changed.append(transition(record, EXPIRED, detail="past its requested expiry"))
+        elif record.state in (ACTIVE, CLEANUP_PENDING) and _past(record.life_bound(), now):
+            changed.append(transition(record, EXPIRED, detail="past its expiry"))
+    if changed:
+        await run.publish(*changed)
+
+
+def _streams(execution: Any) -> list[tuple[str, str]]:
+    """``(drive_id, cursor)`` for every stream the brain's checkpoint holds. Read, never written."""
+    progress = execution.progress
+    stream_map = progress.get("streams")
+    if isinstance(stream_map, dict):
+        streams = [(str(drive), dict(stream)) for drive, stream in stream_map.items() if isinstance(stream, dict)]
+    else:
+        streams = [(str(progress.get("drive_id") or ""), dict(progress))]
+    return [
+        (drive, str(stream.get("page_token") or stream.get("baseline_start_token") or ""))
+        for drive, stream in streams
+        if drive and (stream.get("page_token") or stream.get("baseline_start_token"))
+    ]
+
+
+def _publish_reserve() -> float:
+    """Time kept back from a provider call to publish its outcome under the fence."""
+    return min(5.0, WATCH_RUN_SECONDS * 0.25)
+
+
+def _due(expires_at: str | None, now: datetime, sweep_seconds: float = DEFAULT_SWEEP_SECONDS) -> bool:
+    parsed = parse_instant(expires_at)
+    return parsed is None or (parsed - now).total_seconds() <= renewal_window_seconds(sweep_seconds)
+
+
+async def _create(
+    run: _Run, manager: Any, conn: Connection, *, account_id: str, drive_id: str, cursor: str,
+    namespace: str, predecessor: str | None, access_token: str | None, provider_gate: Any,
+    ttl_seconds: int,
+) -> None:
+    token = secrets.token_urlsafe(32)
+    intent = WatchRecord(
+        attempt_id=str(uuid.uuid4()), connection=conn.name,
+        integration_id=run.execution.integration_id, account_id=account_id, drive_id=drive_id,
+        generation=int(run.execution.generation), namespace=namespace,
+        verification_hash=verification_hash(token), requested_expiry=requested_expiry(ttl_seconds),
+        predecessor=predecessor, state=PREPARED,
+    )
+    # 1. The intent is durable before anything else happens.
+    await run.publish(intent)
+    # Admission is decided again after every publication wait (R51 AC-04): while it was in flight an
+    # abandoned worker of an earlier sweep may have answered with the account's quota or a minimum for
+    # creating on this drive, journaled on this loop. Nothing has been sent, so the attempt retires
+    # with the accurate reason; if that retirement cannot be published, its failure ends this run and
+    # the last acknowledged record is recovered by the next sweep — nothing unacknowledged is projected.
+    refusal = _creation_refusal(run, account_id, drive_id)
+    if refusal is not None:
+        await run.publish(transition(intent, RETIRED, detail=refusal))
+        return
+    # 2. The dispatch marker: a fenced write, so a paused, replaced or revoked execution stops here,
+    #    and a record that from now on says a channel MAY exist.
+    dispatched = transition(intent, DISPATCHED)
+    await run.publish(dispatched)
+    refusal = _creation_refusal(run, account_id, drive_id)
+    if refusal is not None:
+        # Still provably unsent: the request has not even been handed to a worker.
+        await run.publish(transition(dispatched, RETIRED, detail=refusal))
+        return
+    loop = asyncio.get_running_loop()
+    # The provider call ends early enough that its outcome — whatever it is — can still be
+    # published inside the run deadline.
+    dispatch_deadline = run.deadline - _publish_reserve()
+
+    def confirm_admission() -> None:
+        # Asked from the worker, answered on the loop that owns the StateStore. A refusal, or no
+        # answer, means the request is never sent: `WatchNotDispatched` retires the attempt.
+        try:
+            refused = _ask_loop(
+                loop, lambda: _creation_refusal(run, account_id, drive_id),
+                dispatch_deadline - time.monotonic(),
+            )
+        except Exception:
+            raise WatchNotDispatched("not dispatched: admission could not be confirmed") from None
+        if refused is not None:
+            raise WatchNotDispatched(refused)
+
+    def admitted_gate() -> None:
+        # The manager calls its provider gate immediately before `request.execute`, and the live
+        # authority check inside it can block — long enough for an abandoned worker to journal the
+        # account's quota or this drive's creation minimum. So admission is decided once more AFTER
+        # that check returns: the authority answer keeps its precedence, and a restriction that landed
+        # meanwhile still stops the request before it is sent.
+        if provider_gate is not None:
+            provider_gate()
+        confirm_admission()
+
+    def dispatch_when_admitted() -> Any:
+        # A queued worker may start only after an abandoned one has finished — and journaled its
+        # restriction — so admission is asked before any client work too.
+        confirm_admission()
+        return manager.dispatch(
+            dispatched, page_token=cursor, verification_token=token,
+            access_token=access_token, provider_gate=admitted_gate, deadline=dispatch_deadline,
+        )
+
+    try:
+        response = await run.offload(
+            dispatch_when_admitted,
+            on_late=_late_evidence(
+                loop, run.state, dispatched,
+                hold=(run.execution.integration_id, int(run.execution.generation), account_id),
+                operation=(
+                    run.execution.integration_id, int(run.execution.generation), account_id,
+                    f"{WATCH_CREATE_RESOURCE}{drive_id}",
+                ),
+            ),
+            deadline=dispatch_deadline,
+        )
+    except asyncio.CancelledError:
+        # Further dispatch stops. The durable ``dispatched`` record is recovered as uncertain by
+        # the next sweep; a late response can only become cleanup evidence.
+        raise
+    except WatchStepTimeout as timeout:
+        if not timeout.started:
+            await run.publish(transition(dispatched, RETIRED, detail="deadline reached before dispatch"))
+        else:
+            await run.publish(transition(dispatched, UNCERTAIN, detail="no response before the run deadline"))
+        return
+    except WatchNotDispatched as exc:
+        await run.publish(transition(dispatched, RETIRED, detail=str(exc)))
+        if isinstance(exc.__cause__, BrainError):
+            raise exc.__cause__  # the live authority check refused: nothing more for this connection
+        return
+    except WatchQuotaLimited as exc:
+        # Definitive — nothing was created — so this attempt retires; but the answer is the
+        # ACCOUNT's quota (R51 final 3): renewal stops here and the hold is journaled and published.
+        # Creation is never retried automatically; the predecessor and the cursor are untouched.
+        # The hold is journaled BEFORE the retirement is published (R51 F2): if that publication
+        # fails, times out, loses its acknowledgment, is refused or is cancelled, its own outcome
+        # propagates unchanged and ends this connection's run — nothing is projected, no further
+        # watch call is made — while the local hold still blocks polling and renewal until
+        # Retry-After. A fresh acquisition publishes it through the shared restriction owner.
+        # (The outer handler's second, monotonic write on success is harmless.)
+        deferral = exc.deferral
+        run.state.hold_connection(
+            run.execution.integration_id, run.execution.generation, account_id,
+            str(deferral.not_before), str(getattr(deferral, "category", "rate_limited")),
+        )
+        await run.publish(transition(dispatched, RETIRED, detail="provider quota limited"))
+        raise _AccountQuotaHeld(deferral) from exc
+    except WatchRefused as exc:
+        await run.publish(transition(dispatched, RETIRED, detail=f"provider refused ({exc.status})"))
+        return
+    except WatchProviderMinimum as exc:
+        # A non-quota answer naming a provider minimum (A4). The outcome stays UNKNOWN — a 503 is no
+        # proof nothing was created, and creation is never resent blindly — and the minimum restricts
+        # creation on THIS account/drive (not this random attempt). It is journaled BEFORE the fallible
+        # publication, so a failed, lost, refused or cancelled publication cannot lose it.
+        _restrict_operation(
+            run.state, run.execution, account_id, f"{WATCH_CREATE_RESOURCE}{drive_id}", exc.deferral,
+        )
+        await run.publish(transition(dispatched, UNCERTAIN, detail="outcome unknown: provider minimum named"))
+        return
+    except Exception as exc:
+        await run.publish(transition(dispatched, UNCERTAIN, detail=f"outcome unknown: {type(exc).__name__}"))
+        return
+    try:
+        resource_id, expires_at = validate_watch_response(dispatched, response)
+    except InvalidWatchResponse as exc:
+        if exc.resource_id and str((response or {}).get("id") or "") == dispatched.attempt_id:
+            await run.publish(transition(
+                dispatched, CLEANUP_PENDING, resource_id=exc.resource_id, detail=exc.reason,
+            ))
+        else:
+            await run.publish(transition(dispatched, UNCERTAIN, detail=exc.reason))
+        return
+    active = transition(dispatched, ACTIVE, resource_id=resource_id, expires_at=expires_at, detail=None)
+    try:
+        await run.publish(active)
+    except BaseException:
+        # Created at Google, but the activation could not be published: keep what proves it
+        # exists, so the sweep that next owns the record stops it instead of trusting it.
+        run.state.record_watch_evidence(conn.name, dispatched.attempt_id, resource_id)
+        raise
+
+
+async def _cleanup(
+    run: _Run, manager: Any, connection: str, budget: _Budget, *, access_token: str | None,
+    provider_gate: Any, account_id: str | None = None,
+) -> None:
+    """Stop known channels. ``account_id`` is the verified account of the CURRENT transport — the one
+    a quota answer to a stop belongs to, which an older channel record's account may not be."""
+    loop = asyncio.get_running_loop()
+    hold = (
+        (run.execution.integration_id, int(run.execution.generation), account_id)
+        if account_id else None
+    )
+    for record in sorted(run.records.values(), key=lambda r: r.attempt_id):
+        if record.connection != connection or record.state != CLEANUP_PENDING or not record.resource_id:
+            continue
+        if budget.stops <= 0 or run.remaining() <= 0:
+            return  # the SWEEP's stop budget or deadline is spent: nothing further is stopped
+        if record.stop_attempts >= MAX_STOP_ATTEMPTS:
+            # THIS record exhausted its attempts. It is kept as it is — its evidence, its attempts,
+            # no slot spent — for the existing expiry handling; the records after it still get theirs.
+            continue
+        if account_id and _account_held(run, account_id):
+            return  # a hold adopted during this sweep (e.g. a late worker's quota answer) stands
+        stop_operation = f"{WATCH_STOP_RESOURCE}{record.resource_id}"
+        if account_id and _operation_restricted(run.state, run.execution, account_id, stop_operation):
+            # A provider minimum for stopping THIS channel stands (A4) — learned earlier, possibly in
+            # this very sweep by a late worker. Waiting is not a failed stop: no attempt is spent, the
+            # record stays cleanup_pending, and the other channels are still stopped.
+            continue
+        budget.stops -= 1  # the slot stays spent whatever happens: no refund, no retry in this sweep
+        operation = (
+            (run.execution.integration_id, int(run.execution.generation), account_id, stop_operation)
+            if account_id else None
+        )
+
+        def confirm_stop(stop_operation: str = stop_operation) -> None:
+            # Asked from the worker, answered on the loop that owns the StateStore, within the run
+            # deadline. A refusal — or no answer — means the request is never executed.
+            if not account_id:
+                return
+            try:
+                refused = _ask_loop(
+                    loop, lambda: _stop_refusal(run, account_id, stop_operation),
+                    run.deadline - time.monotonic(),
+                )
+            except Exception:
+                raise _StopNotSent("unconfirmed") from None
+            if refused is not None:
+                raise _StopNotSent(refused)
+
+        def admitted_gate(confirm: Callable[[], None] = confirm_stop) -> None:
+            # The manager calls its gate immediately before `request.execute`, and the live authority
+            # check inside it can block while an abandoned worker journals the account's quota or this
+            # channel's stop minimum. Authority answers first (its refusal keeps precedence); then
+            # restriction admission is decided once more before the request.
+            if provider_gate is not None:
+                provider_gate()
+            confirm()
+
+        def stop_when_admitted(r: WatchRecord = record, gate: Callable[[], None] = admitted_gate,
+                               confirm: Callable[[], None] = confirm_stop) -> Any:
+            # A queued worker may start only after an abandoned one has finished — and journaled its
+            # restriction — so admission is asked before any client work too.
+            confirm()
+            return manager.stop(
+                r, str(r.resource_id), access_token=access_token, provider_gate=gate,
+                deadline=run.deadline,
+            )
+
+        try:
+            await run.offload(
+                stop_when_admitted,
+                on_late=_late_evidence(loop, run.state, None, hold=hold, operation=operation),
+            )
+        except asyncio.CancelledError:
+            raise
+        except BrainError:
+            raise
+        except _StopNotSent as exc:
+            # Provably unsent: the channel stays cleanup_pending with its resource and stop attempts
+            # unchanged, and nothing is published for it. A hold learned late stays local until the
+            # next fresh acquisition publishes it.
+            if exc.scope == "operation":
+                continue  # this channel waits for its minimum; the independent channels go on
+            return  # the account's hold — or unconfirmed admission — ends cleanup for this sweep
+        except WatchStopSetupFailed as exc:
+            # The client could not be set up, so no request was ever built: not a failed stop. The
+            # channel stays exactly as acknowledged — nothing published or projected, no attempt
+            # counted — its slot stays spent (never retried this sweep), and the next channel is
+            # still subject to the run deadline and the remaining budget.
+            log.warning("Drive watch renewal for %s: %s", connection, exc)
+            continue
+        except WatchNotDispatched:
+            # The manager's own guard: its gate returned at or after the run deadline, so the request
+            # was never executed. Not a failed stop — nothing is published or projected — and the run
+            # has no time left for another.
+            return
+        except WatchStepTimeout:
+            # The run deadline passed while the stop was queued, constructing its request, blocked in
+            # its gate or admission, or in flight. A worker having started is no proof the request was
+            # sent, so no failed attempt is counted and nothing is published or projected: the
+            # acknowledged cleanup_pending record stands for the next sweep. A worker still running
+            # is abandoned: past the deadline the manager never executes a request it has not sent,
+            # and a request already sent stays conservatively pending — its late answer can only add
+            # the account's hold or this channel's minimum, locally. Cleanup ends here.
+            return
+        except WatchQuotaLimited as exc:
+            # The channel still exists: the record stays cleanup_pending, spending no stop attempt —
+            # the account's quota is not this channel's failure (R51 final 3).
+            raise _AccountQuotaHeld(exc.deferral) from exc
+        except WatchProviderMinimum as exc:
+            # A named minimum for stopping THIS channel (A4), under the verified account of the
+            # transport that made the call — not the record's possibly older account. The channel
+            # still exists; waiting is not a failed stop, so no attempt is spent and nothing is
+            # published for the record.
+            if account_id:
+                _restrict_operation(run.state, run.execution, account_id, stop_operation, exc.deferral)
+            continue
+        except Exception as exc:
+            await run.publish(_bump_stop(record, f"stop failed: {type(exc).__name__}"))
+            continue
+        await run.publish(transition(record, RETIRED, detail="stopped"))
+
+
+def _bump_stop(record: WatchRecord, detail: str) -> WatchRecord:
+    """A failed stop is not a transition: the record stays cleanup_pending with one more attempt."""
+    return dataclasses.replace(
+        record, stop_attempts=record.stop_attempts + 1, detail=detail[:200], updated_at=now_iso(),
+    )
+
+
+async def _renew_connection(
+    settings: BrainSettings, conn: Connection, row: dict[str, Any], state: StateStore, manager: Any,
+    budget: _Budget, now: datetime,
+) -> None:
+    run: _Run | None = None
+    closers: list[Callable[[], None]] = []
+    execution = None
+    client_cm = brain_client.BrainClient(settings.base_url, settings.api_key, settings.team)
+    deadline = time.monotonic() + WATCH_RUN_SECONDS
+    try:
+        async with client_cm as client:
+            acquire = client.acquire_gdrive_execution(str(row["id"]), str(uuid.uuid4()))
+            remaining = deadline - time.monotonic()
+            execution = await asyncio.wait_for(acquire, timeout=max(0.1, remaining))
+            run = _Run(client, execution, state, settings.team, deadline, from_section(execution.progress))
+            effective = effective_gdrive_connection(conn, execution.config, execution.integration_id)
+            access_token = None
+            auth_mode = str(effective.options.get("auth_mode") or "oauth")
+            # The account namespace is resolved exactly as the coordinator resolves it (AIO-1167 R44
+            # S2/F3), so a channel's notification marks the stream the coordinator actually reads.
+            if auth_mode == "oauth":
+                grant = await run.bounded(client.broker_gdrive_access_token(execution))
+                access_token = grant["access_token"]
+                account_id = oauth_account_namespace(execution.config, grant, effective.options)
+            elif not (effective.options.get("service_account_key_path") or effective.options.get("credential_json")):
+                return
+            else:
+                from .sources.gdrive import GoogleDriveSource
+
+                try:
+                    account_id = service_account_namespace(
+                        GoogleDriveSource(**provider_source_options(effective.options)),
+                        execution.config, effective.options.get("service_account_status"),
+                    )
+                except ServiceAccountBindingRefused as exc:
+                    # Fail closed: no channel under an account the coordinator will not run as.
+                    log.warning("Drive watch renewal for %s refused: %s", conn.name, exc.category)
+                    return
+            # The verified account's provider hold binds the watch lifecycle too (R51 blind-final 3):
+            # the brain's acknowledged minimums for THIS account — never another credential's — are
+            # adopted through the coordinator's own restriction owner, and a standing hold, local or
+            # acknowledged, stops every watch creation and cleanup call until it lapses.
+            _adopt_remote_restriction_evidence(
+                state, execution, execution.integration_id, execution.generation, account_id,
+            )
+            hold = _standing_account_hold(
+                state, execution.integration_id, execution.generation, account_id,
+            )
+            # The local projection is rebuilt from the brain's record — what a lost or stale local
+            # state lacks is restored before any decision is made. Recovery publishes record outcomes
+            # under the fence and makes no provider call, so it runs under a hold as well.
+            for record in run.records.values():
+                if record.connection == conn.name:
+                    state.save_watch_record(record)
+            await _recover(run, conn.name, now)
+            if hold is not None:
+                # Existing channels, their evidence and every cursor stay exactly as they are;
+                # polling's own admission honours the same hold. A hold an earlier sweep or run kept
+                # only locally is published from this fresh acquisition, once (R51 final 3).
+                await _publish_watch_restrictions(run, conn, account_id)
+                log.info("Drive watch renewal for %s held until %s", conn.name, hold["not_before"])
+                return
+            provider_gate = client.gdrive_provider_gate(execution)
+            closers.append(provider_gate.close)
+            try:
+                await _create_where_due(
+                    run, manager, conn, budget, now, account_id=account_id,
+                    access_token=access_token, provider_gate=provider_gate,
+                )
+                await _cleanup(
+                    run, manager, conn.name, budget, access_token=access_token,
+                    provider_gate=provider_gate, account_id=account_id,
+                )
+                # Operation minima learned in this sweep (A4) are already in the local journal; publish
+                # them now under this execution's live fence — ONLY them: a late account hold journaled
+                # during this sweep waits for the next fresh acquisition. A failed or lost
+                # acknowledgment keeps the journal, and the next acquisition or poll checkpoint
+                # publishes it.
+                await _publish_watch_operation_minima(run, conn, account_id)
+            except _AccountQuotaHeld as held:
+                # The account's quota, learned from a watch call (R51 final 3): journaled locally
+                # FIRST — monotonic, under this verified account — so no watch or polling call for
+                # it is made before the deadline whatever happens next; then published through the
+                # shared restriction owner. No further creation or cleanup in this sweep either way.
+                deferral = held.deferral
+                state.hold_connection(
+                    execution.integration_id, execution.generation, account_id,
+                    str(deferral.not_before), str(getattr(deferral, "category", "rate_limited")),
+                )
+                await _publish_watch_restrictions(run, conn, account_id)
+                log.info(
+                    "Drive watch renewal for %s stopped by the account quota until %s",
+                    conn.name, deferral.not_before,
+                )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        # Fail closed: valid old channels stay active and polling remains the backstop.
+        log.warning("Drive watch renewal for %s stopped: %s", conn.name, type(exc).__name__)
+    finally:
+        # Workers never publish, so releasing the lease cannot let an abandoned one activate
+        # anything; the resources they use are closed only when they have all finished.
+        _close_when_idle(run, closers)
+        if execution is not None:
+            try:
+                async with brain_client.BrainClient(settings.base_url, settings.api_key, settings.team) as releaser:
+                    await asyncio.wait_for(releaser.release_gdrive_execution(execution), timeout=10.0)
+            except Exception:
+                pass
+
+
+async def _create_where_due(
+    run: _Run, manager: Any, conn: Connection, budget: _Budget, now: datetime, *,
+    account_id: str, access_token: str | None, provider_gate: Any,
+) -> None:
+    ttl = int(getattr(manager, "ttl_seconds", lambda _name: 604_800)(conn.name))
+    for drive_id, cursor in _streams(run.execution):
+        # A creation starts only if its outcome can be published and the cleanup allowance kept.
+        if budget.creates <= 0 or run.remaining() <= WATCH_CLEANUP_SECONDS + _publish_reserve():
+            return
+        namespace = StreamKey(
+            run.team, run.execution.integration_id, account_id, drive_id,
+        ).namespace(run.execution.generation)
+        mine = [r for r in run.records.values() if r.connection == conn.name and r.namespace == namespace]
+        if sum(1 for r in mine if r.state in PENDING_STATES) >= MAX_UNRESOLVED_PER_STREAM:
+            continue  # polling covers this stream until its unknown attempts resolve
+        active = sorted((r for r in mine if r.state == ACTIVE), key=lambda r: r.expires_at or "")
+        legacy = sorted(
+            (c for c in run.state.list_channels(conn.name, active_only=True)
+             if c.namespace == namespace and c.channel_id not in run.records),
+            key=lambda c: c.expires_at or "",
+        )
+        newest_expiry = max(
+            [r.expires_at for r in active if r.expires_at] + [c.expires_at for c in legacy if c.expires_at],
+            default=None,
+        )
+        if active or legacy:
+            if not _due(newest_expiry, now, budget.sweep_seconds):
+                continue
+        predecessor = (active[-1].attempt_id if active else (legacy[-1].channel_id if legacy else None))
+        if _account_held(run, account_id):
+            return  # a hold adopted during this sweep (e.g. a late worker's quota answer) stands
+        if _operation_restricted(run.state, run.execution, account_id, f"{WATCH_CREATE_RESOURCE}{drive_id}"):
+            # A provider minimum for creating a channel on THIS drive stands (A4) — from an earlier
+            # sweep, a fresh store's adopted evidence, or a late worker in this one. No new attempt
+            # before it; other drives, valid predecessors and polling are unaffected.
+            continue
+        budget.creates -= 1
+        await _create(
+            run, manager, conn, account_id=account_id, drive_id=drive_id, cursor=cursor,
+            namespace=namespace, predecessor=predecessor, access_token=access_token,
+            provider_gate=provider_gate, ttl_seconds=ttl,
+        )
+
+
+async def renew_watches(
+    state: StateStore, manager: Any, connections: list[Connection], settings: BrainSettings,
+    *, sweep_seconds: float = DEFAULT_SWEEP_SECONDS,
+) -> None:
+    """One renewal sweep over every enabled Drive connection. Admin state is re-read first."""
+    try:
+        async with brain_client.BrainClient(settings.base_url, settings.api_key, settings.team) as discovery:
+            remote = await asyncio.wait_for(
+                discovery.fetch_integration_selections(include_disabled=True), timeout=WATCH_RUN_SECONDS,
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return  # unknown Admin state: renew nothing
+    enabled = [
+        row for row in remote
+        if row.get("type") == "gdrive" and row.get("status") == "enabled" and row.get("id")
+    ]
+    budget = _Budget(sweep_seconds=sweep_seconds)
+    now = datetime.now(timezone.utc)
+    # Each enabled row renews under the local entry BOUND to its immutable id (AIO-1167 R44 C11):
+    # an entry with the row's name but another explicit id renews nothing, never the other id.
+    for row in enabled:
+        conn, conflict = bind_local_gdrive(connections, str(row["id"]), str(row.get("name") or ""))
+        if conflict:
+            log.warning("Drive watch renewal for %s: local configuration names a different integration id",
+                        row.get("name"))
+            continue
+        if conn is None:
+            continue
+        await _renew_connection(settings, conn, row, state, manager, budget, now)

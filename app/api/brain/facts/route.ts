@@ -3,7 +3,10 @@ import { serverClient } from "@/lib/db/server";
 import { getSessionUser } from "@/lib/auth/session";
 import { errorResponse } from "@/lib/api/schemas";
 import { adminClient } from "@/lib/db/admin";
-import { recentFacts } from "@/lib/graph/learning";
+import { recentFacts, resolveEpisodeItems } from "@/lib/graph/learning";
+import { filterArcFactsByAuthorizedItems } from "@/lib/graph/arc-input-authorization";
+import { visibleItemIdsForProjects } from "@/lib/access/enforce";
+import { revocationEpoch } from "@/lib/access/authorization-epoch";
 
 export const runtime = "nodejs";
 
@@ -50,6 +53,11 @@ export async function GET(req: NextRequest) {
   // unbootstrapped fallback (stored path = one owner), assertDirection (PRET-4 ruling 2:
   // grants ARE the scope), assertNoForeignHistory (pointer-only resolution never reaches the
   // slug-reuse state).
+  // AIO-1167 R94 — the revocation epoch is captured BEFORE the member's oracle scope is resolved, so
+  // the scope below is certified only under the epoch it was read after: a revocation landing anywhere
+  // from here to the final check fails the response closed (empty, degraded) — never the member's old
+  // projects served under a newer epoch. One attempt, as before.
+  const epoch = await revocationEpoch(adminClient(), team.id);
   const { visibleProjectsWithError } = await import("@/lib/access/oracle");
   const { selectEnforcedGraphPartitions } = await import("@/lib/graph/partition-read");
   const oracle = await visibleProjectsWithError(adminClient(), { teamId: team.id, memberId: (me as { id: string }).id });
@@ -89,18 +97,27 @@ export async function GET(req: NextRequest) {
     return Response.json({ facts: [], as_of: new Date().toISOString(), stale: false, degraded: true, window_hours: WINDOW_HOURS });
   }
 
+  const admin = adminClient();
+  // Facts publish no person attribution, so a pending attribution repair does not gate them; the
+  // revocation barrier (captured above, before the scope) still brackets the provenance read.
   const since = new Date(Date.now() - WINDOW_HOURS * 3600 * 1000).toISOString();
   const { facts, ok } = await recentFacts(groups, since, LIMIT);
+  const episodes = await resolveEpisodeItems(groups, facts.flatMap((fact) => fact.episodeUuids), LIMIT * 8);
+  const visible = await visibleItemIdsForProjects(admin, team.id, oracle.set.projectIds);
+  const authorityOk = episodes.ok && !visible.error && await revocationEpoch(admin, team.id) === epoch;
+  const authorizedFacts = authorityOk
+    ? filterArcFactsByAuthorizedItems(facts, episodes.items, visible.ids)
+    : [];
 
   // `as_of` is honest here — this is a live Neo4j read, not a cache. The bug was `ok`: `recentFacts`
   // already distinguishes "the window is genuinely quiet" from "the read FAILED" (its own comment says
   // "treating as degraded, not as an empty window"), and the route dropped it — so a Neo4j outage
   // rendered as a benign empty fact list. `stale` is structurally false for a live read.
   return Response.json({
-    facts,
+    facts: authorizedFacts,
     as_of: new Date().toISOString(),
     stale: false,
-    degraded: !ok,
+    degraded: !ok || !authorityOk,
     window_hours: WINDOW_HOURS,
   });
 }

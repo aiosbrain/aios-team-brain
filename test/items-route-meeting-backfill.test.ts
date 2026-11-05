@@ -23,7 +23,7 @@ vi.mock("@/lib/api/rate-limit", () => ({ rateLimit: async () => true }));
 vi.mock("@/lib/attribution/resolve-authors", () => ({ attributeIncomingItem: async () => ({ opts: {} }) }));
 vi.mock("@/lib/pm-sync", () => ({ projectChangedTasksAfterWrite: async () => {} }));
 vi.mock("@/lib/ingest", () => ({
-  ingestItem: async () => ({ status: h.ingestStatus, id: "item-1" }),
+  ingestApiItem: async () => ({ status: h.ingestStatus, id: "item-1" }),
 }));
 vi.mock("@/lib/api/auth", () => ({
   authenticateApiKey: async () => ({

@@ -15,6 +15,7 @@ import { normalizeTier } from "../lib/api/schemas";
 import type { DecisionRow } from "../lib/api/item-payload-schema";
 import { pgClient } from "../lib/db/pg/client";
 import type { DbClient } from "../lib/db/types";
+import { withIdentityMutationBoundary } from "../lib/identity/authority";
 
 if (!process.env.DATABASE_URL) {
   console.error("set DATABASE_URL (try: npx dotenvx run -f .env.local -- …, or export it)");
@@ -135,25 +136,28 @@ async function main() {
     const b = await ensureBuiltins(db, team.id);
     if (!b.ok) console.warn(`[seed-demo] ensureBuiltins: ${b.error}`);
   }
-  for (const m of memberDefs) {
-    const { data } = await db
-      .from("members")
-      .upsert(
-        { team_id: team.id, ...m, status: "active", auth_user_id: null },
-        { onConflict: "team_id,email" }
-      )
-      .select("id, actor_handle")
-      .single();
-    if (data) members[data.actor_handle] = data.id;
-    // PRET-4 (diff-review L2): raw-upserted demo members need their builtin-posture row —
-    // against a marker-stamped DB nothing else writes it, and alex's canAccessAdmin would
-    // fail on external posture. Via the sanctioned writer's function; idempotent.
-    if (data) {
-      const { writeInviteDefaultMembership } = await import("@/lib/access/groups");
-      const w = await writeInviteDefaultMembership(db, team.id, data.id as string, "team");
-      if (!w.ok) console.warn(`[seed-demo] posture write for ${m.actor_handle} failed: ${w.error}`);
+  await withIdentityMutationBoundary(team.id, async () => {
+    for (const m of memberDefs) {
+      const { data, error } = await db
+        .from("members")
+        .upsert(
+          { team_id: team.id, ...m, status: "active", auth_user_id: null },
+          { onConflict: "team_id,email" }
+        )
+        .select("id, actor_handle")
+        .single();
+      if (error) throw new Error(`demo member upsert failed: ${error.message}`);
+      if (data) members[data.actor_handle] = data.id;
+      // PRET-4 (diff-review L2): raw-upserted demo members need their builtin-posture row —
+      // against a marker-stamped DB nothing else writes it, and alex's canAccessAdmin would
+      // fail on external posture. Via the sanctioned writer's function; idempotent.
+      if (data) {
+        const { writeInviteDefaultMembership } = await import("@/lib/access/groups");
+        const w = await writeInviteDefaultMembership(db, team.id, data.id as string, "team");
+        if (!w.ok) console.warn(`[seed-demo] posture write for ${m.actor_handle} failed: ${w.error}`);
+      }
     }
-  }
+  });
 
   // 3. demo API key (printed once; sha256 stored)
   const keyId = randomBytes(6).toString("hex");

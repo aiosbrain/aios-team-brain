@@ -2,6 +2,7 @@ import "server-only";
 import type { PoolClient } from "pg";
 import type { DbClient } from "@/lib/db/types";
 import { transactionSessionFor } from "@/lib/db/pg/tx";
+import { runSql } from "@/lib/db/pg/pool";
 
 export type AuditEntry = {
   team_id: string | null;
@@ -44,13 +45,26 @@ export async function audit(db: DbClient, entry: AuditEntry) {
   }
 }
 
+const REQUIRED_AUDIT_SQL = `insert into audit_log (team_id, actor_kind, member_id, api_key_id, action,
+       target_type, target_id, meta, ip) values ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::inet)`;
+
+function requiredAuditParams(entry: AuditEntry): unknown[] {
+  return [entry.team_id, entry.actor_kind, entry.member_id ?? null, entry.api_key_id ?? null,
+    entry.action, entry.target_type ?? null, entry.target_id ?? null,
+    JSON.stringify(entry.meta ?? {}), entry.ip ?? null];
+}
+
+/**
+ * Required evidence inside the AMBIENT `withTransaction` (the one `runSql` joins): the row commits
+ * with the caller's write, or the error propagates and the whole transaction rolls back. Never
+ * swallowed and never on a second connection. Call it ONLY inside `withTransaction` — evidence that
+ * could commit apart from the act it records is not required evidence.
+ */
+export async function auditRequiredInTransaction(entry: AuditEntry): Promise<void> {
+  await runSql(REQUIRED_AUDIT_SQL, requiredAuditParams(entry));
+}
+
 /** Required evidence: use the caller's transaction; failure must abort its entire write. */
 export async function auditRequired(client: PoolClient, entry: AuditEntry): Promise<void> {
-  await client.query(
-    `insert into audit_log (team_id, actor_kind, member_id, api_key_id, action,
-       target_type, target_id, meta, ip) values ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::inet)`,
-    [entry.team_id, entry.actor_kind, entry.member_id ?? null, entry.api_key_id ?? null,
-      entry.action, entry.target_type ?? null, entry.target_id ?? null,
-      JSON.stringify(entry.meta ?? {}), entry.ip ?? null],
-  );
+  await client.query(REQUIRED_AUDIT_SQL, requiredAuditParams(entry));
 }

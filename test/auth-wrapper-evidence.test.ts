@@ -365,11 +365,32 @@ describe("authenticateApiKey — actual owner", () => {
       actorHandle: "alex",
       displayName: "Alex",
       email: USER.email,
+      // An ordinary member key is never a connector principal (AIO-1167): the fixture's member row
+      // carries no `is_connector`, and the owner reports that as an explicit `false`.
+      isConnector: false,
     });
     expect(h.audit).not.toHaveBeenCalled();
 
     h.tables.group_members = [];
     await expect(authenticateApiKey(request(VALID))).resolves.toMatchObject({ memberTier: "external" });
+  });
+
+  it("reports connector identity from the key owner's member row alone, and only for a literal true", async () => {
+    const owner = (is_connector: unknown): Row =>
+      keyRow({ members: { actor_handle: "gdrive-sync", status: "active", role: "member", display_name: null, email: null, is_connector } });
+
+    h.tables.api_keys = [owner(true)];
+    await expect(authenticateApiKey(request(VALID))).resolves.toMatchObject({ isConnector: true, actorHandle: "gdrive-sync" });
+
+    // The reserved handle, a truthy non-boolean, or a missing flag do not make a connector.
+    for (const flag of [false, null, undefined, "true", 1]) {
+      h.tables.api_keys = [owner(flag)];
+      await expect(authenticateApiKey(request(VALID)), String(flag)).resolves.toMatchObject({
+        isConnector: false,
+        actorHandle: "gdrive-sync",
+      });
+    }
+    expect(h.audit).not.toHaveBeenCalled();
   });
 });
 

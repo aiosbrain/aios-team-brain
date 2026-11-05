@@ -88,7 +88,17 @@ export function streamRetryDelayMs(failedAttempt: number): number {
  * the raw message carries the internal model + base URL (`LLM <model> @ <baseUrl>: …`), which
  * must not leak to the client. The real error is logged server-side by the caller.
  */
+/** AIO-1167 R66: the sanitized, retryable refusal for a context whose authorization changed. */
+export const CONTEXT_AUTHORIZATION_CLIENT_MESSAGE =
+  "Access to the sources for this question changed while it was being answered. Please ask again.";
+
 export function clientErrorMessage(err: unknown): string {
+  // AIO-1167 R66: the captured context's authorization changed — retryable by ASKING AGAIN (a fresh
+  // retrieval re-authorizes), and named without any source, item or epoch. Matched by name so this
+  // transport-only module needs no server import.
+  if (err instanceof Error && err.name === "QueryContextAuthorizationChangedError") {
+    return CONTEXT_AUTHORIZATION_CLIENT_MESSAGE;
+  }
   if (isRetryableStreamError(err)) {
     return "The model was busy or briefly unavailable. Please try again in a moment.";
   }

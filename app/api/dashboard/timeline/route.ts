@@ -3,12 +3,43 @@ import { serverClient } from "@/lib/db/server";
 import { adminClient } from "@/lib/db/admin";
 import { getSessionUser } from "@/lib/auth/session";
 import { errorResponse } from "@/lib/api/schemas";
-import { getCachedWorkTimeline } from "@/lib/dashboard/timeline-cache";
+import { getCachedWorkTimeline, TimelineAuthorizationChangedError } from "@/lib/dashboard/timeline-cache";
 import { getWorkTimeline, WINDOW_DAYS, MAX_WINDOW_DAYS } from "@/lib/dashboard/work-timeline";
 import { contentTimelineEnforcement } from "@/lib/access/admission";
+import {
+  AttributionRepairPendingError,
+  authorizationEpoch,
+  withLockedAuthorizationEpoch,
+} from "@/lib/access/authorization-epoch";
+import type { ViewerTier } from "@/lib/auth/visibility";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
+
+/**
+ * The fresh-build (`days > 7`) arm under the same barrier the cached arm gets from
+ * `getCachedWorkTimeline` (AIO-1167). Its payload credits work by `items.member_id`, so it must not be
+ * served while an attribution repair is pending — that column is being rewritten — nor when the
+ * authorization epoch moved during the build. The GATED epoch is read before the build (a pending
+ * repair throws there) and again at a locked publication point after it (a repair that went pending
+ * mid-read throws there; a remap, unlink, repair completion or revocation shows as a different
+ * epoch). A changed epoch rebuilds once from a fresh admission; a second change is the cache's own
+ * retryable `TimelineAuthorizationChangedError`. Nothing here is cached.
+ */
+async function freshWorkTimeline(teamId: string, tier: ViewerTier, days: number, memberId: string) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const epoch = await authorizationEpoch(adminClient(), teamId);
+    const built = await getWorkTimeline(
+      adminClient(),
+      teamId,
+      tier,
+      days,
+      await contentTimelineEnforcement(adminClient(), teamId, memberId),
+    );
+    if (await withLockedAuthorizationEpoch(teamId, (current) => current === epoch)) return built;
+  }
+  throw new TimelineAuthorizationChangedError();
+}
 
 /**
  * Dashboard Timeline data for an ARBITRARY lookback — powers the "Show earlier days" expansion under the
@@ -59,9 +90,23 @@ export async function GET(req: NextRequest) {
   // §5.8: BOTH arms carry the member's enforcement — the fresh-build arm resolves it explicitly
   // (it bypasses the cache layer, so the cache layer's resolution can't cover it). TIERRET-1: that
   // enforcement includes the READER from the one admission resolver, exactly like the cached arm.
-  const timeline =
-    days <= WINDOW_DAYS
-      ? (await getCachedWorkTimeline(adminClient(), team.id, tier, memberId)).days
-      : await getWorkTimeline(adminClient(), team.id, tier, days, await contentTimelineEnforcement(adminClient(), team.id, memberId));
+  // AIO-1167: both arms are also bound to the attribution-repair gate and the authorization epoch.
+  let timeline: Awaited<ReturnType<typeof getWorkTimeline>>;
+  try {
+    timeline =
+      days <= WINDOW_DAYS
+        ? (await getCachedWorkTimeline(adminClient(), team.id, tier, memberId)).days
+        : await freshWorkTimeline(team.id, tier, days, memberId);
+  } catch (error) {
+    // Person attribution is mid-repair: neither the old ledger nor a partial rebuild may be served.
+    if (error instanceof AttributionRepairPendingError) {
+      return errorResponse("temporarily_unavailable", "attribution repair is in progress; retry shortly", 503);
+    }
+    // Authorization moved under both attempts of the read: retryable, never a raw 500.
+    if (error instanceof TimelineAuthorizationChangedError) {
+      return errorResponse("temporarily_unavailable", "timeline authorization changed; retry the request", 503);
+    }
+    throw error;
+  }
   return Response.json({ days: timeline, window_days: days });
 }
