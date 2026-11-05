@@ -356,3 +356,25 @@ async def test_a_conflicted_user_log_root_is_cleared_only_with_routing_proof(tmp
         assert summary.authoritative_complete is True and _binding(w2) == ("bound", "my-drive", None, None)
     assert world.removed == []
     w2.close()
+
+
+# ── explicit trash of a direct user-log root never waits on routing (R65) ──────────────────────
+
+@pytest.mark.asyncio
+async def test_explicit_trash_of_a_direct_user_log_root_is_removed_without_a_membership_probe(
+    tmp_path, monkeypatch, clock,
+):
+    world, _path, state = await _baseline(tmp_path, monkeypatch, "trash-no-probe.sqlite")
+    # The very next user-log row is the trash itself, full file body (no live edit before it).
+    world.files["file-f"]["trashed"] = True
+    world.logs["my-drive"].append({"fileId": "file-f", "file": dict(world.files["file-f"])})
+    world.membership["shared-d"] = _deferral("named", clock)
+    world.calls.clear()
+    await world.run(state)
+
+    assert "file-f" in world.removed, "the claim-aware explicit-trash removal is emitted"
+    assert ("drives.get", "shared-d") not in world.calls, "trash needs no routing decision"
+    assert "file-f" not in _restrictions(state), "no membership-derived root restriction"
+    assert "file-f" not in _evidence(world)["resources"]
+    assert _hold(state) is None and _evidence(world)["hold"] is None, "no account hold"
+    state.close()
