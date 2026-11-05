@@ -2,6 +2,7 @@ import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { audit } from "@/lib/api/audit";
 import { advanceAuthorizationEpoch } from "@/lib/access/authorization-epoch";
+import { lockIdentityAuthority } from "@/lib/identity/authority-lock";
 import { runSql, withTransaction } from "@/lib/db/pg/pool";
 import { isBuiltinEligible, isPrincipal } from "@/lib/access/eligibility";
 import {
@@ -101,10 +102,14 @@ class NarrowingRolledBack extends Error {
  *
  * `mutate` reports whether an edge was actually removed: a refusal or a no-op advances nothing. An epoch
  * write that fails rolls the edge deletion back with it, and a failed mutation never publishes an
- * epoch. Lock order: the narrowing's own rows (member row `for no key update` — compatible with the key
- * share an output publication's foreign keys take — then the edge), then the epoch row; an output
- * publication holds the epoch share lock and touches neither, so the two queue, never deadlock. Audits
- * run AFTER the transaction, as before: best-effort trail, never able to abort the act.
+ * epoch. Lock order: the TEAM IDENTITY BOUNDARY first (R93 — the existing `lockIdentityAuthority`
+ * advisory, re-entrant for a caller already under it, e.g. `createMember`), then the narrowing's own rows
+ * (member row `for no key update` — compatible with the key share an output publication's foreign keys
+ * take — then the edge), then the epoch row. A hard member deletion takes that same boundary before its
+ * identity row → epoch → member, so the two queue at the boundary instead of each holding what the other
+ * needs next; an output publication holds the epoch share lock and touches neither, so it queues too,
+ * never deadlocks. Audits run AFTER the transaction, as before: best-effort trail, never able to abort
+ * the act.
  */
 async function withAudienceNarrowing<T>(
   teamId: string,
@@ -112,6 +117,7 @@ async function withAudienceNarrowing<T>(
 ): Promise<T | { ok: false; error: string }> {
   try {
     return await withTransaction(async () => {
+      await lockIdentityAuthority(teamId); // FIRST: before any member/edge lock or mutation
       const { narrowed, result } = await mutate();
       if (narrowed) await advanceAuthorizationEpoch(teamId);
       return result;

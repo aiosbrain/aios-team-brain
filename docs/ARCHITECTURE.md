@@ -1756,9 +1756,11 @@ sanctioned access writers (`removeMemberFromGroup`, `revokeProjectFromGroup`,
 stray prune) advance `team_authorization_epochs` in the SAME transaction as the edge deletion, before
 success is reported (`withAudienceNarrowing`, `lib/access/groups.ts`): refusals/no-ops advance nothing,
 an epoch failure rolls the deletion back, the barrier is conservative under overlapping grants, and
-audits run after commit as before. A membership narrowing locks the member row (`for no key update`)
-before the edge, so it never deadlocks a protected publication (epoch share, then the foreign-key key
-share on that member row). A protected answer never
+audits run after commit as before. A narrowing takes the team identity boundary FIRST (R93 — the one
+`lockIdentityAuthority` advisory, re-entrant under `createMember`), then the member row (`for no key
+update`), the edge and the epoch: a hard member deletion takes the same boundary before its identity
+row → epoch → member, so the two queue there, and it never deadlocks a protected publication (epoch
+share, then the foreign-key key share on that member row). A protected answer never
 feeds a title (the question-derived title stays); non-Google answers keep automatic titles.
 
 The Timeline reads Drive evidence through a stable seek-paginated ledger independent of the generic
@@ -1895,7 +1897,16 @@ a `gdrive_cleanup_obligations` row under the canonical team/provider lock before
 physical item, graph, and cache cleanup runs afterward and is retryable. A retry takes the same lock and
 rechecks for a restored claim before deleting. Every memory/persisted cache read checks the current epoch,
 and persistent publication is atomic with an epoch lock; Timeline synopsis salvage and arc fusion/fallbacks
-carry the build-start epoch through their final serving boundary. Timeline publication distinguishes an
+carry the build-start epoch through their final serving boundary. **A Timeline request attempt is bound to ONE epoch (R92):** `getCachedWorkTimeline`
+captures it BEFORE the first admission read, resolves admission/posture/project-key after it, and requires
+that exact epoch at the memory, persisted, salvage, cold-publication and cache-failure-fallback stages;
+any mismatch (a revocation anywhere after capture — even when a still-authorized member has legitimately
+populated the old project set's variant at the newer epoch) invalidates the whole attempt and its key, and
+the bounded whole-attempt retry resolves a fresh admission; exhaustion or an unreadable epoch fails closed.
+**Member deletion vs a protected answer (R92):** a soft `deleteMember` selects the member `for no key
+update` (it admits the answer's foreign-key key share while its trigger waits for the epoch); a hard delete
+takes the identity-authority row and the epoch `for no key update` BEFORE its member `for update`, so it
+never waits on the epoch while holding a member lock. Timeline publication distinguishes an
 epoch rejection from an ordinary cache outage: rejected payloads are discarded and rebuilt once under
 current authority (then fail retryably), while an ordinary outage may use process memory only after a
 final locked epoch check. Arc scheduling carries the prior row's epoch and rereads it at background start;

@@ -284,7 +284,8 @@ describe("R87: posture narrowing vs report publication, both commit orders", () 
     const publication = kind === "scheduled"
       ? scheduled(c, execution).then(() => "published", (e: unknown) => (e as { code?: string }).code ?? String(e))
       : manual(c, attempt!, execution).then((r) => (r === null ? null : "published"));
-    expect(await waitsOnLock("%from api_keys k%for update of k, m%"), "the report waited on the key/member lock").toBe(true);
+    // R93: the posture narrowing holds the team identity boundary, so the report queues there first.
+    expect(await waitsOnLock("%pg_advisory_xact_lock(hashtextextended%"), "the report waited on the narrowing at the identity boundary").toBe(true);
     commit();
     expect(await narrowing).toEqual({ ok: true });
     // The race is real: the narrowing never rewrote the member tuple — only Everyone's row changed.
@@ -308,7 +309,8 @@ describe("R87: posture narrowing vs report publication, both commit orders", () 
     const publication = kind === "scheduled" ? scheduled(c, execution) : manual(c, attempt!, execution);
     await inLedger; // validated, report written, ledger publication in progress — locks held
     const narrowing = writeInviteDefaultMembership(db(), c.seed.teamId, c.principal.memberId, "external", { reconcile: true });
-    expect(await waitsOnLock("%for no key update%"), "the posture move waited on the member lock").toBe(true);
+    // R93: the posture move queues at the team identity boundary the report already holds.
+    expect(await waitsOnLock("%pg_advisory_xact_lock(hashtextextended%"), "the posture move waited on the report at the identity boundary").toBe(true);
     open();
     expect(await publication).toMatchObject({ newly_completed: true });
     expect(await narrowing).toEqual({ ok: true });

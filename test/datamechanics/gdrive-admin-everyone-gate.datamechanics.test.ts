@@ -211,7 +211,9 @@ describe("a publication and a concurrent Everyone removal serialize, both interl
     const save = saveGdriveConnectionConfig(adminClient(), w.auth, {
       name: w.name, config: { ...before.row.config, fileIds: [], audienceProjectIds: [w.audience] },
     }).then(() => "saved", (e: unknown) => (e as { code?: string }).code);
-    expect(await waitsOnLock("%select role,status from members where id=$1 and team_id=$2 for no key update%"), "the publication waited on the removal").toBe(true);
+    // R93: a sanctioned narrowing takes the team identity boundary FIRST, so the publication now queues
+    // there — earlier than the member row it used to wait on.
+    expect(await waitsOnLock("%pg_advisory_xact_lock(hashtextextended%"), "the publication waited on the removal at the identity boundary").toBe(true);
     open();
     expect((await removal).ok).toBe(true);
     expect(await save).toBe("admin_authority_changed");
@@ -229,7 +231,8 @@ describe("a publication and a concurrent Everyone removal serialize, both interl
     const publication = publishGoogleDriveOAuthCredential(oauth(w), { afterLocks: async () => { reached(); await held; } });
     await atLocks; // the Admin + Everyone membership are checked and locked
     const removal = w.removeFromEveryone();
-    expect(await waitsOnLock("%for no key update%"), "the removal waited on the publication").toBe(true);
+    // R93: the removal queues at the team identity boundary the publication already holds.
+    expect(await waitsOnLock("%pg_advisory_xact_lock(hashtextextended%"), "the removal waited on the publication at the identity boundary").toBe(true);
     release();
     await expect(publication).resolves.toBeTruthy();
     expect((await removal).ok).toBe(true);

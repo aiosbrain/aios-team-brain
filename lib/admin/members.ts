@@ -343,6 +343,8 @@ export async function deleteMember(
     concurrencyHooks?: {
       beforeIdentityLock?: () => Promise<void>;
       afterIdentityLock?: () => Promise<void>;
+      /** Hard delete only: the identity row and the epoch are held, no member row yet (R93 tests). */
+      afterEpochLock?: () => Promise<void>;
     };
   } = {}
 ): Promise<DeleteResult> {
@@ -352,8 +354,30 @@ export async function deleteMember(
     // advances identity authority re-entrantly after the row mutation; taking the authority lock
     // before the member row prevents row->authority inversion against a named correction.
     await opts.concurrencyHooks?.afterIdentityLock?.();
+    // AIO-1167 R92 — never hold a member lock that blocks a protected answer's foreign-key KEY SHARE
+    // while waiting for the authorization epoch that answer holds `for share` (a 40P01 cycle).
+    //  · SOFT: the member is selected `for no key update` — it still excludes competing updates, the
+    //    Drive principal locks and a hard delete, but admits the answer's key share; the status update's
+    //    trigger then advances the epoch once the answer commits.
+    //  · HARD: deleting the row needs `for update`, which conflicts with that key share. So the global
+    //    order is established BEFORE it: identity authority (above) → its row → the authorization epoch,
+    //    both in a write-compatible exclusive mode (never shared, then upgraded) → the member and its
+    //    dependents. A publication holding the epoch share then blocks the delete before any member lock.
+    //    The trigger still advances the revision and epoch; nothing is pre-bumped (a missing epoch row is
+    //    materialized at the canonical initial epoch, exactly as `lockedRevocationEpoch` does).
+    if (opts.hard) {
+      await runSql(`select team_id from team_identity_authority where team_id=$1 for no key update`, [teamId]);
+      await runSql(
+        `insert into team_authorization_epochs(team_id,epoch) values ($1,1) on conflict (team_id) do nothing`,
+        [teamId],
+      );
+      await runSql(`select epoch from team_authorization_epochs where team_id=$1 for no key update`, [teamId]);
+      await opts.concurrencyHooks?.afterEpochLock?.();
+    }
     const {rows}=await runSql<{id:string;role:string;status:string}>(
-      `select id,role,status from members where team_id=$1 and email=$2 for update`,
+      opts.hard
+        ? `select id,role,status from members where team_id=$1 and email=$2 for update`
+        : `select id,role,status from members where team_id=$1 and email=$2 for no key update`,
       [teamId,e],
     );
     const member=rows[0] ?? null;

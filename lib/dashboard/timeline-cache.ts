@@ -394,24 +394,42 @@ export async function readTimelineCache(
   _tier: ViewerTier,
   variant: TimelineVariant
 ): Promise<CacheEntry | null> {
+  const read = await readTimelineCacheAt(db, teamId, variant, undefined);
+  return read.status === "hit" ? read.entry : null;
+}
+
+/** A persisted read bound to an attempt's epoch (R92): a changed epoch is NOT a miss — it invalidates
+ *  the attempt, whose admission was resolved under the old one. Any other error is a miss. */
+type PersistedRead = { status: "hit"; entry: CacheEntry } | { status: "miss" } | { status: "epoch_changed" };
+
+async function readTimelineCacheAt(
+  db: DbClient,
+  teamId: string,
+  variant: TimelineVariant,
+  expectedAuthorizationEpoch: number | undefined,
+): Promise<PersistedRead> {
   try {
-    return await withTransaction(async () => {
+    return await withTransaction(async (): Promise<PersistedRead> => {
       const epoch = await lockedAuthorizationEpoch(teamId);
+      if (expectedAuthorizationEpoch !== undefined && epoch !== expectedAuthorizationEpoch) return { status: "epoch_changed" };
       const row = await readTimelineCacheRow(db, teamId, viewKey(variant));
-      if (!row || Number(row.authorization_epoch) !== epoch) return null;
+      if (!row || Number(row.authorization_epoch) !== epoch) return { status: "miss" };
       // Payload is `{ v, days }`. A missing/older version = a shape from a previous deploy → treat as a
       // MISS so the caller rebuilds (never render a stale wrong shape).
       const p = row.payload as { v?: number; days?: unknown } | null;
-      if (!p || p.v !== PAYLOAD_VERSION || !Array.isArray(p.days)) return null;
+      if (!p || p.v !== PAYLOAD_VERSION || !Array.isArray(p.days)) return { status: "miss" };
       const days = p.days as TimelineDay[];
       const at =
         typeof row.computed_at === "string" ? Date.parse(row.computed_at) : new Date(row.computed_at).getTime();
       // `=== true` so a row written before the column existed reads false — "no evidence of degradation",
       // not "verified good". Defaulting the other way would mark every pre-migration team's ledger bad.
-      return { days, at: Number.isFinite(at) ? at : 0, degraded: row.degraded === true, authorizationEpoch: epoch };
+      return {
+        status: "hit",
+        entry: { days, at: Number.isFinite(at) ? at : 0, degraded: row.degraded === true, authorizationEpoch: epoch },
+      };
     });
   } catch {
-    return null;
+    return { status: "miss" };
   }
 }
 
@@ -686,7 +704,10 @@ export class TimelineAuthorizationChangedError extends Error {
 export type TimelineServeOrigin = "memory" | "persisted" | "cold";
 
 export interface TimelineReadHooks {
-  /** Deterministic concurrency hook used by the epoch-race regression tests. */
+  /** Deterministic concurrency hooks used by the epoch-race regression tests (R92: each stage). */
+  afterAdmission?: (attempt: number) => Promise<void>;
+  beforePersistedRead?: (attempt: number) => Promise<void>;
+  beforeSalvage?: (attempt: number) => Promise<void>;
   beforeColdPublish?: (attempt: number) => Promise<void>;
   /** TEST observation only (AIO-1167 R45 L8): told which path served the payload, just before it is
    *  returned. It cannot change what is served or written. */
@@ -736,23 +757,36 @@ async function getCachedWorkTimelineAttempt(
 ): Promise<CachedTimeline | null> {
   // PRET-6: there is no permissive tier row anymore — a principal-less read is a caller bug.
   if (memberId == null) throw new Error("timeline read without a principal (fail closed)");
+  // AIO-1167 R92 — ONE epoch per attempt, captured BEFORE the first admission read. The admission,
+  // posture and project-derived key below are resolved after it, and EVERY later stage (memory,
+  // persisted, salvage, cold publication, cache-failure fallback) requires exactly this epoch. A
+  // revocation committing anywhere after the capture invalidates the whole attempt — never a newer
+  // epoch recaptured beside the old admission. An epoch that cannot be read throws: fail closed.
+  const epoch = await withLockedAuthorizationEpoch(teamId, (current) => current);
   const view = await resolveView(db, teamId, memberId); // CHEAP (admission + project hash)
+  await hooks.afterAdmission?.(attempt);
   const posture = view.admission.posture;
   const key = memKey(teamId, viewKey(view));
   const now = Date.now();
-  // The shared epoch lock gives a memory hit a linearization point before a concurrent revocation.
-  // Without it, a process could read the old epoch, pause behind a revoker, then serve old memory
-  // after the revocation had already reported success.
-  const { epoch, cached } = await withLockedAuthorizationEpoch(teamId, (current) => {
+  // The shared epoch lock gives a memory hit a linearization point before a concurrent revocation —
+  // and it must still be the attempt's epoch: a variant populated at a newer epoch by a member who IS
+  // still authorized is no proof that THIS reader's older admission is.
+  const memory = await withLockedAuthorizationEpoch(teamId, (current) => {
+    if (current !== epoch) return { changed: true as const };
     const hit = mem.get(key);
-    return { epoch: current, cached: hit?.authorizationEpoch === current ? hit : undefined };
+    return { changed: false as const, cached: hit?.authorizationEpoch === epoch ? hit : undefined };
   });
+  if (memory.changed) return null;
+  const cached = memory.cached;
   if (cached && cached.authorizationEpoch === epoch && now - cached.at < TTL_MS) {
     hooks.onServed?.("memory");
     return { days: cached.days, freshness: freshness(cached.at, TTL_MS, { now, degraded: cached.degraded }) };
   }
 
-  const persisted = await readTimelineCache(db, teamId, posture, view);
+  await hooks.beforePersistedRead?.(attempt);
+  const read = await readTimelineCacheAt(db, teamId, view, epoch);
+  if (read.status === "epoch_changed") return null;
+  const persisted = read.status === "hit" ? read.entry : null;
   if (persisted) {
     mem.set(key, { days: persisted.days, at: persisted.at, degraded: persisted.degraded, authorizationEpoch: persisted.authorizationEpoch });
     // ONE envelope for both the fresh and the stale branch — `freshness()` derives `stale` from the same
@@ -782,6 +816,7 @@ async function getCachedWorkTimelineAttempt(
   // TIERRET-1: the same key is an `adm:` key, so salvage never crosses the authorization namespace in
   // either direction (old `vis:` prose is never read here; old code never reads `adm:` rows).
   // Same EPOCH too: prose written under a superseded authorization epoch is never carried.
+  await hooks.beforeSalvage?.(attempt);
   const days = attachSalvagedSummaries(
     built,
     await readSalvageableSummaries(db, teamId, viewKey(view), epoch),

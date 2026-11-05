@@ -23,11 +23,9 @@ export interface IdentityAuthoritySnapshot {
   connectorIds: ReadonlySet<string>;
 }
 
-export async function lockIdentityAuthority(teamId: string): Promise<void> {
-  await runSql(`select pg_advisory_xact_lock(hashtextextended($1,0))`, [
-    `${teamId}:identity-authority`,
-  ]);
-}
+// The boundary's one implementation (AIO-1167 R93: dependency-free so the access writers can take it).
+import { lockIdentityAuthority } from "@/lib/identity/authority-lock";
+export { lockIdentityAuthority };
 
 export interface IdentityMutationBoundaryHooks {
   /** Test-only scheduling point immediately before the first authority lock attempt. */

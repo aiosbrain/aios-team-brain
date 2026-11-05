@@ -147,6 +147,9 @@ const PATH = "gdrive/doc.md";
 const isIdentityLock = (e: Entry) => e.params[0] === `${TEAM}:identity-authority`;
 const isAuthorityLock = (e: Entry) => e.sql.includes("from integrations i") && e.sql.includes("for update of i, a");
 const isPrincipalLock = (e: Entry) => e.sql.includes("from api_keys k") && e.sql.includes("for update of k, m");
+/** The live-principal predicate, evaluated by its OWN non-locking statement after the lock (R87). */
+const isPrincipalValidation = (e: Entry) =>
+  e.sql.includes("from api_keys k") && e.sql.includes(") as valid ") && !e.sql.includes(" for update");
 const isProjectLock = (e: Entry) => /^select id, slug from projects where team_id = \$1 and id = any\(\$2::uuid\[\]\) order by id for (key share|share|no key update)$/.test(e.sql);
 const SOURCE_PROJECT_READ = "select id from projects where team_id = $1 and slug = $2";
 const isSourceProjectRead = (e: Entry) => e.sql === SOURCE_PROJECT_READ;
@@ -200,6 +203,10 @@ function driveDatabase(opts: {
   /** Rows the item `for update` returns, per call. Defaults to exactly what was asked for. */
   rowLocks?: Candidate[][];
   fail?: (sql: string, params: unknown[]) => Error | null;
+  /** Rows the bound key/member LOCK returns (default: the bound key). */
+  principalLock?: Row[];
+  /** Rows the live-principal VALIDATION returns (default: valid). */
+  principalValidation?: Row[];
 } = {}) {
   let occupantReads = 0;
   let mappingReads = 0;
@@ -232,7 +239,8 @@ function driveDatabase(opts: {
         progress: {}, progress_revision: 1,
       }];
     }
-    if (isPrincipalLock(e)) return [{ valid: true }];
+    if (isPrincipalLock(e)) return opts.principalLock ?? [{ id: "key" }];
+    if (isPrincipalValidation(e)) return opts.principalValidation ?? [{ valid: true }];
     if (isSourceProjectRead(e)) return [{ id: STORAGE }];
     if (isProjectLock(e)) return (params[1] as string[]).map(lockedProjectRow);
     if (sql.includes("exists(select 1 from project_groups")) {
@@ -566,6 +574,7 @@ describe("the whole Drive ingest: identity → connection → the complete proje
       indexOf(work, isIdentityLock),
       indexOf(work, isAuthorityLock),
       indexOf(work, isPrincipalLock),
+      indexOf(work, isPrincipalValidation),
       indexOf(work, isMappingRead),
       indexOf(work, isProjectLock),
       lastIndexOf(work, isProjectLock),
@@ -579,8 +588,10 @@ describe("the whole Drive ingest: identity → connection → the complete proje
     expect(order).toEqual([...order].sort((a, b) => a - b));
     expect(order[0]).toBe(0);
 
-    // The plan — between the principal lock and the first project lock — takes no lock.
-    expect(which(work.slice(order[2] + 1, order[4]), isLocking)).toEqual([]);
+    // The plan — between the principal lock and the first project lock, the non-locking live-principal
+    // validation included — takes no lock; the validation follows the lock and precedes planning.
+    expect(which(work.slice(order[2] + 1, order[5]), isLocking)).toEqual([]);
+    expect(order[3]).toBe(order[2] + 1);
     // COMPLETE and in final mode: audience shared, storage written, the canonical project by key.
     expect(which(work, isProjectLock).map((entry) => [entry.params[1], mode(entry)])).toEqual([
       [[project(1)], "share"],
@@ -589,8 +600,8 @@ describe("the whole Drive ingest: identity → connection → the complete proje
       [[elsewhere], "key share"],
     ]);
     // NO LATE PROJECT: nothing touches a project row once the provider identity is held.
-    expect(which(work.slice(order[6]), isProjectLock)).toEqual([]);
-    expect(which(work.slice(order[6]), (e) => /\bfrom projects\b|\binto projects\b/.test(e.sql) && isLocking(e))).toEqual([]);
+    expect(which(work.slice(order[7]), isProjectLock)).toEqual([]);
+    expect(which(work.slice(order[7]), (e) => /\bfrom projects\b|\binto projects\b/.test(e.sql) && isLocking(e))).toEqual([]);
 
     // One key per path identity: no slug-keyed advisory anywhere.
     expect(which(work, isSlugPathLock)).toEqual([]);
@@ -620,6 +631,22 @@ describe("the whole Drive ingest: identity → connection → the complete proje
     expect(which(c.work, isProjectLock)).toEqual([]);
     expect(which(c.work, isProviderLock)).toEqual([]);
     expect(which(c.work, isItemRowLock)).toEqual([]);
+
+    // Fail closed on the bound principal too (R87's two statements): no locked key/member row, a
+    // validation row that is not valid, and no validation row each refuse before planning.
+    for (const principal of [
+      { principalLock: [] },
+      { principalValidation: [{ valid: false }] },
+      { principalValidation: [] },
+    ]) {
+      const refused = track(new ScriptedConnection(driveDatabase(principal)));
+      await expect(ingestApiItem(NOT_A_DATABASE, auth, drivePayload(), "team", undefined, "team", execution))
+        .rejects.toMatchObject({ code: "connector_principal_required", status: 403 });
+      expect(which(refused.work, isPrincipalLock)).toHaveLength(1);
+      expect(which(refused.work, isPrincipalValidation)).toHaveLength("principalLock" in principal ? 0 : 1);
+      expect(which(refused.work, isMappingRead)).toEqual([]);
+      expect(which(refused.work, isProjectLock)).toEqual([]);
+    }
   });
 
   it("RETRYABLE: the first attempt rolls back whole and the second plans again from the connection authority", async () => {
