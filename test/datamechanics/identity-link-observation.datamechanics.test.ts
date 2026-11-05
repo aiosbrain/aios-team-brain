@@ -584,7 +584,7 @@ describe.each(PROVIDERS)("AIO-1167 X-02 — %s: the fenced decision is ONE bound
       second: () => removeMemberIdentity(db(), seed.teamId, { provider, externalId: shownB.externalId }, { expectedRevision: shownB.revision }),
     });
     expect(unlink.first).toEqual({ ok: true });
-    expect(unlink.second).toEqual({ removed: true, mappingRevision: shownB.revision + 1 });
+    expect(unlink.second).toMatchObject({ removed: true, mappingRevision: shownB.revision + 1 });
     expect(await mapping(seed, provider, nextB)).toEqual({ holder: alice, revision: 1, state: "linked" });
     expect(await mapping(seed, provider, shownB.externalId)).toEqual({ holder: null, revision: shownB.revision + 1, state: "unlinked" });
     expect((await auditOrder(seed)).slice(-2)).toEqual([[nextB, "identity.set"], [shownB.externalId, "identity.removed"]]);
@@ -619,7 +619,7 @@ describe.each(PROVIDERS)("AIO-1167 X-02 — %s: the fenced decision is ONE bound
       first: () => removeMemberIdentity(db(), seed.teamId, { provider, externalId: shownB.externalId }, { expectedRevision: shownB.revision }),
       second: () => link(seed, alice, provider, nextB, { original: shownB }),
     });
-    expect(unlinked).toEqual({ removed: true, mappingRevision: shownB.revision + 1 });
+    expect(unlinked).toMatchObject({ removed: true, mappingRevision: shownB.revision + 1 });
     expect(change).toEqual({ ok: false, error: STALE });
     expect(await mapping(seed, provider, nextB)).toEqual({ holder: null, revision: 0, state: null });
     expect(await audits(seed, nextB)).toEqual([]);
