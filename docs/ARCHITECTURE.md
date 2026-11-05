@@ -1182,9 +1182,10 @@ nothing. An explicit `file.trashed=true` is persisted in that removal obligation
 absence gates, so a standing root/document read restriction blocks reads but does not block the
 claim-aware retirement; ambiguous `removed=true` remains on the cross-stream barrier/probe path.
 Trash evidence is history, though (AIO-1167 R61): the brain claim is one per connection while trash
-obligations are retained per stream, so a retained trash removal settles unread only while no
-READABLE peer stream claims the document (`_explicit_trash_verdict`). A readable peer's claim — the
-trace of a later restoration that stream ingested — sends it to the document's own metadata: trashed
+obligations are retained per stream, so a retained trash removal settles unread only while NO peer
+stream claims the document (`_explicit_trash_verdict`). Any peer's claim — possibly the trace of a
+later restoration that stream ingested, whether or not it can read its change log now (stream
+availability is not chronology, R62) — sends it to the document's own metadata: trashed
 or not-found removes, readable and not trashed SUPERSEDES the obsolete obligation (never sent, durable
 across reopen and replacement workers), a standing restriction holds it unread, and any other failure
 retries. Tokens of two streams are never ordered.

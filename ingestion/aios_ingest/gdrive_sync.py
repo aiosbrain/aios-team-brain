@@ -4136,20 +4136,18 @@ def _explicit_trash_verdict(
     complete snapshot would reactivate it. Opaque tokens of two streams cannot be ordered, so the
     claim is weighed against the provider instead:
 
-      · no other READABLE stream claims it — ``absent`` at once, with no read (prompt trash, R51
-        final 2). A claim held by a stream that cannot read its change log (``_cannot_read``) is
-        retained history, not an observation of a restoration, and never sends trash to a probe;
-      · claimed by a readable stream — the document's own metadata decides: trashed or not found is
+      · no other stream claims it at all — ``absent`` at once, with no read (prompt trash, R51
+        final 2);
+      · claimed by ANY other stream — the document's own metadata decides: trashed or not found is
         ``absent`` (a genuinely later trash); readable and not trashed, the trash is OBSOLETE —
         superseded, never sent (``superseded``); unreadable otherwise, nothing is concluded
-        (``unverified``);
+        (``unverified``). Whether that stream can read its change log NOW says nothing about when
+        its claim was made (R62): a stream that ingested the restoration and then lost its start
+        token still holds the restored claim, so stream availability is never chronology;
       · so claimed under a standing provider minimum — ``restricted``: retained, not read early.
 
     A deferral of the read is raised for the removal drain's owners, as for any probe."""
-    if all(
-        _cannot_read(state.get_progress(namespace))
-        for namespace in state.streams_claiming(connection_id, work.generation, work.namespace, work.item_key)
-    ):
+    if not state.streams_claiming(connection_id, work.generation, work.namespace, work.item_key):
         return "absent"
     if restricted:
         state.fail_work(work, _RESTRICTED_PROBE_PENDING, not_before=work.not_before, failure=False)

@@ -28,7 +28,8 @@ from aios_ingest.brain_client import BrainError
 from aios_ingest.state import StateStore
 from test_document_restrictions import clock  # noqa: F401 (a fixture)
 from test_gdrive_upgrade import (
-    _HELD, _SECOND_INTEGRATION, _WORLD_INTEGRATION, _ClaimLedger, _DriveWorld, _owed, _retry_at,
+    _HELD, _SECOND_INTEGRATION, _WORLD_INTEGRATION, _ClaimLedger, _DriveWorld, _owed, _ProviderHttpError,
+    _retry_at,
 )
 
 GEN = 9
@@ -231,4 +232,124 @@ async def test_control_a_restricted_document_is_not_read_early_and_its_removal_i
     await world.run(state)
     assert world.removed == [] and _owed_trash(state, world) == []
     assert world.ledger.claims["doc-1"] == {_WORLD_INTEGRATION, _SECOND_INTEGRATION}
+    state.close()
+
+
+# ── R62: a peer that is unreadable NOW still holds a LATER restoration's claim ──────────────────
+
+def _block_b(world):
+    """B owes a controlled recovery and its drive refuses the start token it begins with."""
+    world.progress["streams"]["shared-b"]["checkpoint_id"] = "page-this-sidecar-never-retired"
+    world.revision += 1
+    world.token_errors["shared-b"] = _ProviderHttpError(403)
+
+
+async def _restored_then_b_blocked(tmp_path, monkeypatch, name, *, sink, through):
+    world, path, state, fences = await _refused_trash_then_restored(
+        tmp_path, monkeypatch, name, sink=sink, through=through, reopen=True,
+    )
+    _block_b(world)
+    blocked = await world.run(state)
+    b = world.namespace("shared-b")
+    peer = state.get_progress(b)
+    assert gdrive_sync._cannot_read(peer), "B is start-token recovery-blocked"
+    assert blocked.authoritative_complete is False
+    assert "doc-1" in state.membership_ids(b, GEN, snapshot_id=peer.active_snapshot), "B's active snapshot holds it"
+    assert state.streams_claiming(_WORLD_INTEGRATION, GEN, world.namespace("shared-a"), "doc-1") == [b]
+    assert world.ledger.claims["doc-1"] == {_WORLD_INTEGRATION, _SECOND_INTEGRATION}
+    assert len(_owed_trash(state, world)) == 1, "A's older trash is still owed"
+    state.close()
+    return world, path, StateStore(path), fences  # reopened: the next run is a replacement fence
+
+
+@pytest.mark.parametrize("through", ["changes", "baseline"])
+@pytest.mark.parametrize("sink", ["refused", "lost"])
+@pytest.mark.asyncio
+async def test_a_blocked_peers_restored_claim_is_never_retired_by_an_older_trash(
+    tmp_path, monkeypatch, through, sink,
+):
+    world, path, state, fences = await _restored_then_b_blocked(
+        tmp_path, monkeypatch, f"blocked-{through}-{sink}.sqlite", sink=sink, through=through,
+    )
+    removed_before, pushed = list(world.removed), world.pushed.count("doc-1")
+    fence_before = fences[-1]
+
+    _retry_at(state, world.namespace("shared-a"), "doc-1", None)
+    world.calls.clear()
+    await world.run(state)
+
+    assert fences[-1] > fence_before, "a replacement execution fence"
+    assert ("metadata", "doc-1") in world.calls, "stream availability is not chronology: the provider decides"
+    assert world.removed == removed_before, "no removal is sent"
+    assert _owed_trash(state, world) == [], "the old trash is durably superseded"
+    assert world.ledger.claims["doc-1"] == {_WORLD_INTEGRATION, _SECOND_INTEGRATION}
+    assert "doc-1" not in world.ledger.deleted
+    assert world.pushed.count("doc-1") == pushed, "no extra upsert"
+
+    # A further reopen keeps it settled — B still blocked, nothing re-sent.
+    state.close()
+    state = StateStore(path)
+    await world.run(state)
+    assert world.removed == removed_before and _owed_trash(state, world) == []
+    assert world.ledger.claims["doc-1"] == {_WORLD_INTEGRATION, _SECOND_INTEGRATION}
+    assert world.pushed.count("doc-1") == pushed
+    assert gdrive_sync._cannot_read(state.get_progress(world.namespace("shared-b")))
+    state.close()
+
+
+@pytest.mark.asyncio
+async def test_a_blocked_peer_under_a_document_restriction_reads_nothing_until_it_expires(
+    tmp_path, monkeypatch, clock,
+):
+    world, _path, state, _ = await _restored_then_b_blocked(
+        tmp_path, monkeypatch, "blocked-restricted.sqlite", sink="refused", through="changes",
+    )
+    minimum = (clock.at + timedelta(hours=1)).isoformat()
+    state.restrict_document(_WORLD_INTEGRATION, GEN, "account", "doc-1", minimum, "provider_unavailable")
+    _retry_at(state, world.namespace("shared-a"), "doc-1", None)
+    world.calls.clear()
+    await world.run(state)
+
+    assert [call for call in world.calls if call in (("metadata", "doc-1"), ("doc", "doc-1"))] == []
+    assert world.removed == [] and len(_owed_trash(state, world)) == 1
+    assert world.ledger.claims["doc-1"] == {_WORLD_INTEGRATION, _SECOND_INTEGRATION}
+
+    clock.at += timedelta(hours=2)
+    _retry_at(state, world.namespace("shared-a"), "doc-1", None)
+    world.calls.clear()
+    await world.run(state)
+    assert ("metadata", "doc-1") in world.calls
+    assert world.removed == [] and _owed_trash(state, world) == []
+    assert world.ledger.claims["doc-1"] == {_WORLD_INTEGRATION, _SECOND_INTEGRATION}
+    state.close()
+
+
+@pytest.mark.parametrize("loss", ["trashed", "deleted"])
+@pytest.mark.parametrize("other", ["other-connection", "last-claim"])
+@pytest.mark.asyncio
+async def test_control_a_current_loss_is_still_removed_promptly_while_the_peer_is_blocked(
+    tmp_path, monkeypatch, loss, other,
+):
+    world, _path, state, _ = await _restored_then_b_blocked(
+        tmp_path, monkeypatch, f"blocked-{loss}-{other}.sqlite", sink="refused", through="changes",
+    )
+    if other == "last-claim":
+        world.ledger.claims["doc-1"].discard(_SECOND_INTEGRATION)
+    # Provider truth now: trashed again, or gone (404). B cannot read its log to say so.
+    if loss == "trashed":
+        world.files["doc-1"]["trashed"] = True
+    else:
+        del world.files["doc-1"]
+    _retry_at(state, world.namespace("shared-a"), "doc-1", None)
+    world.calls.clear()
+    await world.run(state)
+
+    assert ("metadata", "doc-1") in world.calls
+    assert "doc-1" in world.removed, "a confirmed current loss is removed promptly"
+    assert (_WORLD_INTEGRATION, "doc-1") in world.ledger.retired
+    assert _owed_trash(state, world) == []
+    if other == "other-connection":
+        assert world.ledger.claims["doc-1"] == {_SECOND_INTEGRATION} and "doc-1" not in world.ledger.deleted
+    else:
+        assert "doc-1" in world.ledger.deleted, "the last claim: the content is suppressed"
     state.close()

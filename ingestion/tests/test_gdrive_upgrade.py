@@ -7727,13 +7727,12 @@ async def test_stale_claim_of_a_recovery_blocked_peer_does_not_swallow_a_confirm
     promptly = await world.run(state)
 
     # The provider's answer made the removal the connection's, and it was reconciled while the peer
-    # still holds it and still cannot recover. A deleted or access-lost document was read for itself
-    # to get that answer; explicit trash carries it in the change, so it is never read — the stale
-    # claim neither withholds it nor sends it to a probe (AIO-1167 R51 final 2).
-    if loss == "trashed":
-        assert ("metadata", "doc-1") not in world.calls
-    else:
-        assert ("metadata", "doc-1") in world.calls
+    # still holds it and still cannot recover. The document was read for itself to get that answer —
+    # explicit trash too: a PEER CLAIM may be the trace of a later restoration whatever that peer's
+    # availability now, so trash evidence with any peer claimant is re-verified (AIO-1167 R62; the
+    # no-peer zero-read path is pinned in test_explicit_trash_evidence / test_gdrive_cross_stream_trash).
+    # The stale claim still never withholds a confirmed loss.
+    assert ("metadata", "doc-1") in world.calls
     assert world.removed == ["doc-1"]
     assert state.pending_count(origin, 9) == 0 and _barrier_peers(state, origin) == []
     assert state.membership_ids(origin, 9) == ["doc-ka"]
