@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { BASE_URL, convergeTeam, issueKeyFor, keyHeaders, seedTeam } from "./http-helpers";
+import { BASE_URL, convergeTeam, identityRepairStatus, issueKeyFor, keyHeaders, seedTeam } from "./http-helpers";
 import { db, ingest } from "../datamechanics/helpers";
 import { randomUUID } from "node:crypto";
 
@@ -73,6 +73,9 @@ describe("GET /api/v1/timeline (HTTP)", () => {
     const seed = await seedTeam();
     await seedCommit(seed, "internal-only");
     const { key } = await issueKeyFor(seed, "external");
+    // Adding the external member is a roster mutation: the fixture converged the identity repair it
+    // owes, so a 200 here is the route's answer to a settled team, not a race with a pending repair.
+    expect(await identityRepairStatus(seed)).toBe("complete");
 
     const res = await fetch(TIMELINE, { headers: keyHeaders(key, seed.teamSlug) });
     expect(res.status).toBe(200);

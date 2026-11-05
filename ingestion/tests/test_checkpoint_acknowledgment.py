@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import copy
 import json
+import time
 from types import SimpleNamespace
 
 import httpx
@@ -101,6 +102,20 @@ def world(monkeypatch):
 
     async def sleep(delay):
         w.clock += delay
+
+    # ONE clock domain (PR #759 CI): the coordinator stamps the run deadline from
+    # ``gdrive_sync.time.monotonic`` and BrainClient enforces it with ``monotonic_fn``. Both read the
+    # synthetic ``w.clock``, advanced only by the fake sleeps — otherwise a real uptime below the
+    # synthetic origin makes a valid deadline look expired to the client. Production enforcement is
+    # unchanged; only the coordinator module's view of ``time`` is replaced here.
+    class _SyntheticTime:
+        def __getattr__(self, name):
+            return getattr(time, name)
+
+        def monotonic(self):
+            return w.clock
+
+    monkeypatch.setattr("aios_ingest.gdrive_sync.time", _SyntheticTime())
 
     class Client(BrainClient):
         """The real revision/uncertainty owner on the wire; Google-facing calls are doubles."""
