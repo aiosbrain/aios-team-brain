@@ -767,6 +767,25 @@ def _consumed_drive(
     return physical
 
 
+def _user_log_route_proven(
+    source: GoogleDriveSource, root_kind: str, physical_drive: str | None, consumed_by: str,
+) -> bool:
+    """Positive proof that a root consumed by ``consumed_by`` belongs there (AIO-1167 R63).
+
+    ``_consumed_drive`` keeps an explicit FILE root on the user log when membership is UNKNOWN — a
+    continuity fallback, not evidence. Where a root's obligation is DISCHARGED onto the user log (a
+    relocation cancelled back to it, a deferred root settled by enumeration, a membership-event debt
+    settled), that fallback must not count: only a file physically in My Drive, or a Shared Drive that
+    definitively answers non-membership, proves the user log consumes it. Any other stream, and any
+    folder root, is unaffected (its consumed drive IS its physical drive). A provider deferral of the
+    membership read is raised for the caller's owners."""
+    if consumed_by != "my-drive" or root_kind != "file":
+        return True
+    if physical_drive in (None, "", "my-drive"):
+        return True
+    return _shared_drive_membership(source, str(physical_drive)) == "nonmember"
+
+
 def _start_token_restricted(
     state: StateStore, execution: GdriveExecution, options: dict[str, Any], drive_id: str,
 ) -> bool:
@@ -995,7 +1014,20 @@ def _reobserve_stalled_relocations(
                 deferred.append((root_id, exc))
             continue
         if observed.state == "here":
-            state.cancel_relocation(integration_id, generation, root_kind, root_id)
+            # Back on the user log only on proof (R63): an unknown membership keeps the relocation,
+            # its pending destination and its claims exactly as they are.
+            try:
+                proven = _user_log_route_proven(source, root_kind, observed.physical_drive_id, binding.drive_id)
+            except ProviderDeferred as exc:
+                if exc.category == "rate_limited" or exc.category in _LOCAL_DEADLINE_CATEGORIES:
+                    raise
+                if observe is not None:
+                    observe(root_id, exc)
+                if deferred is not None:
+                    deferred.append((root_id, exc))
+                continue
+            if proven:
+                state.cancel_relocation(integration_id, generation, root_kind, root_id)
         elif observed.state == "elsewhere" and observed.drive_id != binding.pending_drive_id:
             state.mark_root_relocating(
                 integration_id, generation, root_kind, root_id, binding.drive_id,
@@ -1037,7 +1069,20 @@ def _reobserve_conflicted_roots(
                 deferred.append((root_id, exc))
             continue
         if observed.state == "here":
-            state.settle_root(integration_id, generation, root_kind, root_id)
+            # Cleared on the user log only on proof (R64): `_consumed_drive`'s unknown-membership
+            # continuity answer is not one, and keeps the conflict debt (partial).
+            try:
+                proven = _user_log_route_proven(source, root_kind, observed.physical_drive_id, binding.drive_id)
+            except ProviderDeferred as exc:
+                if exc.category == "rate_limited" or exc.category in _LOCAL_DEADLINE_CATEGORIES:
+                    raise
+                if observe is not None:
+                    observe(root_id, exc)
+                if deferred is not None:
+                    deferred.append((root_id, exc))
+                continue
+            if proven:
+                state.settle_root(integration_id, generation, root_kind, root_id)
         elif observed.state == "elsewhere" and observed.drive_id:
             state.mark_root_relocating(
                 integration_id, generation, root_kind, root_id, binding.drive_id,
@@ -1078,10 +1123,8 @@ def _revalidate_membership_event_roots(
             continue
         try:
             observed = _observe_root(source, root_id, binding.drive_id, seen, root_kind)
-            physical = observed.physical_drive_id
-            proven_here = observed.state == "here" and (
-                physical in (None, "my-drive", binding.drive_id)
-                or _shared_drive_membership(source, str(physical)) == "nonmember"
+            proven_here = observed.state == "here" and _user_log_route_proven(
+                source, root_kind, observed.physical_drive_id, binding.drive_id,
             )
         except ProviderDeferred as exc:
             if exc.category == "rate_limited" or exc.category in _LOCAL_DEADLINE_CATEGORIES:
@@ -2949,6 +2992,38 @@ async def _run_gdrive_stream_unlocked(
                         state.settle_root(execution.integration_id, generation, root_kind, root_id)
                 return held
 
+            def direct_root_left(file_id: str, file: dict[str, Any]) -> bool | None:
+                """Whether a direct, bound FILE root is consumed by another stream now (R56) — or
+                ``None`` when that cannot be decided now and the change is HELD (AIO-1167 R64).
+
+                The routing decision may be the first call this run makes to the membership oracle
+                for the root's Shared Drive, so it is admitted and deferred by the same owners as a
+                root read: a root under a standing provider minimum is not probed early; a quota
+                answer is the account's hold (raised: this page is not materialized, the cursor
+                stays); a provider-named minimum becomes this ROOT's restriction and the page goes
+                on, its claim standing; any other deferral — a timeout, the run's own budget — is
+                ``unverified``: the page is not retained and is read again, and no provider minimum
+                is recorded for it."""
+                physical = str(file.get("driveId") or "my-drive")
+                answered = getattr(source, _DRIVE_MEMBERSHIP_CACHE, None)
+                probes = physical != "my-drive" and not (isinstance(answered, dict) and physical in answered)
+                if probes and file_id in restricted_roots:
+                    return None
+                try:
+                    return _consumed_drive(source, "file", file, drive_id) != drive_id
+                except ProviderDeferred as exc:
+                    if exc.category == "rate_limited":
+                        raise _account_hold(exc) from exc
+                    if exc.category not in _LOCAL_DEADLINE_CATEGORIES and _restrict_resource(
+                        state, execution, credential_identity(options), file_id, exc,
+                    ):
+                        restricted_roots.add(file_id)
+                        _count(summary, exc.category)
+                        _count_retry_after_diagnostic(summary, exc)
+                        return None
+                    unverified.append((file_id, exc))
+                    return None
+
             last_trashed: dict[str, bool] = {}
             # Membership removals that come from explicit trash, kept apart so they follow the same
             # final observation as the trash obligation they belong to (R51 P2, below).
@@ -3074,10 +3149,16 @@ async def _run_gdrive_stream_unlocked(
                     and str(row["drive_id"]) == drive_id
                 ), None)
                 in_scope = bool(roots or direct or drive_root)
-                moved_out = bool(
-                    direct and file_id in bound_root_kinds and file
-                    and _consumed_drive(source, "file", file, drive_id) != drive_id
-                )
+                moved_out = False
+                if direct and file_id in bound_root_kinds and file and not trashed:
+                    # Explicit trash needs no routing decision (R51 final 2), so it never probes.
+                    left = direct_root_left(file_id, file)
+                    if left is None:
+                        # Held: the root's claim stands, and the rescan this seeds defers it (a
+                        # restricted root) — or the page is not retained at all (unverified).
+                        subtree_recovery_required = True
+                        continue
+                    moved_out = left
                 if selected and not in_scope and not removed and not moved_out and (
                     deferred_here & set(state.membership_roots(namespace, generation, file_id))
                 ):
@@ -3458,6 +3539,7 @@ async def _enumerate_baseline(
             obligations: list[tuple[str, str, dict[str, Any]]] = []
             membership_additions: list[tuple[str, str, str]] = []
             bound_drive = (root_bindings or {}).get(("file", str(root["root_id"])))
+            consumed, route_proven = drive_id, False  # this root's routing, read with its metadata
             if another_streams("file", root["root_id"]):
                 # The stream of the drive that contains this root owns it — it was bound there
                 # before this local state was written, or it was read there since. Its page here
@@ -3476,12 +3558,21 @@ async def _enumerate_baseline(
             else:
                 try:
                     meta = source._metadata(root["root_id"])
+                    # The whole observation, routing included (AIO-1167 R64): which stream consumes
+                    # the root, and whether a deferred user-log root's route is PROVEN (R63), may be
+                    # the run's first call to the membership oracle. Read once, here.
+                    if bound_drive is not None:
+                        consumed = _consumed_drive(source, "file", meta, drive_id)
+                        route_proven = consumed != drive_id or _user_log_route_proven(
+                            source, "file", str(meta.get("driveId") or "my-drive"), drive_id,
+                        )
                 except BrainError:
                     raise
                 except ProviderDeferred as exc:
                     # A quota answer is the account's (re-raised as its hold) and the run's own
-                    # budget stops the run; any other deferral is THIS root's (R50 F3): deferred
-                    # exactly as a restricted one, its named minimum kept.
+                    # budget stops the run; any other deferral — of the metadata or of the
+                    # membership answer — is THIS root's (R50 F3): deferred exactly as a restricted
+                    # one, its named minimum kept, its siblings enumerated.
                     defer_root("file", str(root["root_id"]), exc)
                     meta = None
                     membership_additions.extend(
@@ -3497,14 +3588,14 @@ async def _enumerate_baseline(
                 pages_read += 1
             if meta is None:
                 pass
-            elif bound_drive is not None and _consumed_drive(source, "file", meta, drive_id) != drive_id:
+            elif bound_drive is not None and consumed != drive_id:
                 # This stream's cursor can no longer observe the document. Reading it once here
                 # and then reporting the stream current would hide every later edit: the root is
                 # recorded as relocating toward the drive it was read in, and this baseline stops
                 # short of publishing. That drive's stream takes it over once it has a token.
                 state.mark_root_relocating(
                     integration_id, generation, "file", str(root["root_id"]), drive_id,
-                    destination=_consumed_drive(source, "file", meta, drive_id),
+                    destination=consumed,
                 )
                 raise SelectedRootRelocated(
                     f"selected file {root['root_id']} is no longer in the drive it was bound to"
@@ -3519,8 +3610,13 @@ async def _enumerate_baseline(
                         "file_id": str(meta["id"]), "metadata": meta,
                     }))
             if meta is not None and bound_drive is not None:
-                # Read by this enumeration: a deferred file root is settled here, and only here.
-                state.settle_root(integration_id, generation, "file", str(root["root_id"]), enumerated=True)
+                # Read by this enumeration: a deferred file root is settled here, and only here — and
+                # on the user log only with positive routing proof (R63): a deferred user-log file
+                # root needs BOTH its enumeration and coverage by its consuming stream. Unproven, it
+                # stays deferred (partial, its claims standing) and the controlled rescan retries it.
+                held = state.root_obligations(integration_id, generation).get(("file", str(root["root_id"])))
+                if held is None or held.status != "uncertain" or route_proven:
+                    state.settle_root(integration_id, generation, "file", str(root["root_id"]), enumerated=True)
             if state.projected_pending_count(
                 namespace, generation, [item_key for item_key, _action, _payload in obligations],
             ) > _MAX_PENDING_PER_STREAM:

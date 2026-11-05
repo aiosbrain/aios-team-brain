@@ -1315,13 +1315,16 @@ class StateStore:
         A file root consumed through the user log (``my-drive``) because its account was not a
         member of the Shared Drive it lives in is reported there only while that stays true; a
         membership gain is announced by a DRIVE-level change that names no file. Which drive holds
-        each such root is not recorded, so every ``bound`` user-log file root is made ``uncertain``
-        with ``ROOT_MEMBERSHIP_EVENT_DETAIL`` — a durable, published debt that keeps the connection
-        partial until revalidation proves the consuming stream. Nothing is selected, removed or
-        unbound: its claims and the user log's snapshot stand. Idempotent; returns the roots marked."""
+        each such root is not recorded, so every ``bound`` or ``uncertain`` user-log file root is
+        made ``uncertain`` with ``ROOT_MEMBERSHIP_EVENT_DETAIL`` — a durable, published debt that
+        keeps the connection partial until revalidation proves the consuming stream. A DEFERRED root
+        keeps its ``ROOT_DEFERRED_PREFIX`` detail (``_write_root_uncertain``): that obligation is the
+        barrier, and its enumeration settles it only with the same routing proof (R63). Nothing is
+        selected, removed or unbound: its claims and the user log's snapshot stand. Idempotent;
+        returns the roots considered."""
         rows = self._db.execute(
             "SELECT root_kind,root_id FROM selection_root_bindings WHERE connection_id=? AND generation=? "
-            "AND root_kind='file' AND drive_id='my-drive' AND status='bound' ORDER BY root_id",
+            "AND root_kind='file' AND drive_id='my-drive' AND status IN ('bound','uncertain') ORDER BY root_id",
             (connection_id, generation),
         ).fetchall()
         marked = [(str(row["root_kind"]), str(row["root_id"])) for row in rows]

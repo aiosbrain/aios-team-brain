@@ -1076,14 +1076,30 @@ unstarted, waiting on a start token it cannot get, or started with its change lo
 serves) is reclassified each run on the same evidence (`_reclassify_nonmember_file_roots`): it is
 recorded relocating toward the user log and keeps its claims through the ordinary hand-over. The
 opposite transition can arrive with no file row: a membership gain is reported in the user log as a
-DRIVE-level change (R61). Any Shared Drive event there makes every bound user-log file root
-`uncertain` with `ROOT_MEMBERSHIP_EVENT_DETAIL` (`StateStore.invalidate_user_log_file_roots`, recorded
+DRIVE-level change (R61). Any Shared Drive event there makes every bound or uncertain user-log file
+root `uncertain` with `ROOT_MEMBERSHIP_EVENT_DETAIL` — a DEFERRED root keeps its deferred detail, which
+is already the barrier (R63) — (`StateStore.invalidate_user_log_file_roots`, recorded
 before the page commits and published like any root transition), and each run revalidates it
 (`_revalidate_membership_event_roots`) on the same probes: consumed by its drive's own stream now, it
 relocates there through the ordinary hand-over; in My Drive, or its drive answering non-membership, it
 settles; an unknown membership, an unreadable root or a deferral keeps it uncertain — and completion
 partial. Only that revalidation may settle it (`settle_root(..., revalidated=True)`); nothing else in
-the drive becomes selected. Every
+the drive becomes selected. `_consumed_drive` keeps a user-log file root on the user log when membership
+is UNKNOWN; that continuity fallback is never DISCHARGE evidence (R63): one predicate,
+`_user_log_route_proven` (the file is physically in My Drive, or its Shared Drive answers
+non-membership), gates every discharge onto the user log — membership-event revalidation, cancelling a
+stalled relocation back to it (`_reobserve_stalled_relocations`; unknown keeps the relocation, its
+destination, its claims and partial completion), and the enumeration that settles a deferred user-log
+file root. A deferred user-log explicit-file root therefore needs BOTH its enumeration and positive
+coverage by its consuming stream; unproven, it stays deferred and the controlled rescan retries it.
+The same proof clears a root-authority conflict on the user log (`_reobserve_conflicted_roots`, R64).
+Routing may be the run's FIRST call to the membership oracle, so it has the same owners as a root
+read (R64): ordinary change classification of a bound file root (`direct_root_left`) admits a standing
+root restriction before probing, sends a quota answer to the account hold (page not materialized,
+cursor kept), records a provider-named minimum as that root's restriction and holds the change behind
+the rescan it seeds (siblings and other streams go on), and treats a timeout or the run's own budget as
+an unverified page read again — no provider minimum. Explicit-file recovery enumeration reads the root's
+metadata, consuming stream and routing proof once, inside the root's deferral boundary (`defer_root`). Every
 hand-over UNIONS the drive it left into the root's generation-scoped predecessor set
 (`selection_root_bindings.handoff_sources`, a legacy scalar `handoff_from` read as a one-drive set;
 carried in the checkpoint's roots evidence and unioned back on restore without overwriting a newer local

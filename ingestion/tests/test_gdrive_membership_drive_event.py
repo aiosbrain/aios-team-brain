@@ -26,7 +26,7 @@ import pytest
 from aios_ingest import gdrive_sync
 from aios_ingest.brain_client import BrainError
 from aios_ingest.sources.gdrive import ProviderDeferred
-from aios_ingest.state import ROOT_MEMBERSHIP_EVENT_DETAIL, StateStore
+from aios_ingest.state import ROOT_DEFERRED_PREFIX, ROOT_MEMBERSHIP_EVENT_DETAIL, StateStore
 from test_gdrive_upgrade import _WORLD_INTEGRATION, _DriveWorld, _Lazy, _ProviderHttpError
 
 GEN = 9
@@ -291,7 +291,7 @@ async def test_control_an_unproven_revalidation_stays_partial(tmp_path, monkeypa
         world.logs["my-drive"].append({"fileId": "file-f", "removed": True})
     elif answer == "root-read-failure":
         world.unreadable["file-f"] = _ProviderHttpError(500)
-    else:
+    elif answer == "retry-after":
         world.unreadable["file-f"] = ProviderDeferred(
             "Retry-After", not_before=FAR, category="provider_unavailable", provider_deadline=True,
         )
@@ -304,6 +304,10 @@ async def test_control_an_unproven_revalidation_stays_partial(tmp_path, monkeypa
         assert _binding(state) == ("uncertain", "my-drive", None, ROOT_MEMBERSHIP_EVENT_DETAIL)
     assert ("start", "shared-d") not in world.calls
     assert world.removed == []
+    if answer.startswith("unknown-membership"):
+        # Isolated: the metadata stays READABLE (no injected deferral); only membership is unknown.
+        assert "file-f" not in world.unreadable and ("metadata", "file-f") in world.calls
+        assert ("drives.get", "shared-d") in world.calls
     if answer != "unknown-membership-and-a-file-row":  # that row ends only the user log's own membership
         assert "file-f" in state.membership_ids(world.namespace("my-drive"), GEN), "the user log's claim stands"
     state.close()
@@ -324,4 +328,173 @@ async def test_control_a_duplicated_drive_event_is_idempotent(tmp_path, monkeypa
     assert world.calls.count(("start", "shared-d")) <= 1
     assert state.get_progress(world.namespace("shared-d")).baseline_start_token == "shared-d@0"
     assert world.removed == []
+    state.close()
+
+
+# ── R63: discharge onto the user log needs positive routing proof ─────────────────────────────────
+
+def _claims_stand(world, state, reconciled):
+    assert world.removed == [], "nothing removed"
+    assert world.reconciled == reconciled, "no complete snapshot reconciled meanwhile"
+
+
+async def _stalled_relocation(tmp_path, monkeypatch, name):
+    """Membership gained by a drive event; the destination refuses its start token."""
+    world, path, state = await _nonmember_baseline(tmp_path, monkeypatch, name)
+    await _gain_membership_by_drive_event_only(world, state)
+    world.token_errors["shared-d"] = _ProviderHttpError(403)
+    reconciled = list(world.reconciled)
+    blocked = await world.run(state)
+    assert _binding(state)[:3] == ("relocating", "my-drive", "shared-d")
+    assert blocked.authoritative_complete is False
+    return world, path, state, reconciled
+
+
+@pytest.mark.asyncio
+async def test_f1_unknown_membership_never_cancels_a_stalled_relocation(tmp_path, monkeypatch):
+    world, path, state, reconciled = await _stalled_relocation(tmp_path, monkeypatch, "f1.sqlite")
+    world.membership["shared-d"] = "unknown"  # a 403; metadata stays readable, the token still refused
+    for reopen in (False, True, False):
+        if reopen:
+            state.close()
+            state = StateStore(path)
+        world.calls.clear()
+        summary = await world.run(state)
+        assert ("metadata", "file-f") in world.calls and ("drives.get", "shared-d") in world.calls
+        assert "file-f" not in world.unreadable, "isolated: no injected metadata deferral"
+        assert summary.authoritative_complete is False
+        assert _binding(state)[:3] == ("relocating", "my-drive", "shared-d"), "relocation and destination kept"
+        assert _remote_root(world)["status"] == "relocating"
+        assert _remote_root(world)["pending_drive_id"] == "shared-d"
+        _claims_stand(world, state, reconciled)
+    state.close()
+
+
+@pytest.mark.parametrize("evidence", ["proven-member", "definitive-nonmember", "moved-to-my-drive"])
+@pytest.mark.asyncio
+async def test_f1_controls_only_positive_evidence_resolves_a_stalled_relocation(tmp_path, monkeypatch, evidence):
+    world, path, state, _reconciled = await _stalled_relocation(tmp_path, monkeypatch, f"f1-{evidence}.sqlite")
+    if evidence == "proven-member":
+        world.token_errors.pop("shared-d")
+        world.calls.clear()
+        summary, state = await _converge(world, state, path)
+        assert summary.authoritative_complete is True and _binding(state) == ("bound", "shared-d", None, None)
+        in_destination = [
+            call for call in world.calls if call[0] in ("start", "changes", "list") and call[1] == "shared-d"
+        ]
+        assert in_destination[0] == ("start", "shared-d")
+        await _assert_drive_only_edits_and_removals_reach_the_brain(world, state)
+    else:
+        if evidence == "definitive-nonmember":
+            world.membership["shared-d"] = "nonmember"
+        else:
+            # Physically moved into My Drive; membership of shared-d unknown and its token refused.
+            world.membership["shared-d"] = "unknown"
+            world.files["file-f"].pop("driveId")
+            world.files["file-f"]["parents"] = ["my-drive"]
+        await world.run(state)
+        assert _binding(state) == ("bound", "my-drive", None, None), "legitimately cancelled back"
+        summary = await world.run(state)
+        assert summary.authoritative_complete is True
+        assert world.removed == []
+    state.close()
+
+
+async def _deferred_user_log_root(world, state):
+    """A real enumeration deferral: the user log's controlled rescan cannot read file-f now."""
+    world.progress["streams"]["my-drive"]["checkpoint_id"] = "page-this-sidecar-never-retired"
+    world.revision += 1
+    world.unreadable["file-f"] = ProviderDeferred("unavailable", category="provider_unavailable")
+    summary = await world.run(state)
+    assert summary.authoritative_complete is False
+    status, drive, pending, detail = _binding(state)
+    assert (status, drive, pending) == ("uncertain", "my-drive", None) and detail.startswith(ROOT_DEFERRED_PREFIX)
+    return detail
+
+
+@pytest.mark.parametrize("membership", ["unknown", "definitive-nonmember", "proven-member"])
+@pytest.mark.asyncio
+async def test_f2_a_deferred_user_log_root_needs_enumeration_and_routing_proof(tmp_path, monkeypatch, membership):
+    world, path, state = await _nonmember_baseline(tmp_path, monkeypatch, f"f2-{membership}.sqlite")
+    deferred = await _deferred_user_log_root(world, state)
+    reconciled = list(world.reconciled)
+    world.membership["shared-d"] = {
+        "unknown": "unknown", "definitive-nonmember": "nonmember", "proven-member": "member",
+    }[membership]
+    # The drive event arrives WHILE the root is deferred: the deferred obligation is kept, not
+    # overwritten with a membership-only detail — and nothing settles without its enumeration.
+    world.logs["my-drive"].append(dict(DRIVE_EVENT))
+    assert (await world.run(state)).authoritative_complete is False
+    assert _binding(state) == ("uncertain", "my-drive", None, deferred)
+
+    world.unreadable.pop("file-f")  # readable again: the controlled rescan enumerates it
+    if membership == "unknown":
+        for reopen in (False, True, False):
+            if reopen:
+                state.close()
+                state = StateStore(path)
+            before = state.get_progress(world.namespace("my-drive")).active_snapshot
+            world.calls.clear()
+            summary = await world.run(state)
+            after = state.get_progress(world.namespace("my-drive")).active_snapshot
+            assert after > before, "the enumeration ran (a new snapshot was published)"
+            assert ("drives.get", "shared-d") in world.calls
+            assert summary.authoritative_complete is False
+            assert _binding(state) == ("uncertain", "my-drive", None, deferred), "no settlement on continuity"
+            assert "file-f" in state.membership_ids(world.namespace("my-drive"), GEN)
+            _claims_stand(world, state, reconciled)
+    elif membership == "definitive-nonmember":
+        summary = await world.run(state)
+        assert _binding(state) == ("bound", "my-drive", None, None), "settled by enumeration + proof"
+        summary = await world.run(state)
+        assert summary.authoritative_complete is True and world.removed == []
+    else:
+        world.calls.clear()
+        summary, state = await _converge(world, state, path)
+        assert summary.authoritative_complete is True and _binding(state) == ("bound", "shared-d", None, None)
+        await _assert_drive_only_edits_and_removals_reach_the_brain(world, state)
+    state.close()
+
+
+@pytest.mark.parametrize("prior", ["deferred", "ordinary-uncertain"])
+@pytest.mark.asyncio
+async def test_f2_controls_duplicate_drive_events_are_idempotent_on_uncertain_roots(tmp_path, monkeypatch, prior):
+    world, path, state = await _nonmember_baseline(tmp_path, monkeypatch, f"f2-dup-{prior}.sqlite")
+    world.membership["shared-d"] = "unknown"
+    if prior == "deferred":
+        expected = await _deferred_user_log_root(world, state)
+    else:
+        state.mark_root_uncertain(
+            _WORLD_INTEGRATION, GEN, "file", "file-f", "my-drive", detail="root metadata unreadable (500)",
+        )
+        expected = ROOT_MEMBERSHIP_EVENT_DETAIL  # ordinary uncertainty takes the membership debt
+    world.logs["my-drive"].append(dict(DRIVE_EVENT))
+    await world.run(state)
+    first = (_binding(state), _remote_root(world)["transition"])
+    assert first[0] == ("uncertain", "my-drive", None, expected)
+    world.logs["my-drive"].append(dict(DRIVE_EVENT))
+    summary = await world.run(state)
+    assert (_binding(state), _remote_root(world)["transition"]) == first, "a duplicate event changes nothing"
+    assert summary.authoritative_complete is False and world.removed == []
+    state.close()
+
+
+@pytest.mark.asyncio
+async def test_reverse_order_membership_debt_then_enumeration_deferral_stays_partial(tmp_path, monkeypatch):
+    world, path, state = await _nonmember_baseline(tmp_path, monkeypatch, "reverse.sqlite")
+    world.membership["shared-d"] = "unknown"
+    world.logs["my-drive"].append(dict(DRIVE_EVENT))
+    await world.run(state)
+    assert _binding(state) == ("uncertain", "my-drive", None, ROOT_MEMBERSHIP_EVENT_DETAIL)
+    reconciled = list(world.reconciled)
+    deferred = await _deferred_user_log_root(world, state)  # the deferral is the barrier now
+    world.unreadable.pop("file-f")
+    for reopen in (False, True, False):
+        if reopen:
+            state.close()
+            state = StateStore(path)
+        summary = await world.run(state)
+        assert summary.authoritative_complete is False
+        assert _binding(state) == ("uncertain", "my-drive", None, deferred)
+        _claims_stand(world, state, reconciled)
     state.close()
