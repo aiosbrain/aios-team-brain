@@ -41,6 +41,12 @@ import {
 } from "@/lib/projects/context/reconcile-item";
 import { systemIntegrityGate } from "@/lib/projects/context/memberships";
 import { mergeGdriveContributions } from "@/lib/ingest/gdrive-ledger";
+import {
+  canonicalGdriveVersion,
+  decideGdriveObservation,
+  gdriveCanonicalFingerprint,
+  GDRIVE_VERSION_KEY,
+} from "@/lib/ingest/gdrive-observation";
 import { syncGdriveContributionEvidence } from "@/lib/ingest/gdrive-contribution-store";
 import { validateIdentityAuthorityRevision } from "@/lib/identity/authority";
 import { recordGdriveItemClaim } from "@/lib/projects/context/gdrive-claims";
@@ -906,12 +912,74 @@ export async function ingestItem(
   }
 
   const storedFrontmatter = isRecord(existing?.frontmatter) ? existing.frontmatter : {};
+  if (gdriveCommit && existing) {
+    // AIO-1167 R95 — provider OBSERVATION ORDER, decided on the row this commit holds locked (provider →
+    // mapping → path → attribution → item). Two connections' leases are independent fences over one
+    // document, so arrival order is not the provider's order: only the certified Drive `version`
+    // (`lib/ingest/gdrive-observation`) may replace the canonical item. An older observation, a
+    // tokenless one over a certified item, or an equal version with a different canonical payload
+    // leaves body, title, path, provenance, work time and current attribution exactly as they are —
+    // no item version, no extraction/projection churn. It still proves this connection's authority to
+    // the document: its claim is established/refreshed, and contribution evidence the source supports
+    // independently of order is merged (deduplicated, so a replay adds nothing).
+    const verdict = decideGdriveObservation(
+      {
+        version: canonicalGdriveVersion(storedFrontmatter[GDRIVE_VERSION_KEY]),
+        fingerprint: gdriveCanonicalFingerprint(existing.content_sha256 ?? "", storedFrontmatter),
+      },
+      {
+        version: canonicalGdriveVersion(payload.frontmatter?.[GDRIVE_VERSION_KEY]),
+        fingerprint: gdriveCanonicalFingerprint(contentSha, payload.frontmatter ?? {}),
+      },
+    );
+    if (verdict !== "apply") {
+      const retained = mergeGdriveContributions(storedFrontmatter.contributions, []);
+      const merged = mergeGdriveContributions(storedFrontmatter.contributions, payload.frontmatter?.contributions);
+      if (canonicalJson(merged) !== canonicalJson(retained)) {
+        const retainedFrontmatter = { ...storedFrontmatter, contributions: merged };
+        const { error: mergeError } = await db
+          .from("items")
+          .update({ frontmatter: retainedFrontmatter })
+          .eq("id", existing.id);
+        if (mergeError) throw new Error(`Drive contribution merge failed: ${mergeError.message}`);
+        await syncGdriveContributionEvidence(db, auth.teamId, existing.id, retainedFrontmatter, undefined, {
+          memberIdLocked: existing.member_id_locked,
+          memberId: existing.member_id,
+          authorityRevision: mappingRevision,
+        });
+      }
+      await recordGdriveItemClaim(rootDb, { teamId: auth.teamId, itemId: existing.id, ...gdriveCommit.claim });
+      if (verdict === "conflict") {
+        await audit(db, {
+          team_id: auth.teamId,
+          actor_kind: "api_key",
+          member_id: auth.memberId,
+          api_key_id: auth.apiKeyId,
+          action: "gdrive.observation_conflict",
+          target_type: "item",
+          target_id: existing.id,
+          meta: {
+            version: canonicalGdriveVersion(payload.frontmatter?.[GDRIVE_VERSION_KEY]),
+            integration_id: gdriveCommit.claim.integrationId,
+          },
+        });
+      }
+      return {
+        result: { status: "unchanged", id: existing.id, projectId: itemProjectId, accessChanged: false },
+      } satisfies CommittedIngest;
+    }
+  }
   const persistedFrontmatter: Record<string, unknown> = { ...(payload.frontmatter ?? {}) };
   if (payload.frontmatter?.source === "gdrive") {
     persistedFrontmatter.contributions = mergeGdriveContributions(
       storedFrontmatter.contributions,
       payload.frontmatter.contributions,
     );
+    // Only a valid, canonical provider version is ever stored: a malformed one is dropped (the row is
+    // then legacy, and the next certified observation upgrades it).
+    const version = canonicalGdriveVersion(payload.frontmatter[GDRIVE_VERSION_KEY]);
+    if (version === null) delete persistedFrontmatter[GDRIVE_VERSION_KEY];
+    else persistedFrontmatter[GDRIVE_VERSION_KEY] = version;
   }
   // Drive context is derived solely from the connection's surviving audience claims (recorded at
   // the end of both write paths). The system-project routing below must never place a Drive item:

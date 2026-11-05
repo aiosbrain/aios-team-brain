@@ -1,6 +1,6 @@
 import { NextRequest, after } from "next/server";
 import { adminClient } from "@/lib/db/admin";
-import { authenticateApiKey, authenticateAgentToken, isAgentBearer } from "@/lib/api/auth";
+import { authenticateApiKey, authenticateAgentToken, isAgentBearer, type AgentApiAuth } from "@/lib/api/auth";
 import { isRestrictedTier } from "@/lib/auth/visibility";
 import { rateLimit } from "@/lib/api/rate-limit";
 import {
@@ -266,13 +266,11 @@ export async function POST(req: NextRequest) {
 export async function GET(req: NextRequest) {
   // Phase A (spec §10/§17-A): this is the ONE route that honors delegated agent tokens.
   // An agent principal gets the oracle filter below; member keys behave exactly as before.
-  let agentProjects: ReadonlySet<string> | null = null;
+  let agent: AgentApiAuth | null = null;
   let auth: { teamId: string; memberId: string; memberTier: "team" | "external"; apiKeyId: string };
   if (isAgentBearer(req)) {
-    const agent = await authenticateAgentToken(req);
+    agent = await authenticateAgentToken(req);
     if (!agent) return errorResponse("unauthorized", "invalid agent token or team", 401);
-    const { effectiveVisibleProjects } = await import("@/lib/access/oracle");
-    agentProjects = await effectiveVisibleProjects(adminClient(), agent);
     auth = { teamId: agent.teamId, memberId: agent.memberId, memberTier: agent.memberTier, apiKeyId: `agent:${agent.agentTokenId}` };
   } else {
     const memberAuth = await authenticateApiKey(req);
@@ -292,60 +290,77 @@ export async function GET(req: NextRequest) {
   const kinds = url.searchParams.get("kinds")?.split(",").filter(Boolean);
   const pathPrefix = url.searchParams.get("path_prefix");
 
-  // Tier filtering re-applied server-side: external-tier keys see only external.
-  let q = db
-    .from("items")
-    .select("id, path, kind, access, frontmatter, body, content_sha256, actor, updated_at, projects(slug)")
-    .eq("team_id", auth.teamId)
-    .gt("updated_at", cursor || since)
-    .order("updated_at", { ascending: true })
-    .order("id", { ascending: true })
-    .limit(PAGE_SIZE);
-  // Enforced read (Phase B slice 1, spec §5/§11; wall re-ruled by PRET-4 §1b): visibility is
-  // MODE-keyed — enforcing → the ORACLE alone (the legacy posture conjunct is gone: an external
-  // member granted a project must see its access='team' rows, ruling 2, and the conjunct was
-  // the only thing blocking that); permissive → the posture wall alone (applied below, after
-  // the mode is known). When the team is 'enforcing', BOTH member and agent reads intersect
-  // with the membership-visible item set (an agent must never exceed its launcher — slice-B1
-  // Fable HIGH; the agent's Phase-A project_id proxy is used ONLY under permissive).
-  // A flag-read error throws → 500 (fail closed, never a wrong mode).
-  // PRET-6: enforcing is the only behavior — the oracle decides, unconditionally (the mode
-  // branch, the permissive posture wall, and the agent Phase-A project_id proxy all retired).
-  {
-    const { visibleItemIdsForProjects } = await import("@/lib/access/enforce");
-    let projectSet: ReadonlySet<string>;
-    if (agentProjects !== null) {
-      projectSet = agentProjects; // the agent's effective set (already oracle-attenuated)
-    } else {
-      const { visibleProjects } = await import("@/lib/access/oracle");
-      projectSet = (await visibleProjects(db, { teamId: auth.teamId, memberId: auth.memberId })).projectIds;
+  // AIO-1167 R95 — one attempt = the revocation epoch, THEN the principal's scope (the agent's
+  // effective set or the member's oracle projects), its visible ids and the page; the page (and its
+  // cursor) is published only while that epoch still holds (`lib/access/direct-read-epoch`). A changed
+  // epoch re-runs the whole attempt, so nothing read under a revoked scope — rows or cursor — escapes.
+  const { DirectReadUnavailableError, directReadContent, directReadFinal, withEpochBoundDirectRead } =
+    await import("@/lib/access/direct-read-epoch");
+  try {
+    return await withEpochBoundDirectRead<Response>(db, auth.teamId, async () => {
+      // Tier filtering re-applied server-side: external-tier keys see only external.
+      let q = db
+        .from("items")
+        .select("id, path, kind, access, frontmatter, body, content_sha256, actor, updated_at, projects(slug)")
+        .eq("team_id", auth.teamId)
+        .gt("updated_at", cursor || since)
+        .order("updated_at", { ascending: true })
+        .order("id", { ascending: true })
+        .limit(PAGE_SIZE);
+      // Enforced read (Phase B slice 1, spec §5/§11; wall re-ruled by PRET-4 §1b): visibility is
+      // MODE-keyed — enforcing → the ORACLE alone (the legacy posture conjunct is gone: an external
+      // member granted a project must see its access='team' rows, ruling 2, and the conjunct was
+      // the only thing blocking that); permissive → the posture wall alone (applied below, after
+      // the mode is known). When the team is 'enforcing', BOTH member and agent reads intersect
+      // with the membership-visible item set (an agent must never exceed its launcher — slice-B1
+      // Fable HIGH; the agent's Phase-A project_id proxy is used ONLY under permissive).
+      // A flag-read error throws → 500 (fail closed, never a wrong mode).
+      // PRET-6: enforcing is the only behavior — the oracle decides, unconditionally (the mode
+      // branch, the permissive posture wall, and the agent Phase-A project_id proxy all retired).
+      {
+        const { visibleItemIdsForProjects } = await import("@/lib/access/enforce");
+        let projectSet: ReadonlySet<string>;
+        if (agent !== null) {
+          // The agent's effective set (already oracle-attenuated), resolved INSIDE the attempt.
+          const { effectiveVisibleProjects } = await import("@/lib/access/oracle");
+          projectSet = await effectiveVisibleProjects(adminClient(), agent);
+        } else {
+          const { visibleProjects } = await import("@/lib/access/oracle");
+          projectSet = (await visibleProjects(db, { teamId: auth.teamId, memberId: auth.memberId })).projectIds;
+        }
+        const { ids, empty } = await visibleItemIdsForProjects(db, auth.teamId, projectSet);
+        if (empty) return directReadFinal(Response.json({ items: [], next_cursor: null }));
+        q = q.in("id", [...ids]);
+      }
+      if (kinds?.length) q = q.in("kind", kinds);
+      // On-demand fetch of one skill/deliverable folder: match path by prefix.
+      if (pathPrefix) q = q.like("path", `${pathPrefix.replace(/[%_\\]/g, "\\$&")}%`);
+
+      const { data, error } = await q;
+      if (error) return directReadFinal(errorResponse("internal", error.message, 500));
+
+      let items = (data ?? []).map((i) => ({
+        id: i.id,
+        project: (i.projects as unknown as { slug: string })?.slug,
+        path: i.path,
+        kind: i.kind,
+        access: i.access,
+        frontmatter: i.frontmatter,
+        body: i.body,
+        content_sha256: i.content_sha256,
+        actor: i.actor,
+        updated_at: i.updated_at,
+      }));
+      if (project) items = items.filter((i) => i.project === project);
+
+      const next_cursor =
+        (data?.length ?? 0) === PAGE_SIZE ? data![data!.length - 1].updated_at : null;
+      return directReadContent(Response.json({ items, next_cursor }));
+    });
+  } catch (e) {
+    if (e instanceof DirectReadUnavailableError) {
+      return errorResponse("temporarily_unavailable", "item authorization changed or is unavailable; retry shortly", 503);
     }
-    const { ids, empty } = await visibleItemIdsForProjects(db, auth.teamId, projectSet);
-    if (empty) return Response.json({ items: [], next_cursor: null });
-    q = q.in("id", [...ids]);
+    throw e;
   }
-  if (kinds?.length) q = q.in("kind", kinds);
-  // On-demand fetch of one skill/deliverable folder: match path by prefix.
-  if (pathPrefix) q = q.like("path", `${pathPrefix.replace(/[%_\\]/g, "\\$&")}%`);
-
-  const { data, error } = await q;
-  if (error) return errorResponse("internal", error.message, 500);
-
-  let items = (data ?? []).map((i) => ({
-    id: i.id,
-    project: (i.projects as unknown as { slug: string })?.slug,
-    path: i.path,
-    kind: i.kind,
-    access: i.access,
-    frontmatter: i.frontmatter,
-    body: i.body,
-    content_sha256: i.content_sha256,
-    actor: i.actor,
-    updated_at: i.updated_at,
-  }));
-  if (project) items = items.filter((i) => i.project === project);
-
-  const next_cursor =
-    (data?.length ?? 0) === PAGE_SIZE ? data![data!.length - 1].updated_at : null;
-  return Response.json({ items, next_cursor });
 }

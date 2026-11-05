@@ -38,6 +38,7 @@ from .sources.gdrive import (
     IncompleteExtractionError,
     ProviderCursorInvalid,
     ProviderDeferred,
+    UnstableObservationError,
     is_drive_rate_limit,
 )
 from .state import ROOT_AUTHORITY_CONFLICT_DETAIL, ROOT_MEMBERSHIP_EVENT_DETAIL, StateStore, StreamKey, PendingWork, MaterializedPage
@@ -1667,7 +1668,8 @@ def read_change_page(
         # ``changeType=drive`` plus a top-level ``driveId`` and no file at all. Request both
         # discriminators explicitly -- treating a no-file change as an ignorable row would advance
         # the cursor past the only evidence that an entire selected subtree needs reconciliation.
-        "fields": "nextPageToken,newStartPageToken,changes(changeType,removed,fileId,driveId,file(id,name,mimeType,trashed,driveId,parents,modifiedTime))",
+        # ``version`` (AIO-1167 R95) is the provider's order for one file — an opaque decimal string.
+        "fields": "nextPageToken,newStartPageToken,changes(changeType,removed,fileId,driveId,file(id,name,mimeType,trashed,driveId,parents,modifiedTime,version))",
     }
     if drive_id:
         kwargs["driveId"] = drive_id
@@ -3762,7 +3764,7 @@ async def _enumerate_baseline(
                 "pageSize": 1000,
                 "supportsAllDrives": True,
                 "includeItemsFromAllDrives": True,
-                "fields": "nextPageToken,files(id,name,mimeType,webViewLink,createdTime,modifiedTime,trashed,driveId,parents,owners(permissionId,emailAddress,displayName),lastModifyingUser(permissionId,emailAddress,displayName))",
+                "fields": "nextPageToken,files(id,name,mimeType,webViewLink,createdTime,modifiedTime,version,trashed,driveId,parents,owners(permissionId,emailAddress,displayName),lastModifyingUser(permissionId,emailAddress,displayName))",
             }
             if row["drive_id"] != "my-drive":
                 kwargs.update(corpora="drive", driveId=row["drive_id"])
@@ -4178,26 +4180,17 @@ async def _drain_pending(
             # the item under the current provider gate so access, trash state and membership are
             # all current before content extraction.
             meta = source._metadata(work.item_key)
-            if not _metadata_in_current_selection(state, work, meta):
-                _fail_work(state, work, "provider item is no longer in the current selected membership")
-                summary.failed += 1
-                summary.failure_categories["membership_changed"] = (
-                    summary.failure_categories.get("membership_changed", 0) + 1
-                )
+            if _selection_refused(state, execution, source, work, meta, summary):
                 continue
-            if not _retained_upsert_selected(state, execution, source, work, meta):
-                # Retained from an earlier execution and NOT proven selected by current ancestry:
-                # kept pending — neither restored nor discarded — until a replacement enumeration
-                # (whose publication supersedes it if the document is gone) or a fresh observation.
-                state.fail_work(work, _RETAINED_UPSERT_UNVERIFIED, not_before=work.not_before, failure=False)
-                summary.failure_categories["selection_unverified"] = (
-                    summary.failure_categories.get("selection_unverified", 0) + 1
-                )
-                continue
-            doc = source._raw_doc(meta)
+            doc, certified = _certified_document(source, meta)
             if not state.work_membership_current(work):
                 continue
-            restored_root = _restorable_file_root(state, execution, namespace, generation, work, meta, source)
+            # The document may have changed under extraction (R98): the body accepted is the one its
+            # CERTIFIED snapshot brackets, so every metadata decision is made again on that snapshot
+            # — selection, retained-upsert ancestry and root restoration — never on the pre-read.
+            if _selection_refused(state, execution, source, work, certified, summary, closing=True):
+                continue
+            restored_root = _restorable_file_root(state, execution, namespace, generation, work, certified, source)
         except BrainError:
             raise
         except ProviderDeferred as exc:
@@ -4221,9 +4214,12 @@ async def _drain_pending(
             summary.failure_categories["provider_read"] = summary.failure_categories.get("provider_read", 0) + 1
             continue
         except IncompleteExtractionError as exc:
+            # A document that kept changing under its read (R95) is retried the same way, under its
+            # own category: it is a provider race, not missing content.
+            category = "observation_unstable" if isinstance(exc, UnstableObservationError) else "incomplete_extraction"
             _fail_work(state, work, str(exc))
             summary.failed += 1
-            summary.failure_categories["incomplete_extraction"] = summary.failure_categories.get("incomplete_extraction", 0) + 1
+            summary.failure_categories[category] = summary.failure_categories.get(category, 0) + 1
             continue
         except Exception as exc:
             _fail_work(state, work, f"{type(exc).__name__}: {exc}")
@@ -4236,6 +4232,89 @@ async def _drain_pending(
         ):
             break
     return consumed
+
+
+def _selection_refused(
+    state: StateStore, execution: GdriveExecution, source: GoogleDriveSource, work: PendingWork,
+    meta: dict[str, Any], summary: IngestSummary, *, closing: bool = False,
+) -> bool:
+    """Whether ``meta`` — the provider's metadata for this obligation's document — refuses its upsert
+    now, recording the refusal exactly as the drain always has. Asked of the metadata read before
+    extraction and again of the snapshot the extraction was certified under (AIO-1167 R98). A refusal
+    infers no deletion and moves no stream ownership: it only withholds this push.
+
+    ``closing`` (R99): the check immediately before the push. Certifying the document's own metadata
+    does not certify the ANCESTRY that grants folder-derived authority — a folder between the document
+    and its selected root can leave the selection while the document's id, version and immediate parent
+    stay put, and the stored traversal still answers yes. So the closing check proves that authority by
+    a fresh provider walk (``_closing_selection_proven``) for EVERY upsert — ordinary current-execution
+    work as well as retained recovery work; neither ``observed_under`` nor ``recovery_required`` exempts
+    it. An unproven closing check is held exactly as an unverified retained upsert is: pending,
+    ``selection_unverified``, no failure charged."""
+    if not _metadata_in_current_selection(state, work, meta):
+        _fail_work(state, work, "provider item is no longer in the current selected membership")
+        summary.failed += 1
+        summary.failure_categories["membership_changed"] = (
+            summary.failure_categories.get("membership_changed", 0) + 1
+        )
+        return True
+    proven = (
+        _closing_selection_proven(state, source, work, meta) if closing
+        else _retained_upsert_selected(state, execution, source, work, meta)
+    )
+    if not proven:
+        # Retained from an earlier execution and NOT proven selected by current ancestry:
+        # kept pending — neither restored nor discarded — until a replacement enumeration
+        # (whose publication supersedes it if the document is gone) or a fresh observation.
+        state.fail_work(
+            work, _CLOSING_SELECTION_UNVERIFIED if closing else _RETAINED_UPSERT_UNVERIFIED,
+            not_before=work.not_before, failure=False,
+        )
+        summary.failure_categories["selection_unverified"] = (
+            summary.failure_categories.get("selection_unverified", 0) + 1
+        )
+        return True
+    return False
+
+
+_CLOSING_SELECTION_UNVERIFIED = "closing selection proof unavailable: the document's current ancestry is not proven selected"
+
+
+def _closing_selection_proven(
+    state: StateStore, source: GoogleDriveSource, work: PendingWork, meta: dict[str, Any],
+) -> bool:
+    """The closing proof of a document's selection by THIS obligation's stream (AIO-1167 R99).
+
+    Weighed against the configured roots of the snapshot that answers for the obligation, over the
+    document's CURRENT ancestry read through the provider gate (``_selecting_stream`` scoped to the
+    owning stream — never another stream's root, and never the stored traversal, which is as old as the
+    pre-read): a direct file root or a selected drive proves it without a walk; a folder root proves it
+    only through a fresh walk, with its own recursion rule and NO depth cutoff (R100: baseline enumeration
+    of a recursive root has none either); a walk that exhausts its distinct ancestors (a cycle included)
+    grants nothing. An inconclusive walk (a restricted or unreadable ancestor) is not proof. A provider deferral and an authority refusal
+    are raised for the drain's owners. A legacy obligation with no snapshot keeps its pre-snapshot
+    compatibility, as ``_metadata_in_current_selection`` does."""
+    if state.work_snapshot_id(work) is None:
+        return True
+    own = state.get_progress(work.namespace)
+    connection_id = own.key.connection_id if own is not None else ""
+    try:
+        return _selecting_stream(
+            state, source, work, meta, connection_id, own_stream_only=True, max_depth=None,
+        ) == work.namespace
+    except _AncestryUnverified:
+        return False
+
+
+def _certified_document(source: GoogleDriveSource, meta: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
+    """The raw document and the metadata snapshot it was certified under (AIO-1167 R98). A provider
+    double that implements only ``_raw_doc`` has no certification of its own: its document belongs to
+    the metadata it was built from."""
+    certify = getattr(source, "_certified_raw_doc", None)
+    if callable(certify):
+        result = certify(meta)
+        return result.doc, result.metadata
+    return source._raw_doc(meta), meta
 
 
 def _defer_document_read(
@@ -4354,6 +4433,7 @@ _RETAINED_ANCESTRY_DEPTH = 12
 
 def _selecting_stream(
     state: StateStore, source: GoogleDriveSource, work: PendingWork, meta: dict[str, Any], connection_id: str,
+    *, own_stream_only: bool = False, max_depth: int | None = _RETAINED_ANCESTRY_DEPTH,
 ) -> str | None:
     """The namespace of a stream of this connection whose CONFIGURED selected roots contain the
     document as the provider reports it NOW — its own id, its drive, or an ancestor folder found by
@@ -4367,10 +4447,16 @@ def _selecting_stream(
     So the parent chain is read through the provider gate, and only the stable root identities come
     from local state. This stream is weighed first. A read that is not a definitive answer is raised
     as ``_AncestryUnverified`` (inconclusive); a deferral is raised for the drain's owners."""
-    streams = [work.namespace] + [
+    # ``own_stream_only`` (R99, the closing proof): only the obligation's own stream's roots count.
+    # ``max_depth`` (R100): the retained/recovery checks keep their bound; the closing proof passes
+    # ``None`` — baseline enumeration of a recursive root has no depth cutoff, so neither may the proof
+    # of what it enumerated. Termination never rests on the bound: each level's frontier is built only
+    # from folders not read before (``seen``), so a cycle runs dry after one read per distinct folder,
+    # and an exhausted walk grants nothing.
+    streams = [work.namespace] + ([] if own_stream_only else [
         progress.namespace for progress in state.list_progress(connection_id, work.generation)
         if progress.namespace != work.namespace
-    ]
+    ])
     # (kind, id) -> recursive: a folder root's recursion decides how deep it selects.
     roots_by_stream: dict[str, dict[tuple[str, str], bool]] = {}
     for namespace in streams:
@@ -4391,7 +4477,8 @@ def _selecting_stream(
             return namespace
     frontier = [str(parent) for parent in meta.get("parents") or []]
     seen: set[str] = set()
-    for depth in range(_RETAINED_ANCESTRY_DEPTH):
+    depth = 0
+    while max_depth is None or depth < max_depth:
         if not frontier:
             return None
         for namespace, roots in roots_by_stream.items():
@@ -4422,6 +4509,7 @@ def _selecting_stream(
                 continue
             next_frontier.extend(str(parent) for parent in parent_meta.get("parents") or [])
         frontier = next_frontier
+        depth += 1
     raise _AncestryUnverified()
 
 

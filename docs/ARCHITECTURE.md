@@ -1228,6 +1228,30 @@ divergent-state recovery (R76 F1): each upsert is stamped where it is observed, 
 complete) one observed under an earlier execution restores only when the document's current parent
 chain reaches this stream's configured roots (`_retained_upsert_selected`). Otherwise it stays pending —
 never discarded, never used to infer absence — for the replacement enumeration to settle.
+
+**Provider observation ORDER across connections (AIO-1167 R95).** Two connections can hold valid
+leases over the same provider file; their execution fences are per integration, so arrival order is
+not the provider's order. Drive v3 `File.version` (an output-only int64, monotonically increasing with
+every server-side change) is: every metadata projection requests it (`files.get`, folder `files.list`,
+`changes.list`), and it travels as an opaque DECIMAL STRING end to end. The reader certifies ONE
+observation (`GoogleDriveSource._observe_document`): metadata (with its version) is read before the
+Docs content and revision history and read AGAIN after them, and only the same file id at the same
+version brackets the body and the mutable metadata it returns; a change re-reads from the newer
+observation (bounded), and an unstable read raises `UnstableObservationError` — an incomplete
+extraction, retried, never sent. A read whose metadata carries no version is uncertified and stays as
+before. The certified version is `frontmatter.gdrive_version`; the canonical writer
+(`ingestItem`, under the provider/item locks it already holds) compares it as a string
+(`lib/ingest/gdrive-observation.ts`: digits only, leading zeros stripped, length then lexicographic —
+never a JS number). A strictly older version, a missing/malformed one over an item holding a valid
+version, or an equal version with a different canonical payload (body hash, title, `source_ts`,
+`modified_time`; the last recorded as `gdrive.observation_conflict` for reconciliation) leaves body,
+title, path, provenance, work time and current attribution untouched — no item version, no
+`item.updated`, no extraction or projection — while the connection's claim is still established and
+order-independent contribution evidence is merged once. An equal identical version is the unchanged
+replay; a valid version upgrades a legacy (tokenless) item; legacy over legacy behaves as before.
+Freshness never grants authority: the execution fence is checked first, so an invalidated execution
+writes nothing whatever its version.
+
 An unstarted stream no root needs any more is forgotten locally and leaves the brain's
 checkpoint with the run's next checkpoint. Shared Drive listing, traversal, rescan, and parent-membership checks use the
 provider's actual `driveId` as the root; the former synthetic `root` key is repaired only when the
@@ -1692,7 +1716,16 @@ change rebuilds once, and a second is the same retryable 503. The arcs recompute
 epoch reads the same way. Reads that publish no person attribution — graph-fact provenance
 (`lib/graph/provenance-read.ts`, and so retrieval's graph leg), arc-partition item authority and the
 facts feed — bind to the same counter through `revocationEpoch`, which keeps the revocation barrier
-without the repair gate. A QUERY context carries that epoch to every dispatch (AIO-1167 R66,
+without the repair gate. So do the DIRECT item reads (AIO-1167 R95, `lib/access/direct-read-epoch.ts`):
+`GET /api/v1/items` (member and agent keys) and `GET /api/v1/items/<id>` capture the epoch FIRST in each
+attempt, then resolve the principal's scope (member oracle, or the agent's effective set), its visible
+ids or by-id probe and admission, and the rows; content is published only through a short locked
+check (`lockedRevocationEpoch` in its own transaction, nothing written under it). Unchanged, the
+response is linearized before any revocation, which waits on that lock; changed, the whole attempt
+(scope, ids, admission, rows, cursor) runs once more, then fails closed as 503
+`temporarily_unavailable`, as does an unreadable or unlockable epoch. An answer carrying nothing the
+scope protects — an empty page, an invisible or absent id (the same 404), a read error — is returned
+as it is. A QUERY context carries that epoch to every dispatch (AIO-1167 R66,
 `lib/query/context-authorization.ts`). Both routes capture it BEFORE resolving the reader's view —
 the first input that selects content — and hand that one capture to `retrieve()`, which never
 recaptures over it (R67); a direct caller without one gets a capture before any read it

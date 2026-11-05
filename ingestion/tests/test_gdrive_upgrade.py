@@ -2561,6 +2561,10 @@ async def test_change_page_re_evaluates_moves_into_and_out_of_selected_subtree(t
         def _raw_doc(self, meta):
             return RawDoc(source="gdrive", external_id=meta["id"], title=meta.get("name"), body="body")
         def _metadata(self, file_id):
+            if file_id == "selected-folder":
+                # The closing proof of folder-derived authority reads the ancestry fresh (AIO-1167 R99).
+                return {"id": "selected-folder", "mimeType": "application/vnd.google-apps.folder",
+                        "parents": ["root"]}
             assert file_id == "moved-in"
             return {
                 "id": "moved-in", "name": "Moved in",

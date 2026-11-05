@@ -65,6 +65,42 @@ class IncompleteExtractionError(RuntimeError):
     """Required readable content was missing, so an older complete body must be kept."""
 
 
+class UnstableObservationError(IncompleteExtractionError):
+    """The document changed while it was read, on every bounded attempt (AIO-1167 R95).
+
+    Its body and mutable metadata were never bracketed by ONE provider version, so the read is not a
+    certified observation and never reaches the sink; the obligation stays owed and retries like any
+    incomplete extraction, keeping the older complete body."""
+
+
+# The provider's version of one file (AIO-1167 R95): Drive v3 ``File.version``, an output-only int64
+# serialized as a decimal STRING and documented as monotonically increasing with every server-side
+# change. It is carried as an opaque decimal string end to end — never converted to a number here or
+# in the brain — so no value truncates.
+DRIVE_VERSION_FIELD = "version"
+_DRIVE_VERSION = re.compile(r"[0-9]+")
+# Bounded re-reads when the document changes between the bracketing metadata reads.
+_OBSERVATION_ATTEMPTS = 3
+# What a certified snapshot must carry to label the body it brackets (R98): the stable id and version
+# are checked on their own; the title and the provider time are the document's canonical labels.
+_CERTIFIED_REQUIRED_FIELDS = ("name", "modifiedTime")
+
+
+def drive_version(value: object) -> str | None:
+    """A valid provider version, canonicalized without leading zeros; ``None`` when missing or
+    malformed (anything but a string of ASCII digits — a number included)."""
+    if not isinstance(value, str) or not _DRIVE_VERSION.fullmatch(value):
+        return None
+    return value.lstrip("0") or "0"
+
+
+def compare_drive_versions(left: str, right: str) -> int:
+    """Order two CANONICAL versions exactly, whatever their length: length first, then lexicographic."""
+    if len(left) != len(right):
+        return -1 if len(left) < len(right) else 1
+    return 0 if left == right else (-1 if left < right else 1)
+
+
 class ProviderDeferred(RuntimeError):
     """A retryable provider call cannot complete inside the current bounded run.
 
@@ -349,6 +385,15 @@ def _identity(person: dict[str, Any], role: str) -> dict[str, str] | None:
 def _is_service_identity(person: dict[str, Any]) -> bool:
     email = str(person.get("emailAddress") or "").strip().lower()
     return email.endswith(".gserviceaccount.com")
+
+
+@dataclass(frozen=True)
+class CertifiedDocument:
+    """One document as the coordinator may act on it (AIO-1167 R98): the raw document and the ONE
+    metadata snapshot it belongs to — never metadata read for an observation that was replaced."""
+
+    doc: RawDoc
+    metadata: dict[str, Any]
 
 
 class GoogleDocsExtractor:
@@ -911,7 +956,7 @@ class GoogleDriveSource(PullOnlySource, Source):
         return self._request(lambda: drive.files().get(
             fileId=file_id,
             supportsAllDrives=True,
-            fields="id,name,mimeType,webViewLink,createdTime,modifiedTime,trashed,driveId,parents,owners(permissionId,emailAddress,displayName),lastModifyingUser(permissionId,emailAddress,displayName)",
+            fields="id,name,mimeType,webViewLink,createdTime,modifiedTime,version,trashed,driveId,parents,owners(permissionId,emailAddress,displayName),lastModifyingUser(permissionId,emailAddress,displayName)",
         ))
 
     def _revisions(self, file_id: str) -> list[dict[str, Any]] | None:
@@ -982,7 +1027,7 @@ class GoogleDriveSource(PullOnlySource, Source):
                     "pageSize": 1000,
                     "supportsAllDrives": True,
                     "includeItemsFromAllDrives": True,
-                    "fields": "nextPageToken,files(id,name,mimeType,webViewLink,createdTime,modifiedTime,trashed,driveId,parents,owners(permissionId,emailAddress,displayName),lastModifyingUser(permissionId,emailAddress,displayName))",
+                    "fields": "nextPageToken,files(id,name,mimeType,webViewLink,createdTime,modifiedTime,version,trashed,driveId,parents,owners(permissionId,emailAddress,displayName),lastModifyingUser(permissionId,emailAddress,displayName))",
                 }
                 if drive_id:
                     kwargs.update(corpora="drive", driveId=drive_id)
@@ -1000,35 +1045,32 @@ class GoogleDriveSource(PullOnlySource, Source):
                     break
 
     def _raw_doc(self, meta: dict[str, Any]) -> RawDoc:
+        return self._certified_raw_doc(meta).doc
+
+    def _certified_raw_doc(self, meta: dict[str, Any]) -> "CertifiedDocument":
+        """The document AND the one metadata snapshot it was certified under (AIO-1167 R98).
+
+        The coordinator decides selection, retained-upsert ancestry and root restoration from
+        metadata; when the document changed under the read, the metadata it read before extraction
+        belongs to an observation that was NOT accepted. ``metadata`` here is the snapshot whose
+        version brackets ``doc`` (for an uncertified, version-less read: the metadata it was built
+        from, exactly as before)."""
         file_id = str(meta.get("id") or "").strip()
         if not file_id:
             raise IncompleteExtractionError("Drive returned a document without a stable id")
         if meta.get("trashed"):
             raise IncompleteExtractionError(f"document {file_id} is trashed")
         if not meta.get("name") or not meta.get("modifiedTime"):
-            meta = {**meta, **self._metadata(file_id)}
-        docs = self._docs
-        if docs is None:
-            _, docs = self._services()
-        document = self._request(
-            # The canonical view: current content WITHOUT proposed edits, whatever the credential's
-            # access level would show by default (AIO-1167 R44 S6a).
-            lambda: docs.documents().get(
-                documentId=file_id, includeTabsContent=True,
-                suggestionsViewMode="PREVIEW_WITHOUT_SUGGESTIONS",
+            supplemental = self._metadata(file_id)
+            # A VERSIONED supplemental read is a complete projection of its own observation: it
+            # REPLACES the hint it supplements, so no field the provider omitted now (drive, owners,
+            # editor) is seeded from an older projection into certification (R98). A version-less
+            # read keeps the legacy merge exactly as before.
+            meta = (
+                supplemental if drive_version(supplemental.get(DRIVE_VERSION_FIELD)) is not None
+                else {**meta, **supplemental}
             )
-        )
-        extracted = extract_google_doc(document, max_chars=self._max_chars)
-        if not extracted.complete:
-            details = "; ".join(
-                f"{issue.code} at {issue.location}: {issue.detail}"
-                for issue in extracted.issues
-                if issue.blocking
-            )
-            raise IncompleteExtractionError(
-                f"document {file_id} extraction is incomplete"
-                + (f" ({details})" if details else "")
-            )
+        meta, document, extracted, revisions, version = self._observe_document(file_id, meta)
 
         # Drive ownership is access metadata, not proof that the owner wrote the document. Retain it
         # as source provenance for diagnostics/manual repair, but never feed it into authorship.
@@ -1062,7 +1104,6 @@ class GoogleDriveSource(PullOnlySource, Source):
 
         contributions: list[dict[str, str]] = []
         seen_contributions: set[tuple[str, str, str]] = set()
-        revisions = self._revisions(file_id)
         if revisions is None:
             # The body and metadata are readable but the history is not for this reader. That is a
             # disclosed limitation of the evidence, not a failed read: what the brain already holds
@@ -1103,7 +1144,7 @@ class GoogleDriveSource(PullOnlySource, Source):
             seen_contributions.add(dedupe)
             contributions.append({**identity, "at": at})
 
-        return RawDoc(
+        doc = RawDoc(
             source=self.name,
             external_id=file_id,
             title=str(meta.get("name") or document.get("title") or file_id),
@@ -1139,7 +1180,85 @@ class GoogleDriveSource(PullOnlySource, Source):
                 "gdrive_source_identities": source_identities,
                 "attribution_diagnostics": attribution_diagnostics,
                 "contributions": contributions,
+                # The ONE provider version that brackets this body and metadata (R95). Absent for an
+                # uncertified (version-less) read, which the brain never lets replace a certified item.
+                **({"gdrive_version": version} if version is not None else {}),
             },
+        )
+        return CertifiedDocument(doc=doc, metadata=meta)
+
+    def _observe_document(
+        self, file_id: str, meta: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any], Any, list[dict[str, Any]] | None, str | None]:
+        """One CERTIFIED provider observation of a document (AIO-1167 R95).
+
+        ``meta`` is the metadata read BEFORE the content; when it carries a valid ``version``, the
+        content, its extraction and its revision history are read and the metadata is read AGAIN. Only
+        when that second read names the same file at the same version is the result one observation —
+        body, title and every mutable field — and it is returned with that version, the mutable
+        metadata taken from the post-content read. A changed version means the document moved under
+        the read: it is read again from the newer observation, at most ``_OBSERVATION_ATTEMPTS`` times,
+        then ``UnstableObservationError`` (nothing reaches the sink). A second read that drops the
+        version, names another file, or says the document is trashed is never certified either.
+
+        A read whose first metadata has NO valid version (a provider or double that does not report
+        it) is returned exactly as before this contract — one content read, no bracket — and UNCERTIFIED
+        (``None``): the brain never lets it replace an item holding a certified version.
+        """
+        docs = self._docs
+        if docs is None:
+            _, docs = self._services()
+        expected = drive_version(meta.get(DRIVE_VERSION_FIELD))
+        for _attempt in range(_OBSERVATION_ATTEMPTS):
+            document = self._request(
+                # The canonical view: current content WITHOUT proposed edits, whatever the credential's
+                # access level would show by default (AIO-1167 R44 S6a).
+                lambda: docs.documents().get(
+                    documentId=file_id, includeTabsContent=True,
+                    suggestionsViewMode="PREVIEW_WITHOUT_SUGGESTIONS",
+                )
+            )
+            extracted = extract_google_doc(document, max_chars=self._max_chars)
+            if not extracted.complete:
+                details = "; ".join(
+                    f"{issue.code} at {issue.location}: {issue.detail}"
+                    for issue in extracted.issues
+                    if issue.blocking
+                )
+                raise IncompleteExtractionError(
+                    f"document {file_id} extraction is incomplete"
+                    + (f" ({details})" if details else "")
+                )
+            revisions = self._revisions(file_id)
+            if expected is None:
+                return meta, document, extracted, revisions, None
+            after = self._metadata(file_id)
+            if str(after.get("id") or "").strip() != file_id:
+                raise UnstableObservationError(f"document {file_id} was not the file read back after its content")
+            if after.get("trashed"):
+                raise IncompleteExtractionError(f"document {file_id} was trashed while it was read")
+            observed = drive_version(after.get(DRIVE_VERSION_FIELD))
+            if observed is None:
+                raise UnstableObservationError(
+                    f"document {file_id} stopped reporting its provider version while it was read"
+                )
+            missing = [field for field in _CERTIFIED_REQUIRED_FIELDS if not after.get(field)]
+            if missing:
+                # The snapshot cannot label the body it would certify: never sent, retried.
+                raise IncompleteExtractionError(
+                    f"document {file_id} metadata lacks {', '.join(missing)}; the observation is not certifiable"
+                )
+            # ONE snapshot per version (R98): `after` is the complete projection of the observation
+            # it names. It is never merged over earlier metadata, so an optional field it omits (a
+            # drive, owners, the last editor) stays absent instead of being relabelled with this
+            # version.
+            if observed == expected:
+                return after, document, extracted, revisions, observed
+            # Changed under the read: `after` was read before the next content read, so it is the
+            # next attempt's opening observation — on its own.
+            meta, expected = after, observed
+        raise UnstableObservationError(
+            f"document {file_id} kept changing while it was read ({_OBSERVATION_ATTEMPTS} attempts)"
         )
 
     def fetch(self, *, since: str | None = None) -> Iterator[RawDoc]:
