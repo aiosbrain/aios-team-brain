@@ -19,6 +19,7 @@ reactivates it. Through the real coordinator over ``_DriveWorld`` (claims in ``_
 from __future__ import annotations
 
 import dataclasses
+import shutil
 from datetime import timedelta
 
 import pytest
@@ -353,3 +354,161 @@ async def test_control_a_current_loss_is_still_removed_promptly_while_the_peer_i
     else:
         assert "doc-1" in world.ledger.deleted, "the last claim: the content is suppressed"
     state.close()
+
+
+# ── R66: retained trash vs a restoration another WORKER published through another state file ──────
+
+def _coalesce(world, drive, doc, row):
+    """Drive's change log reports a file once, in its CURRENT state: earlier rows for it are replaced."""
+    log = world.logs.setdefault(drive, [])
+    for index, existing in enumerate(log):
+        if existing.get("fileId") == doc:
+            log[index] = row
+            return
+    log.append(row)
+
+
+async def _w1_retains_trash_w2_restores(tmp_path, monkeypatch, clock, *, sink, where, other, enumeration):
+    """W1 retains A's explicit trash (refused / committed-but-lost); W2 — an independent store
+    copied from the same acknowledged baseline — restores the document and publishes it."""
+    lost = [] if sink == "lost" else None
+    world = _world(monkeypatch, lost_responses=lost, fences=[])
+    if other == "last-claim":
+        world.ledger.claims["doc-1"].discard(_SECOND_INTEGRATION)
+    w1_path, w2_path = str(tmp_path / "w1.sqlite"), str(tmp_path / "w2.sqlite")
+    w1 = StateStore(w1_path)
+    assert (await world.run(w1)).authoritative_complete is True
+    w1.close()
+    shutil.copy(w1_path, w2_path)
+    w1 = StateStore(w1_path)
+
+    _trash_in_a(world)
+    if sink == "lost":
+        lost.append(True)
+    else:
+        world.removal_faults.append(BrainError(503, "cleanup_unavailable", "the brain refused"))
+    await world.run(w1)
+    assert len(_owed_trash(w1, world)) == 1, "W1 retains the trash obligation"
+    _retry_at(w1, world.namespace("shared-a"), "doc-1", _HELD)
+    w1.close()
+
+    # Restored — in place (same stream) or into B (another stream) — and W2 publishes it.
+    world.files["doc-1"]["trashed"] = False
+    if where == "same-stream":
+        _coalesce(world, "shared-a", "doc-1", {"fileId": "doc-1", "file": dict(world.files["doc-1"])})
+    else:
+        world.files["doc-1"].update(driveId="shared-b", parents=["folder-b"])
+        _coalesce(world, "shared-a", "doc-1", {"fileId": "doc-1", "removed": True})
+        world.logs["shared-b"].append({"fileId": "doc-1", "file": dict(world.files["doc-1"])})
+    pushed = world.pushed.count("doc-1")
+    w2 = StateStore(w2_path)
+    for _ in range(3):
+        await world.run(w2)
+    assert world.pushed.count("doc-1") == pushed + 1, "W2 ingested the restoration"
+    assert _WORLD_INTEGRATION in world.ledger.claims["doc-1"], "W2's acknowledged restoration claims it"
+    assert _owed_trash(w2, world) == [], "W2 holds no trash"
+    w2.close()
+
+    # W1 reacquires from its own state file, which knows nothing of W2's restoration.
+    w1 = StateStore(w1_path)
+    assert len(_owed_trash(w1, world)) == 1
+    if enumeration == "deferred":
+        # Its replacement enumeration is held back: only the retained work can run first.
+        minimum = (clock.at + timedelta(hours=1)).isoformat()
+        w1.restrict_document(_WORLD_INTEGRATION, GEN, "account", "folder-a", minimum, "provider_unavailable")
+        w1.restrict_document(_WORLD_INTEGRATION, GEN, "account", "folder-b", minimum, "provider_unavailable")
+    _retry_at(w1, world.namespace("shared-a"), "doc-1", None)
+    return world, w1_path, w1
+
+
+@pytest.mark.parametrize("enumeration", ["normal", "deferred"])
+@pytest.mark.parametrize("other", ["other-connection", "last-claim"])
+@pytest.mark.parametrize("where", ["same-stream", "another-stream"])
+@pytest.mark.parametrize("sink", ["refused", "lost"])
+@pytest.mark.asyncio
+async def test_retained_trash_never_retires_a_restoration_another_worker_published(
+    tmp_path, monkeypatch, clock, sink, where, other, enumeration,
+):
+    world, w1_path, w1 = await _w1_retains_trash_w2_restores(
+        tmp_path, monkeypatch, clock, sink=sink, where=where, other=other, enumeration=enumeration,
+    )
+    claims = set(world.ledger.claims["doc-1"])
+    removed, pushed, deleted = list(world.removed), world.pushed.count("doc-1"), list(world.ledger.deleted)
+    retired = list(world.ledger.retired)
+    world.calls.clear()
+    await world.run(w1)
+
+    assert ("metadata", "doc-1") in world.calls, "retained trash is re-verified against the provider"
+    assert world.removed == removed, "the obsolete removal never reaches reconciliation"
+    assert _owed_trash(w1, world) == [], "superseded by the readable, untrashed document"
+    assert world.ledger.claims["doc-1"] == claims and world.ledger.deleted == deleted
+    assert world.ledger.retired == retired, "the restored claim was never retired"
+    if enumeration == "deferred":
+        # Only the retained work ran: the restoration stands without another upsert. (A normal
+        # replacement enumeration of W1's stale store re-reads every document it lists — doc-b too.)
+        assert world.pushed.count("doc-1") == pushed, "it survived without another upsert"
+
+    # Restarts until complete reconciliation (any restriction lapsed). W1's own recovery rescan may
+    # re-read what it enumerates — doc-b as much as doc-1 — but the claim is never retired between.
+    clock.at += timedelta(hours=2)
+    for _ in range(6):
+        w1.close()
+        w1 = StateStore(w1_path)
+        summary = await world.run(w1)
+        if summary.authoritative_complete:
+            break
+    assert summary.authoritative_complete is True
+    assert "doc-1" in world.reconciled[-1]
+    assert world.removed == removed and world.ledger.claims["doc-1"] == claims
+    assert world.ledger.deleted == deleted, "nothing suppressed since the restoration"
+    assert world.ledger.retired == retired, "no complete reconciliation retired the restored claim"
+    w1.close()
+
+
+@pytest.mark.parametrize(
+    "provider", ["trashed-again", "deleted-404", "ambiguous-500", "restricted", "retry-after"],
+)
+@pytest.mark.asyncio
+async def test_retained_trash_replay_follows_current_provider_evidence(tmp_path, monkeypatch, clock, provider):
+    from aios_ingest.sources.gdrive import ProviderDeferred
+
+    world, w1_path, w1 = await _w1_retains_trash_w2_restores(
+        tmp_path, monkeypatch, clock, sink="refused", where="another-stream", other="other-connection",
+        enumeration="normal",
+    )
+    if provider == "trashed-again":
+        world.files["doc-1"]["trashed"] = True
+    elif provider == "deleted-404":
+        del world.files["doc-1"]
+    elif provider == "ambiguous-500":
+        world.unreadable["doc-1"] = _ProviderHttpError(500)
+    elif provider == "restricted":
+        w1.restrict_document(
+            _WORLD_INTEGRATION, GEN, "account", "doc-1", (clock.at + timedelta(hours=1)).isoformat(),
+            "provider_unavailable",
+        )
+    else:
+        world.unreadable["doc-1"] = ProviderDeferred(
+            "Retry-After", not_before=(clock.at + timedelta(hours=1)).isoformat(),
+            category="provider_unavailable", provider_deadline=True,
+        )
+    world.calls.clear()
+    await world.run(w1)
+
+    if provider in ("trashed-again", "deleted-404"):
+        assert "doc-1" in world.removed, "current trash or a document 404 permits the removal"
+        assert world.ledger.claims["doc-1"] == {_SECOND_INTEGRATION}, "another connection's claim survives"
+        assert _owed_trash(w1, world) == []
+    else:
+        assert "doc-1" not in world.removed and len(_owed_trash(w1, world)) == 1, "the obligation is kept"
+        assert _WORLD_INTEGRATION in world.ledger.claims["doc-1"]
+        if provider == "restricted":
+            assert ("metadata", "doc-1") not in world.calls, "a standing restriction prevents the probe"
+        if provider == "retry-after":
+            assert "doc-1" in w1.document_restrictions(_WORLD_INTEGRATION, GEN, "account")
+            _retry_at(w1, world.namespace("shared-a"), "doc-1", None)
+            world.calls.clear()
+            await world.run(w1)  # before the named minimum passes
+            assert ("metadata", "doc-1") not in world.calls, "no early probe after a Retry-After"
+            assert "doc-1" not in world.removed
+    w1.close()

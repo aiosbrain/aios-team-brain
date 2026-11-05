@@ -3188,6 +3188,8 @@ async def _run_gdrive_stream_unlocked(
                     # uncertainty stays on the absence gates below.
                     obligations.append((file_id, "remove", {
                         "file_id": file_id, "trashed": True, "reason": "explicit_trash",
+                        # Which execution OBSERVED it (R66): only that execution may replay it unread.
+                        "observed_under": _observation_token(execution),
                     }))
                     if selected:
                         trash_membership_removals.append(file_id)
@@ -4219,31 +4221,45 @@ def _document_loss_verified(source: GoogleDriveSource, file_id: str) -> bool:
     return bool(meta.get("trashed"))
 
 
+def _observation_token(execution: GdriveExecution) -> str:
+    """The identity of ONE execution grant: its fence and the per-acquisition owner the coordinator
+    mints (a fresh ``uuid4`` each run). Evidence observed under it is current for exactly that
+    execution — never for a later one, however it was reacquired (AIO-1167 R66)."""
+    return f"{execution.fence}:{execution.owner}"
+
+
 def _explicit_trash_verdict(
-    state: StateStore, source: GoogleDriveSource, work: PendingWork, connection_id: str,
-    *, restricted: bool,
+    state: StateStore, execution: GdriveExecution, source: GoogleDriveSource, work: PendingWork,
+    connection_id: str, *, restricted: bool,
 ) -> str:
-    """Whether a retained explicit-trash removal is still the connection's (AIO-1167 R61).
+    """Whether a retained explicit-trash removal is still the connection's (AIO-1167 R61/R66).
 
-    The connection's brain claim is one per document, whichever stream made it, while trash evidence
-    is retained per stream — across a refused or lost acknowledgment, a restart, a replacement
-    worker. A document restored and moved into another selected drive is ingested by THAT stream,
-    which claims it; replaying the older trash would deactivate the restored claim, and no later
-    complete snapshot would reactivate it. Opaque tokens of two streams cannot be ordered, so the
-    claim is weighed against the provider instead:
+    The connection's brain claim is one per document, whichever stream — or WORKER — made it, while
+    trash evidence is retained in one worker's local store — across a refused or lost
+    acknowledgment, a restart, a replacement worker. A document restored meanwhile is ingested by
+    another stream, or by another worker against another state file, which claims it; replaying the
+    older trash would deactivate the restored claim, and no later complete snapshot would reactivate
+    it. Neither local absence of a claim, a retry count, the generation nor a fresh execution fence
+    says the trash is still current, so:
 
-      · no other stream claims it at all — ``absent`` at once, with no read (prompt trash, R51
-        final 2);
-      · claimed by ANY other stream — the document's own metadata decides: trashed or not found is
+      · observed under THIS execution (``observed_under``, ``_observation_token``) and claimed by no
+        other local stream — ``absent`` at once, with no read: the provider answered within the
+        execution that holds authority now, so nothing can have been published since (prompt
+        trash, R51 final 2);
+      · anything else — retained from an earlier execution, a legacy obligation, or claimed by ANY
+        other stream — needs CURRENT provider evidence, and the document's own metadata decides: trashed or not found is
         ``absent`` (a genuinely later trash); readable and not trashed, the trash is OBSOLETE —
         superseded, never sent (``superseded``); unreadable otherwise, nothing is concluded
         (``unverified``). Whether that stream can read its change log NOW says nothing about when
         its claim was made (R62): a stream that ingested the restoration and then lost its start
         token still holds the restored claim, so stream availability is never chronology;
-      · so claimed under a standing provider minimum — ``restricted``: retained, not read early.
+      · needing that evidence under a standing provider minimum — ``restricted``: retained, not
+        read early.
 
-    A deferral of the read is raised for the removal drain's owners, as for any probe."""
-    if not state.streams_claiming(connection_id, work.generation, work.namespace, work.item_key):
+    A deferral of the read (a Retry-After, a quota answer) is raised for the removal drain's owners,
+    as for any probe, so no later probe is made early."""
+    fresh = (work.payload or {}).get("observed_under") == _observation_token(execution)
+    if fresh and not state.streams_claiming(connection_id, work.generation, work.namespace, work.item_key):
         return "absent"
     if restricted:
         state.fail_work(work, _RESTRICTED_PROBE_PENDING, not_before=work.not_before, failure=False)
@@ -4311,7 +4327,7 @@ def _cross_stream_removal(
     own = state.get_progress(work.namespace)
     connection_id = own.key.connection_id if own is not None else execution.integration_id
     if (work.payload or {}).get("trashed") is True:
-        return _explicit_trash_verdict(state, source, work, connection_id, restricted=restricted)
+        return _explicit_trash_verdict(state, execution, source, work, connection_id, restricted=restricted)
     roster_unknown = state.unknown_root_count(connection_id, work.generation) > 0
     local = {
         progress.key.drive_id: progress

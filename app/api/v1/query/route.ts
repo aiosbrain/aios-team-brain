@@ -18,6 +18,11 @@ import { generateAndSetTitle } from "@/lib/chat/title";
 import { recordLlmUsage } from "@/lib/costs/llm-usage";
 import { GraphProvenanceUnavailableError } from "@/lib/graph/provenance-read";
 import { AttributionRepairPendingError } from "@/lib/access/authorization-epoch";
+import {
+  CONTEXT_AUTHORIZATION_CLIENT_MESSAGE,
+  QueryContextAuthorizationChangedError,
+  requireContextAuthorization,
+} from "@/lib/query/context-authorization";
 
 export const runtime = "nodejs";
 export const maxDuration = 120;
@@ -182,6 +187,9 @@ export async function POST(req: NextRequest) {
     if (e instanceof GraphProvenanceUnavailableError || e instanceof AttributionRepairPendingError) {
       return errorResponse("temporarily_unavailable", "query context is temporarily unavailable; retry shortly", 503);
     }
+    if (e instanceof QueryContextAuthorizationChangedError) {
+      return errorResponse("temporarily_unavailable", CONTEXT_AUTHORIZATION_CLIENT_MESSAGE, 503);
+    }
     throw e;
   }
 
@@ -218,6 +226,19 @@ export async function POST(req: NextRequest) {
   // Per-team provider keys + models + the explicit answering-backend override (same resolver the
   // dashboard route uses, so both honor OpenRouter/OpenAI/local + `teams.answering_provider`).
   const keys = await resolveAnsweringKeys(db, teamId, "interactive-query");
+
+  // AIO-1167 R66: route preparation is done. A Drive revocation committed since retrieval captured
+  // its epoch (another connection may still hold the document) means the captured text is no longer
+  // this reader's: refuse — retryable, sanitized — before any of it is dispatched or streamed. Each
+  // answer attempt re-checks again inside `streamAnswer`.
+  try {
+    await requireContextAuthorization(ctx, teamId).assertCurrent();
+  } catch (e) {
+    if (e instanceof QueryContextAuthorizationChangedError) {
+      return errorResponse("temporarily_unavailable", CONTEXT_AUTHORIZATION_CLIENT_MESSAGE, 503);
+    }
+    throw e;
+  }
 
   const encoder = new TextEncoder();
   const stream = new ReadableStream({
@@ -291,7 +312,9 @@ export async function POST(req: NextRequest) {
         // and upstream body — infrastructure detail no bearer (least of all a delegated one)
         // should receive. Full detail goes to the server log.
         console.error("[query] stream failed:", e instanceof Error ? e.message : e);
-        send("error", { message: "query failed" });
+        send("error", {
+          message: e instanceof QueryContextAuthorizationChangedError ? CONTEXT_AUTHORIZATION_CLIENT_MESSAGE : "query failed",
+        });
       } finally {
         controller.close();
       }

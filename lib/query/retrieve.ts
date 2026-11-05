@@ -3,7 +3,8 @@ export { buildFtsQuery, significantTerms, conjunctiveTerms, toOrQuery } from "./
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { GraphitiClient, type GraphFact } from "@/lib/graph/graphiti-client";
-import { GraphProvenanceUnavailableError, readAuthorizedGraphFacts } from "@/lib/graph/provenance-read";
+import { GraphProvenanceUnavailableError, readAuthorizedGraphFactsResult } from "@/lib/graph/provenance-read";
+import { ContextAuthorization, QueryContextAuthorizationChangedError } from "./context-authorization";
 import { selectEnforcedGraphPartitions } from "@/lib/graph/partition-read";
 import { runSql } from "@/lib/db/pg/pool";
 import {
@@ -71,7 +72,11 @@ type AugmentHit = { path?: string; text?: string; score?: number; project?: stri
  * misconfig it returns the input order unchanged. sids are reassigned so the
  * most relevant source is S1 (keeps the LLM's citations stable & meaningful).
  */
-async function rerankSources(question: string, sources: Source[]): Promise<Source[]> {
+export async function rerankSources(
+  question: string,
+  sources: Source[],
+  authorization?: ContextAuthorization,
+): Promise<Source[]> {
   if (!RERANK_URL || sources.length < 2) return sources;
   // AC-07 (M4): the reranker is a RAW transport with its own URL and token — it never passes
   // through `resolveAnsweringKeys`, so the central spend policy could not see it. A staging image
@@ -79,6 +84,10 @@ async function rerankSources(question: string, sources: Source[]): Promise<Sourc
   // a database that is supposed to cost nothing. Return the Postgres ordering BEFORE the fetch;
   // an explicit interactive budget re-enables it through the same policy every other path uses.
   if (!copiedStagingSpendAllowed("interactive-query")) return sources;
+  // AIO-1167 R66: the reranker RECEIVES the captured source text, so it is a dispatch like the
+  // answer: the capture epoch must still be current. A change is a refusal, never a quiet degrade.
+  if (!authorization) throw new QueryContextAuthorizationChangedError("inconsistent");
+  await authorization.assertCurrent();
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), RERANK_TIMEOUT_MS);
   try {
@@ -215,7 +224,7 @@ export async function fetchGraphFactsForGroups(
   question: string,
   groupIds: readonly string[],
   client?: GraphitiClient,
-  authority?: { db: DbClient; teamId: string },
+  authority?: { db: DbClient; teamId: string; authorization?: ContextAuthorization },
 ): Promise<GraphFact[]> {
   // The REST /search payload still lacks relationship episodes. Production retrieval therefore
   // uses the direct, provenance-complete Neo4j path; keeping the client parameter preserves the
@@ -223,9 +232,15 @@ export async function fetchGraphFactsForGroups(
   void client;
   if (groupIds.length === 0) return [];
   if (!authority) return [];
-  const facts = await readAuthorizedGraphFacts(authority.db, {
+  const result = await readAuthorizedGraphFactsResult(authority.db, {
     teamId: authority.teamId, groupIds, query: question, limit: GRAPH_FACT_LIMIT,
   });
+  // AIO-1167 R66: the facts were authorized under the epoch their read observed. A context captured
+  // under a DIFFERENT epoch would carry facts its own epoch never certified: inconsistent, refused.
+  if (authority.authorization && result.facts.length > 0 && !authority.authorization.certifies(result.epoch)) {
+    throw new QueryContextAuthorizationChangedError("changed");
+  }
+  const facts = result.facts;
   return facts.map((fact) => ({
     uuid: fact.id,
     fact: fact.fact,
@@ -494,7 +509,8 @@ async function nativeRetrieve(
   tier: "team" | "external",
   question: string,
   projectSlug?: string | null,
-  enforce?: RetrieveEnforce | null
+  enforce?: RetrieveEnforce | null,
+  authorization?: ContextAuthorization,
 ): Promise<RetrievedContext> {
   // Access enforcement (Phase B slice 2): `enforcing` supplies the principal's membership-visible
   // item set. `visible(id)` gates the item legs (FTS/recency/dense) + source-linked decisions/tasks.
@@ -549,9 +565,9 @@ async function nativeRetrieve(
     try {
       const scope = await selectEnforcedGraphPartitions(db, { teamId, visibleProjectIds: enforce.graphProjectIds });
       graphScope = { covered: scope.covered, total: scope.total };
-      return fetchGraphFactsForGroups(q, scope.groups, undefined, { db, teamId });
+      return fetchGraphFactsForGroups(q, scope.groups, undefined, { db, teamId, authorization });
     } catch (err) {
-      if (err instanceof GraphProvenanceUnavailableError) throw err;
+      if (err instanceof GraphProvenanceUnavailableError || err instanceof QueryContextAuthorizationChangedError) throw err;
       // Fail CLOSED and gracefully (review Medium 6) — but never SILENTLY (review-2 Medium 6): a
       // wedged arming path must be distinguishable from the healthy omit for operators.
       console.error(
@@ -1007,7 +1023,7 @@ async function nativeRetrieve(
   // 4. Optional cross-encoder rerank (local llama-server or cloud). No-op when
   // RERANK_URL is unset; reorders so the most relevant source is cited first.
   // (Runs on the RRF-fused order when dense retrieval contributed, else the FTS/recency order.)
-  const ranked = await rerankSources(question, orderedSources);
+  const ranked = await rerankSources(question, orderedSources, authorization);
 
   return { sources: ranked, structured: structuredWithGraph, grounded, ...(graphScope ? { graphScope } : {}) };
 }
@@ -1018,7 +1034,7 @@ async function nativeRetrieve(
  */
 export const nativeProvider: RetrievalProvider = {
   name: "native",
-  retrieve: (r) => nativeRetrieve(r.db, r.teamId, r.tier, r.question, r.projectSlug, r.enforce ?? null),
+  retrieve: (r) => nativeRetrieve(r.db, r.teamId, r.tier, r.question, r.projectSlug, r.enforce ?? null, r.authorization),
 };
 
 /**
@@ -1049,5 +1065,11 @@ export async function retrieve(
 ): Promise<RetrievedContext> {
   if (enforce == null) throw new Error("retrieve without an enforcement view (fail closed)");
   const provider = selectedProviderName() === "external" ? externalProvider : nativeProvider;
-  return provider.retrieve({ db, teamId, tier, question, projectSlug: projectSlug ?? null, enforce });
+  // AIO-1167 R66: the revocation epoch is captured BEFORE any read it certifies, and the context
+  // carries exactly that capture — never one read afterwards. Every dispatch re-checks it.
+  const authorization = await ContextAuthorization.capture(db, teamId);
+  const ctx = await provider.retrieve({
+    db, teamId, tier, question, projectSlug: projectSlug ?? null, enforce, authorization,
+  });
+  return { ...ctx, authorization };
 }

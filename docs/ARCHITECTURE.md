@@ -1204,7 +1204,13 @@ later restoration that stream ingested, whether or not it can read its change lo
 availability is not chronology, R62) — sends it to the document's own metadata: trashed
 or not-found removes, readable and not trashed SUPERSEDES the obsolete obligation (never sent, durable
 across reopen and replacement workers), a standing restriction holds it unread, and any other failure
-retries. Tokens of two streams are never ordered.
+retries. Tokens of two streams are never ordered. Trash evidence is current only for the EXECUTION
+that observed it (R66): each obligation records `observed_under` (`_observation_token`: the fence
+and the per-acquisition owner), and only that execution settles it unread. A replay under any later
+execution — a reopened store, a replacement worker, another state file that never saw a restoration
+another worker published — re-reads the document first, with the same outcomes and the same
+restriction/Retry-After admission. Local absence of a claim, a retry count, the generation or a
+fresh fence is never freshness.
 An unstarted stream no root needs any more is forgotten locally and leaves the brain's
 checkpoint with the run's next checkpoint. Shared Drive listing, traversal, rescan, and parent-membership checks use the
 provider's actual `driveId` as the root; the former synthetic `root` key is repaired only when the
@@ -1666,7 +1672,16 @@ change rebuilds once, and a second is the same retryable 503. The arcs recompute
 epoch reads the same way. Reads that publish no person attribution — graph-fact provenance
 (`lib/graph/provenance-read.ts`, and so retrieval's graph leg), arc-partition item authority and the
 facts feed — bind to the same counter through `revocationEpoch`, which keeps the revocation barrier
-without the repair gate.
+without the repair gate. A QUERY context carries that epoch to every dispatch (AIO-1167 R66,
+`lib/query/context-authorization.ts`): the public `retrieve()` entry captures it BEFORE any read it
+certifies (`ContextAuthorization.capture`; the constructor is private, so a hand-built or
+after-the-fact epoch is refused as inconsistent), requires the graph facts' own read epoch to match
+it, and re-checks it before a configured reranker receives source text. Both query routes re-check
+it once route preparation is done, and `streamAnswer` before EVERY answer attempt, the retries after
+backoff included. Changed or unreadable, the turn is refused — a sanitized, retryable 503 or SSE
+error (`CONTEXT_AUTHORIZATION_CLIENT_MESSAGE`) — with no dispatch, no answer text or citations, and
+no assistant message or partial run text from the captured context; the run is still finalized.
+Nothing is locked across a model request, and nothing is written to the counter here.
 
 The Timeline reads Drive evidence through a stable seek-paginated ledger independent of the generic
 item cap, re-resolves against complete current identity reads, and reapplies manual correction locks.

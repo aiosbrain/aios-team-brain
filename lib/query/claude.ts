@@ -290,8 +290,17 @@ export async function* streamAnswer(
 ): AsyncGenerator<StreamAnswerEvent> {
   const { assertCopiedStagingSpendAllowed } = await import("@/lib/staging/runtime-policy");
   assertCopiedStagingSpendAllowed("interactive-query");
+  // AIO-1167 R66: every NEW dispatch of the captured context — the first attempt and each retry after
+  // its backoff — re-checks the revocation epoch the context was captured under. A changed,
+  // unreadable or never-established epoch refuses before the request leaves; the refusal is not a
+  // transient stream error, so the retry owner never re-dispatches it.
+  const { requireContextAuthorization } = await import("./context-authorization");
+  const authorization = requireContextAuthorization(ctx);
   yield* withStreamRetry(
-    () => streamAnswerOnce(ctx, question, keys, history, caller, timeZone),
+    async function* attempt() {
+      await authorization.assertCurrent();
+      yield* streamAnswerOnce(ctx, question, keys, history, caller, timeZone);
+    },
     // ANY yielded event commits the stream: once the client has received anything — a delta OR the
     // terminal `done` — a restart would corrupt the visible answer. Retry only when the attempt threw
     // before yielding a single event. (Today `done` is always last, but this stays correct if it isn't.)

@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { GraphProvenanceUnavailableError } from "@/lib/graph/provenance-read";
 import { AttributionRepairPendingError } from "@/lib/access/authorization-epoch";
+import { ContextAuthorization } from "@/lib/query/context-authorization";
+import type { DbClient } from "@/lib/db/types";
 
 /**
  * AIO-1167 — both query routes finish enforced retrieval BEFORE a turn leaves any trace.
@@ -165,7 +167,12 @@ const v1Request = (body: Body | string, bearer = "aios_key1_secret") => new Requ
 const READS = new Set(["retrieve", "keys", "ownsConversation"]);
 const traces = () => h.events.filter((event) => !READS.has(event));
 
-const CONTEXT = { sources: [], structured: "", text: "" };
+// A context really captured for this team (R66): the unit tier has no epoch table, so `capture`
+// observes the canonical initial epoch — the routes refuse any context not built this way.
+const CONTEXT = {
+  sources: [], structured: "", text: "",
+  authorization: await ContextAuthorization.capture({} as DbClient, "team-1"),
+};
 const USAGE = {
   input_tokens: 1, output_tokens: 1, cache_read_tokens: 0, cost_usd: 0,
   provider: "test", model: "test", estimated: false,

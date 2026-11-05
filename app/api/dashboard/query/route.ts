@@ -23,6 +23,11 @@ import { isSyncCommand, runManualSync } from "@/lib/ingest/manual-sync";
 import { audit } from "@/lib/api/audit";
 import { GraphProvenanceUnavailableError } from "@/lib/graph/provenance-read";
 import { AttributionRepairPendingError } from "@/lib/access/authorization-epoch";
+import {
+  CONTEXT_AUTHORIZATION_CLIENT_MESSAGE,
+  QueryContextAuthorizationChangedError,
+  requireContextAuthorization,
+} from "@/lib/query/context-authorization";
 
 const SSE_HEADERS = {
   "Content-Type": "text/event-stream",
@@ -230,6 +235,9 @@ export async function POST(req: NextRequest) {
     if (e instanceof GraphProvenanceUnavailableError || e instanceof AttributionRepairPendingError) {
       return errorResponse("temporarily_unavailable", "query context is temporarily unavailable; retry shortly", 503);
     }
+    if (e instanceof QueryContextAuthorizationChangedError) {
+      return errorResponse("temporarily_unavailable", CONTEXT_AUTHORIZATION_CLIENT_MESSAGE, 503);
+    }
     throw e;
   }
 
@@ -250,6 +258,19 @@ export async function POST(req: NextRequest) {
   // Per-team provider keys + models + the explicit answering-backend override (null fields → env
   // fallback in streamAnswer; `activeProvider` forces a backend, else selectLlmBackend precedence).
   const keys = await resolveAnsweringKeys(db, team.id, "interactive-query");
+
+  // AIO-1167 R66: route preparation is done. A Drive revocation committed since retrieval captured
+  // its epoch (another connection may still hold the document) means the captured text is no longer
+  // this reader's: refuse — retryable, sanitized — before any of it is dispatched or streamed. Each
+  // answer attempt re-checks again inside `streamAnswer`.
+  try {
+    await requireContextAuthorization(ctx, team.id).assertCurrent();
+  } catch (e) {
+    if (e instanceof QueryContextAuthorizationChangedError) {
+      return errorResponse("temporarily_unavailable", CONTEXT_AUTHORIZATION_CLIENT_MESSAGE, 503);
+    }
+    throw e;
+  }
 
   // DEFERRED, deliberately (review: "no idempotency or active-run guard"). Two tabs — or a client that
   // re-POSTs after losing the SSE — start two turns in one conversation: two answers, two spend rows,

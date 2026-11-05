@@ -9,7 +9,9 @@ pinned in ``test/datamechanics/gdrive-audience-claims.datamechanics.test.ts``):
     through the claim-aware owner — with ZERO reads of the restricted root or the document. The
     reporting connection's claim is retired; the last claim suppresses the content; another
     connection's valid claim survives; the restriction itself is untouched;
-  * the evidence survives a failed sink acknowledgment and a restart, and the replay reads nothing;
+  * the evidence survives a failed sink acknowledgment and a restart; the replay belongs to a LATER
+    execution, so it first re-reads the document's own metadata (AIO-1167 R66 — retained trash is
+    not current evidence) — still never the restricted parent, and never the content;
   * an unresolved selected root (an unknown roster) and a restriction on the document itself do not
     send verified trash back to a probe;
   * an ambiguous ``removed`` hint under the restricted parent is NOT trash evidence: it stays on the
@@ -123,7 +125,9 @@ async def test_trash_evidence_survives_a_failed_sink_acknowledgment_and_a_restar
     world.calls.clear()
     await run(world, state)
     assert "doc-n" in world.removed
-    assert not RESTRICTED_READS & set(world.calls) and _reads_of(world, "doc-n") == []
+    # Retained from an earlier execution, the trash is re-verified first (R66): one metadata read of
+    # the document itself, still trashed; the restricted parent is never read.
+    assert not RESTRICTED_READS & set(world.calls) and _reads_of(world, "doc-n") == [("metadata", "doc-n")]
     assert _owed_removal_payload(state, world, "doc-n") is None
     state.close()
 
@@ -274,7 +278,9 @@ async def test_membershipless_trash_evidence_survives_sink_failure_or_lost_ack_a
     world.calls.clear()
     await run(world, state)
     assert _owed_removal_payload(state, world, "doc-n") is None  # acknowledged only now
-    assert not RESTRICTED_READS & set(world.calls) and _reads_of(world, "doc-n") == []
+    # A replay under a later execution re-verifies the trash first (R66), reading only the document's
+    # own metadata — never the restricted parent, never the content.
+    assert not RESTRICTED_READS & set(world.calls) and _reads_of(world, "doc-n") == [("metadata", "doc-n")]
     assert world.ledger.retired.count((world.integration_id, "doc-n")) == 1  # idempotent replay
     assert "doc-n" in world.ledger.deleted
     state.close()
