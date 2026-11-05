@@ -94,7 +94,10 @@ function countAuthorityMutations(source: string, file: string): number {
 }
 
 describe("identity mutation boundary source guard", () => {
-  it("keeps every direct authority mutation in an audited boundary owner", () => {
+  // A whole-tree AST scan (app, lib, scripts: ~720 files, ~7.6 MB) bounds correctness, not speed. It
+  // takes ~2.6s plainly but ~7.6s under V8 coverage (`npm run coverage`, PR #759 CI), past vitest's 5s
+  // default, with no assertion failing. A finite bound like the route-auth guard's, never an unbounded one.
+  it("keeps every direct authority mutation in an audited boundary owner", { timeout: 30_000 }, () => {
     const actual = new Map<string, number>();
     for (const root of ROOTS) {
       for (const file of filesBelow(path.join(process.cwd(), root))) {
