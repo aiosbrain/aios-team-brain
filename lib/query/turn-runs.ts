@@ -152,10 +152,20 @@ export async function finishRun(db: DbClient, runId: string, finalMessageId: str
  * Finalize a failed turn. `message` MUST be the sanitized client-facing text — the raw provider error
  * carries the internal model + base URL, and this column is read back by the browser.
  */
-export async function failRun(db: DbClient, runId: string, message: string): Promise<void> {
+export async function failRun(
+  db: DbClient,
+  runId: string,
+  message: string,
+  // AIO-1167 R67: a turn whose source authorization changed keeps NO readable partial answer.
+  opts: { clearPartial?: boolean } = {},
+): Promise<void> {
   const { error } = await db
     .from("chat_turn_runs")
-    .update({ status: "error", error_message: message, updated_at: new Date().toISOString() })
+    .update({
+      status: "error", error_message: message,
+      ...(opts.clearPartial ? { partial_text: "" } : {}),
+      updated_at: new Date().toISOString(),
+    })
     .eq("id", runId);
   if (error) throw new Error(`failRun: ${error.message}`);
 }

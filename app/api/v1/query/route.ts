@@ -20,6 +20,7 @@ import { GraphProvenanceUnavailableError } from "@/lib/graph/provenance-read";
 import { AttributionRepairPendingError } from "@/lib/access/authorization-epoch";
 import {
   CONTEXT_AUTHORIZATION_CLIENT_MESSAGE,
+  ContextAuthorization,
   QueryContextAuthorizationChangedError,
   requireContextAuthorization,
 } from "@/lib/query/context-authorization";
@@ -141,6 +142,17 @@ export async function POST(req: NextRequest) {
   // membership-visible items and its K-capped graph partitions (graphProjectIds, either posture);
   // a legacy connector/offroster key gets no graph scope. Tokens keep the §5.8b omit. Any error
   // fails closed (500).
+  // AIO-1167 R67: the query's one authorization is captured BEFORE the view below — the first input
+  // that selects content — and carried unchanged through retrieval and every output boundary.
+  let authorization: ContextAuthorization;
+  try {
+    authorization = await ContextAuthorization.capture(db, teamId);
+  } catch (e) {
+    if (e instanceof QueryContextAuthorizationChangedError) {
+      return errorResponse("temporarily_unavailable", CONTEXT_AUTHORIZATION_CLIENT_MESSAGE, 503);
+    }
+    throw e;
+  }
   let enforce: import("@/lib/query/retrieve").RetrieveEnforce | null = null;
   try {
     const { delegatedVisibleItemIds } = await import("@/lib/access/enforce");
@@ -182,7 +194,7 @@ export async function POST(req: NextRequest) {
   const started = Date.now();
   let ctx: Awaited<ReturnType<typeof retrieve>>;
   try {
-    ctx = await retrieve(db, teamId, memberTier, question, project, enforce);
+    ctx = await retrieve(db, teamId, memberTier, question, project, enforce, authorization);
   } catch (e) {
     if (e instanceof GraphProvenanceUnavailableError || e instanceof AttributionRepairPendingError) {
       return errorResponse("temporarily_unavailable", "query context is temporarily unavailable; retry shortly", 503);
@@ -249,9 +261,16 @@ export async function POST(req: NextRequest) {
       if (conversationId) send("conversation", { id: conversationId });
 
       let answer = "";
+      // AIO-1167 R67: every NEW publication, persistence or downstream dispatch of source-derived
+      // output re-checks the captured authorization first (a single-row epoch read; no lock, no
+      // transaction held while the model streams). Bytes already delivered are not recalled; after a
+      // change nothing further is emitted or stored — only the spend is still metered.
+      const gate = () => authorization.assertCurrent();
+      const isRefusal = (e: unknown) => e instanceof QueryContextAuthorizationChangedError;
       try {
         for await (const chunk of streamAnswer(ctx, question, keys, historyTurns, caller, timeZone)) {
           if (chunk.type === "delta") {
+            await gate();
             answer += chunk.text;
             send("delta", { text: chunk.text });
           } else {
@@ -267,10 +286,29 @@ export async function POST(req: NextRequest) {
                 path: s.path,
                 kind: s.kind,
               }));
-            send("sources", { sources });
-            send("done", chunk.usage);
+            // Terminal publication, then the stored answer: each is a boundary of its own.
+            let publish = true;
+            try {
+              await gate();
+            } catch (e) {
+              if (!isRefusal(e)) throw e;
+              publish = false;
+            }
+            if (publish) {
+              send("sources", { sources });
+              send("done", chunk.usage);
+            }
+            let persist = publish;
+            if (persist) {
+              try {
+                await gate();
+              } catch (e) {
+                if (!isRefusal(e)) throw e;
+                persist = false;
+              }
+            }
 
-            if (owner && conversationId) {
+            if (persist && owner && conversationId) {
               await appendMessage(db, owner, conversationId, "assistant", answer, {
                 cited_item_ids: sources.map((s) => s.item_id).filter((id): id is string => Boolean(id)),
                 input_tokens: chunk.usage.input_tokens,
@@ -278,13 +316,17 @@ export async function POST(req: NextRequest) {
                 cost_usd: chunk.usage.cost_usd,
               });
               if (createdNew) {
-                await generateAndSetTitle(db, owner, conversationId, question, answer, keys);
+                // The title request carries the answer: gated before its dispatch and its write.
+                await generateAndSetTitle(db, owner, conversationId, question, answer, keys, gate);
               }
             }
 
+            // Accounting is kept either way (the provider billed it); the answer itself only when stored.
             await db.from("query_log").update({
-              answer_preview: answer.slice(0, 500),
-              cited_item_ids: sources.map((s) => s.item_id).filter(Boolean),
+              ...(persist ? {
+                answer_preview: answer.slice(0, 500),
+                cited_item_ids: sources.map((s) => s.item_id).filter(Boolean),
+              } : {}),
               input_tokens: chunk.usage.input_tokens,
               output_tokens: chunk.usage.output_tokens,
               cache_read_tokens: chunk.usage.cache_read_tokens,
@@ -305,6 +347,7 @@ export async function POST(req: NextRequest) {
               costUsd: chunk.usage.cost_usd,
               estimated: chunk.usage.estimated,
             });
+            if (!publish) throw new QueryContextAuthorizationChangedError("changed");
           }
         }
       } catch (e) {

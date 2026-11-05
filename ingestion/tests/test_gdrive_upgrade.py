@@ -1540,7 +1540,9 @@ async def test_explicit_service_account_mode_never_uses_broker_and_requires_comp
 def test_provider_tombstone_is_acknowledged_only_after_shared_reconcile(tmp_path):
     store = StateStore(str(tmp_path / "remove.sqlite"))
     progress = store.begin_generation(StreamKey("team", "connection", "credential"), 1, start_token="opaque")
-    store.enqueue_work(progress.namespace, 1, "DocA", "remove", {"file_id": "DocA"})
+    # Observed under THIS execution (R67: only a current observation settles without a provider read).
+    store.enqueue_work(progress.namespace, 1, "DocA", "remove",
+                       {"file_id": "DocA", "observed_under": "1:00000000-0000-0000-0000-000000000002"})
 
     class Client:
         calls = []
@@ -1566,7 +1568,9 @@ def test_provider_tombstone_cleanup_failure_stays_durable_across_restart(tmp_pat
     path = tmp_path / "remove-retry.sqlite"
     store = StateStore(str(path))
     progress = store.begin_generation(StreamKey("team", "connection", "credential"), 1, start_token="opaque")
-    store.enqueue_work(progress.namespace, 1, "DocA", "remove", {"file_id": "DocA"})
+    # Observed under THIS execution (R67: only a current observation settles without a provider read).
+    store.enqueue_work(progress.namespace, 1, "DocA", "remove",
+                       {"file_id": "DocA", "observed_under": "1:00000000-0000-0000-0000-000000000002"})
 
     class Client:
         async def reconcile_gdrive(self, *_args, **_kwargs):
@@ -2804,7 +2808,7 @@ def test_observation_revisions_supersede_both_directions_and_survive_restart(tmp
     first = state.list_pending(progress.namespace, 8)[0]
     state.materialize_page(
         progress.namespace, 8, "page-remove", "changes", "b", "c", None,
-        [("doc", "remove", {"file_id": "doc"})], snapshot_id=snapshot,
+        [("doc", "remove", {"file_id": "doc", "observed_under": "1:owner"})], snapshot_id=snapshot,
         membership_removals=["doc"],
     )
     removed = state.list_pending(progress.namespace, 8)[0]
@@ -2938,7 +2942,7 @@ async def test_in_flight_remove_cannot_ack_newer_restoration_observation(tmp_pat
     )
     state.materialize_page(
         progress.namespace, 10, "remove-page", "changes", "a", None, "b",
-        [("doc", "remove", {"file_id": "doc"})], snapshot_id=snapshot,
+        [("doc", "remove", {"file_id": "doc", "observed_under": "1:owner"})], snapshot_id=snapshot,
         membership_removals=["doc"],
     )
 
@@ -4512,7 +4516,7 @@ def test_reconcile_call_stopped_by_the_run_deadline_keeps_the_removal_obligation
     progress = state.begin_generation(
         StreamKey("team", "connection", "account"), 1, start_token="start",
     )
-    state.enqueue_work(progress.namespace, 1, "gone", "remove", {"file_id": "gone"})
+    state.enqueue_work(progress.namespace, 1, "gone", "remove", {"file_id": "gone", "observed_under": "1:owner"})
 
     class Client(_RecordingBrain):
         async def reconcile_gdrive(self, execution, **kwargs):
@@ -7610,14 +7614,27 @@ async def test_deletion_the_provider_would_not_confirm_is_removed_once_the_unope
         state.close()
         state = StateStore(path)
 
-    # The drive opens. Its stream drains past the barrier and does not hold the document, so the
-    # removal is the connection's — on that evidence alone: the document is never read again.
+    # The drive opens and its stream drains past the barrier without the document. AIO-1167 R67: the
+    # removal was observed under an EARLIER execution, so barrier evidence alone no longer concludes
+    # it — another worker may have restored the document through another state file. While its own
+    # read stays inconclusive (a 403) it is weighed but never concluded absent: still owed, nothing
+    # removed, the connection partial.
     del world.token_errors["shared-b"]
+    for _run in range(2):
+        world.calls.clear()
+        held = await world.run(state)
+        assert ("metadata", "doc-1") in world.calls
+        assert world.removed == [] and held.authoritative_complete is False
+        assert [(work.item_key, work.action) for work in state.list_pending(origin, 9)] == [("doc-1", "remove")]
+        state.close()
+        state = StateStore(path)
+
+    # The provider answers conclusively — the document is gone — and the removal is the connection's.
+    del world.unreadable["doc-1"]
     summary = None
     for _run in range(4):
         world.calls.clear()
         summary = await world.run(state)
-        assert ("metadata", "doc-1") not in world.calls
         assert all("doc-1" not in members for members in world.reconciled)
         state.close()
         state = StateStore(path)
@@ -7797,6 +7814,14 @@ async def test_ambiguous_removal_stays_withheld_behind_a_recovery_blocked_peer_t
 
     # The drive issues a token again and shared-b recovers.
     del world.token_errors["shared-b"]
+    if ambiguity == "refused":
+        # AIO-1167 R67: retained evidence whose own read stays inconclusive is never concluded absent:
+        # the removal stays owed until the provider answers.
+        held = await world.run(state)
+        assert world.removed == [] and held.authoritative_complete is False
+        state.close()
+        state = StateStore(path)
+        del world.unreadable["doc-1"]  # now the provider says the document is gone
     summary = None
     for _run in range(4):
         summary = await world.run(state)

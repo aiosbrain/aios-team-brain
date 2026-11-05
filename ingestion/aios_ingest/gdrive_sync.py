@@ -3059,7 +3059,8 @@ async def _run_gdrive_stream_unlocked(
                         )
                         membership_root_removals.extend((item_id, changed_drive_id) for item_id in affected)
                         obligations.extend(
-                            (item_id, "remove", {"file_id": item_id, "reason": "selected_drive_tombstone"})
+                            (item_id, "remove", {"file_id": item_id, "reason": "selected_drive_tombstone",
+                                                 "observed_under": _observation_token(execution)})
                             for item_id in final
                         )
                     continue
@@ -3110,7 +3111,8 @@ async def _run_gdrive_stream_unlocked(
                             membership_root_removals.extend((item_id, root_id) for item_id in affected)
                             final_items.update(final)
                         obligations.extend(
-                            (item_id, "remove", {"file_id": item_id, "reason": "folder_or_ancestor_tombstone"})
+                            (item_id, "remove", {"file_id": item_id, "reason": "folder_or_ancestor_tombstone",
+                                                 "observed_under": _observation_token(execution)})
                             for item_id in sorted(final_items)
                         )
                     continue
@@ -3206,7 +3208,10 @@ async def _run_gdrive_stream_unlocked(
                         continue
                     if removed or (selected and not in_scope):
                         if selected:
-                            obligations.append((file_id, "remove", {"file_id": file_id}))
+                            # Minted HERE, where the change was read — never on a replay (R67).
+                            obligations.append((file_id, "remove", {
+                                "file_id": file_id, "observed_under": _observation_token(execution),
+                            }))
                             membership_removals.append(file_id)
                         continue
                     # Reported with another drive's id, yet read in this one: an ordinary change.
@@ -4276,6 +4281,130 @@ def _explicit_trash_verdict(
     return "superseded"
 
 
+# How far up a document's parents a retained removal's verification walks (R67): a selected root
+# further away than this cannot be proven, so the evidence stays inconclusive (never absent).
+_RETAINED_ANCESTRY_DEPTH = 12
+
+
+def _selecting_stream(
+    state: StateStore, source: GoogleDriveSource, work: PendingWork, meta: dict[str, Any], connection_id: str,
+) -> str | None:
+    """The namespace of a stream of this connection whose CONFIGURED selected roots contain the
+    document as the provider reports it NOW — its own id, its drive, or an ancestor folder found by
+    reading parents' metadata (AIO-1167 R67) — or ``None`` when no root does.
+
+    Local traversal alone cannot answer this for a retained removal: a store whose snapshot predates a
+    restoration another worker published may not traverse the folder the document came back through.
+    So the parent chain is read through the provider gate, and only the stable root identities come
+    from local state. This stream is weighed first. A read that is not a definitive answer is raised
+    as ``_AncestryUnverified`` (inconclusive); a deferral is raised for the drain's owners."""
+    streams = [work.namespace] + [
+        progress.namespace for progress in state.list_progress(connection_id, work.generation)
+        if progress.namespace != work.namespace
+    ]
+    roots_by_stream: dict[str, set[tuple[str, str]]] = {}
+    for namespace in streams:
+        snapshot = state.work_snapshot_id(work) if namespace == work.namespace else None
+        roots_by_stream[namespace] = {
+            (str(row["root_kind"]), str(row["root_id"]))
+            for row in state.list_roots(namespace, work.generation, snapshot_id=snapshot)
+        }
+    drive_id = str(meta.get("driveId") or "my-drive")
+    chain: list[str] = []
+    for namespace, roots in roots_by_stream.items():
+        if ("file", work.item_key) in roots or ("drive", drive_id) in roots:
+            return namespace
+    frontier = [str(parent) for parent in meta.get("parents") or []]
+    seen: set[str] = set()
+    for _depth in range(_RETAINED_ANCESTRY_DEPTH):
+        if not frontier:
+            return None
+        for namespace, roots in roots_by_stream.items():
+            if any(("folder", folder) in roots for folder in frontier):
+                return namespace
+        chain.extend(frontier)
+        next_frontier: list[str] = []
+        for folder in frontier:
+            if folder in seen:
+                continue
+            seen.add(folder)
+            try:
+                parent_meta = source._metadata(folder)
+            except (BrainError, ProviderDeferred):
+                raise
+            except Exception as exc:
+                if _provider_status(exc) == 404:
+                    continue  # a missing ancestor leads to no root
+                raise _AncestryUnverified() from exc
+            if parent_meta.get("trashed"):
+                continue
+            next_frontier.extend(str(parent) for parent in parent_meta.get("parents") or [])
+        frontier = next_frontier
+    raise _AncestryUnverified()
+
+
+class _AncestryUnverified(Exception):
+    """A retained removal's ancestry walk met an inconclusive read or its depth bound."""
+
+
+def _retained_removal_verdict(
+    state: StateStore, source: GoogleDriveSource, work: PendingWork, connection_id: str,
+    *, restricted: bool,
+) -> str | None:
+    """A RETAINED ordinary removal — move-out, access, root or ancestor evidence observed under an
+    EARLIER execution, or a legacy obligation that names none (AIO-1167 R67).
+
+    Like retained trash (R66), it is history: another worker may since have restored the document
+    through another state file, and neither local absence of a claim, a retry count, the generation
+    nor a fresh fence says otherwise. It is weighed against CURRENT evidence before anything is
+    concluded — and readable metadata alone does not prove the document is selected:
+
+      · a standing provider minimum — ``restricted``: retained, not read early;
+      · not found or trashed — ``absent``: a genuine current removal;
+      · readable and inside this stream's selection — its CONFIGURED roots over the document's
+        CURRENT parent chain (``_selecting_stream``; never the stored traversal, which is as old as
+        the evidence) — the removal is OBSOLETE: superseded, never sent;
+      · readable and inside a READABLE other stream's selection — ``claimed``: it moved between
+        selected roots; only this stream's membership ended and nothing is reconciled (behind a
+        stream that cannot read its log, the ordinary weighing withholds it, as before);
+      · readable and under no selected root — ``None``: the current provider evidence agrees the
+        document left the selection, so the ordinary cross-stream weighing decides, its claims,
+        barriers and peer probes untouched;
+      · any other read failure (a 5xx, an account/authorization answer) — ``uncertain``: the ordinary
+        weighing still runs (its claims and barriers), but it may NOT conclude absence from
+        retained evidence: such a removal stays pending, withheld. A deferral is raised for the
+        drain's owners."""
+    if restricted:
+        state.fail_work(work, _RESTRICTED_PROBE_PENDING, not_before=work.not_before, failure=False)
+        return "restricted"
+    try:
+        meta = source._metadata(work.item_key)
+    except (BrainError, ProviderDeferred):
+        raise
+    except Exception as exc:
+        return "absent" if _provider_status(exc) == 404 else "uncertain"
+    if meta.get("trashed"):
+        return "absent"
+    # NOT the obligation's stored traversal (`_metadata_in_current_selection`): it is as old as the
+    # evidence, and can both miss a folder a restoration came back through and keep one that left.
+    try:
+        selecting = _selecting_stream(state, source, work, meta, connection_id)
+    except _AncestryUnverified:
+        return "uncertain"
+    if selecting == work.namespace:
+        state.supersede_pending_removal(work)
+        return "superseded"
+    if selecting is not None and not _cannot_read(state.get_progress(selecting)):
+        return "claimed"
+    # Under no root — or under a root of a stream that cannot read its own change log, whose
+    # withholding the ordinary weighing owns: weighed as before (it never concludes absence here).
+    return None
+
+
+# A retained removal whose current evidence could not be read: never concluded absent (R67).
+_RETAINED_REMOVAL_UNVERIFIED = "retained removal awaits current provider evidence"
+
+
 def _cross_stream_removal(
     state: StateStore, execution: GdriveExecution, source: GoogleDriveSource, work: PendingWork,
     *, restricted: bool = False,
@@ -4328,6 +4457,29 @@ def _cross_stream_removal(
     connection_id = own.key.connection_id if own is not None else execution.integration_id
     if (work.payload or {}).get("trashed") is True:
         return _explicit_trash_verdict(state, execution, source, work, connection_id, restricted=restricted)
+    if (work.payload or {}).get("observed_under") != _observation_token(execution):
+        # Observed under an earlier execution, or a legacy obligation with no identity (R67): current
+        # evidence first; only evidence that the document really left goes on to the weighing below,
+        # and inconclusive evidence may be weighed but never concluded absent.
+        retained = _retained_removal_verdict(state, source, work, connection_id, restricted=restricted)
+        if retained == "uncertain":
+            verdict = _weigh_cross_stream_removal(state, execution, source, work, restricted=restricted)
+            if verdict != "absent":
+                return verdict
+            state.fail_work(work, _RETAINED_REMOVAL_UNVERIFIED, not_before=work.not_before, failure=False)
+            return "withheld"
+        if retained is not None:
+            return retained
+    return _weigh_cross_stream_removal(state, execution, source, work, restricted=restricted)
+
+
+def _weigh_cross_stream_removal(
+    state: StateStore, execution: GdriveExecution, source: GoogleDriveSource, work: PendingWork,
+    *, restricted: bool = False,
+) -> str:
+    """The cross-stream weighing of one removal (``_cross_stream_removal``'s ordinary path)."""
+    own = state.get_progress(work.namespace)
+    connection_id = own.key.connection_id if own is not None else execution.integration_id
     roster_unknown = state.unknown_root_count(connection_id, work.generation) > 0
     local = {
         progress.key.drive_id: progress

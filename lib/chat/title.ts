@@ -127,16 +127,21 @@ export async function generateAndSetTitle(
   conversationId: string,
   question: string,
   answer: string,
-  keys: ProviderKeys = {}
+  keys: ProviderKeys = {},
+  // AIO-1167 R67: the answer is source-derived. `gate` is awaited immediately before the title
+  // request and again before the title is written; when it throws, nothing is dispatched or written.
+  gate?: () => Promise<void>,
 ): Promise<void> {
   try {
+    if (gate) await gate();
     const title = await generateTitle(question, answer, keys, {
       db,
       teamId: owner.teamId,
       memberId: owner.memberId,
     });
+    if (gate) await gate();
     if (title) await setTitle(db, owner, conversationId, title);
   } catch {
-    // keep the derived title
+    // keep the derived title (an authorization refusal included: nothing was written)
   }
 }

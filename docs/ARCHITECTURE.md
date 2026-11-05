@@ -1210,7 +1210,14 @@ and the per-acquisition owner), and only that execution settles it unread. A rep
 execution — a reopened store, a replacement worker, another state file that never saw a restoration
 another worker published — re-reads the document first, with the same outcomes and the same
 restriction/Retry-After admission. Local absence of a claim, a retry count, the generation or a
-fresh fence is never freshness.
+fresh fence is never freshness. R67 extends this to EVERY removal: move-out, access, root and ancestor
+evidence is stamped where it is observed, and a retained (or legacy, unstamped) one is verified
+against current evidence first (`_retained_removal_verdict`): not found or trashed removes; readable,
+its CURRENT parent chain read through the provider gate is weighed against every stream's
+configured roots (`_selecting_stream`, never the stored traversal, which is as old as the evidence)
+— under this stream's roots it is superseded, under a readable peer's it only ends this stream's
+membership, under none the ordinary weighing decides; an inconclusive read (5xx, an auth answer, the
+depth bound) is weighed but never concluded absent.
 An unstarted stream no root needs any more is forgotten locally and leaves the brain's
 checkpoint with the run's next checkpoint. Shared Drive listing, traversal, rescan, and parent-membership checks use the
 provider's actual `driveId` as the root; the former synthetic `root` key is repaired only when the
@@ -1673,12 +1680,19 @@ epoch reads the same way. Reads that publish no person attribution — graph-fac
 (`lib/graph/provenance-read.ts`, and so retrieval's graph leg), arc-partition item authority and the
 facts feed — bind to the same counter through `revocationEpoch`, which keeps the revocation barrier
 without the repair gate. A QUERY context carries that epoch to every dispatch (AIO-1167 R66,
-`lib/query/context-authorization.ts`): the public `retrieve()` entry captures it BEFORE any read it
+`lib/query/context-authorization.ts`). Both routes capture it BEFORE resolving the reader's view —
+the first input that selects content — and hand that one capture to `retrieve()`, which never
+recaptures over it (R67); a direct caller without one gets a capture before any read it
 certifies (`ContextAuthorization.capture`; the constructor is private, so a hand-built or
 after-the-fact epoch is refused as inconsistent), requires the graph facts' own read epoch to match
 it, and re-checks it before a configured reranker receives source text. Both query routes re-check
-it once route preparation is done, and `streamAnswer` before EVERY answer attempt, the retries after
-backoff included. Changed or unreadable, the turn is refused — a sanitized, retryable 503 or SSE
+it once route preparation is done, and immediately before EVERY provider request carrying the
+context — each attempt, both adapters, and the inline size-refusal fallback (R67). After dispatch,
+every new publication or persistence boundary re-checks it too (R67): each delta (and the dashboard's
+partial flush), the terminal citations, the stored answer and its log preview, and the title request
+and its write (`generateAndSetTitle(..., gate)`). Bytes already delivered are not recalled; after a
+change nothing further is emitted or stored, the provider's spend is still accounted, and a dashboard
+run is failed with its partial text cleared (`failRun(..., { clearPartial })`). Changed or unreadable, the turn is refused — a sanitized, retryable 503 or SSE
 error (`CONTEXT_AUTHORIZATION_CLIENT_MESSAGE`) — with no dispatch, no answer text or citations, and
 no assistant message or partial run text from the captured context; the run is still finalized.
 Nothing is locked across a model request, and nothing is written to the counter here.

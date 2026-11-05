@@ -1,5 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { RetrievedContext } from "@/lib/query/retrieve";
+import { ContextAuthorization } from "@/lib/query/context-authorization";
+import type { DbClient } from "@/lib/db/types";
 
 // Spec: docs/design/query-background-stream.md — acceptance criteria 2 and 5.
 // The turn must complete and persist EXACTLY ONCE even when the client vanishes mid-answer (which
@@ -53,7 +55,11 @@ function fakeDb(opts: { failInsertOn?: string } = {}) {
   };
 }
 
-const ctx = { sources: [], structured: "", grounded: true } as unknown as RetrievedContext;
+// A context really captured for the owner's team (R66/R67): `runAnswerTurn` refuses any other.
+const ctx = {
+  sources: [], structured: "", grounded: true,
+  authorization: await ContextAuthorization.capture({} as DbClient, "team-1"),
+} as unknown as RetrievedContext;
 
 function baseArgs(db: ReturnType<typeof fakeDb>, send: (e: string, d: unknown) => void) {
   return {

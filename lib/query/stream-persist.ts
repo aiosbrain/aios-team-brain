@@ -7,6 +7,7 @@ import { appendMessage } from "@/lib/chat/store";
 import { generateAndSetTitle } from "@/lib/chat/title";
 import { recordLlmUsage } from "@/lib/costs/llm-usage";
 import { flushPartial, finishRun, failRun, touchRun } from "./turn-runs";
+import { QueryContextAuthorizationChangedError, requireContextAuthorization } from "./context-authorization";
 
 /**
  * Run ONE answer turn to completion and persist it — independently of whether the client is still
@@ -97,7 +98,36 @@ export async function runAnswerTurn(args: RunAnswerTurnArgs): Promise<void> {
   // Don't hold the process open just for a heartbeat (Node-only; harmless where absent).
   heartbeat?.unref?.();
 
+  // AIO-1167 R67: every NEW publication or persistence of source-derived output — a delta and its
+  // partial flush, the stored answer and its log preview, the title request and its write — re-checks
+  // the captured authorization first. A single-row epoch read: no lock or transaction is held while
+  // the model streams. Bytes already delivered are not recalled; after a change nothing further is
+  // emitted or stored, the spend is still metered, and the run is failed with its partial CLEARED.
+  let gate: () => Promise<void> = async () => undefined;
+  const isRefusal = (e: unknown) => e instanceof QueryContextAuthorizationChangedError;
+  const accountRefused = async (usage: import("./claude").QueryUsage) => {
+    // The provider billed the answer even though it is not published: keep the accounting, never
+    // the answer (no preview, no cited items). Best-effort, so the refusal itself still surfaces.
+    try {
+      const { error } = await db.from("query_log").insert({
+        team_id: owner.teamId, member_id: owner.memberId, question,
+        input_tokens: usage.input_tokens, output_tokens: usage.output_tokens,
+        cache_read_tokens: usage.cache_read_tokens, cost_usd: usage.cost_usd, latency_ms: now() - args.startedAt,
+      });
+      if (error) throw new Error(error.message);
+      await recordLlmUsage(db, {
+        teamId: owner.teamId, memberId: owner.memberId, source: "query", provider: usage.provider,
+        model: usage.model, inputTokens: usage.input_tokens, outputTokens: usage.output_tokens,
+        costUsd: usage.cost_usd, estimated: usage.estimated,
+      });
+    } catch (e) {
+      console.error("[query] refused-turn accounting failed:", e instanceof Error ? e.message : e);
+    }
+  };
+
   try {
+    const authorization = requireContextAuthorization(ctx, owner.teamId);
+    gate = () => authorization.assertCurrent();
     for await (const chunk of streamAnswer(ctx, question, keys, historyTurns, caller, timeZone, {
       onRetry: ({ attempt, delayMs, error }) =>
         console.warn(
@@ -106,6 +136,7 @@ export async function runAnswerTurn(args: RunAnswerTurnArgs): Promise<void> {
         ),
     })) {
       if (chunk.type === "delta") {
+        await gate(); // outside the best-effort flush below, so a refusal ends the turn
         answer += chunk.text;
         send("delta", { text: chunk.text });
         // Heartbeat the run so a returning tab sees progress AND so `isRunStale` can tell a live run
@@ -133,6 +164,12 @@ export async function runAnswerTurn(args: RunAnswerTurnArgs): Promise<void> {
       // `done`, marked the run failed even though the model had succeeded (and been billed), and left
       // the turn unlogged — resurrecting the under-bill through the DB-failure edge. Now a persistence
       // failure takes the catch below BEFORE any `done` was claimed, so the client is told the truth.
+      try {
+        await gate();
+      } catch (e) {
+        if (isRefusal(e)) await accountRefused(chunk.usage);
+        throw e;
+      }
       let finalMessageId: string | null = null;
       if (conversationId) {
         finalMessageId = await appendMessage(db, owner, conversationId, "assistant", answer, {
@@ -185,7 +222,8 @@ export async function runAnswerTurn(args: RunAnswerTurnArgs): Promise<void> {
       // (or failing) title never delays or fails a turn that is already safely persisted.
       if (conversationId && args.createdNew) {
         try {
-          await generateAndSetTitle(db, owner, conversationId, question, answer, keys);
+          // The title request carries the answer: gated before its dispatch and before its write.
+          await generateAndSetTitle(db, owner, conversationId, question, answer, keys, gate);
         } catch (e) {
           console.warn("[query] title generation failed:", e instanceof Error ? e.message : e);
         }
@@ -200,7 +238,8 @@ export async function runAnswerTurn(args: RunAnswerTurnArgs): Promise<void> {
     send("error", { message });
     if (runId) {
       try {
-        await failRun(db, runId, message);
+        // A refused turn keeps no readable partial answer (R67): cleared through the run owner.
+        await failRun(db, runId, message, isRefusal(e) ? { clearPartial: true } : {});
       } catch (err) {
         console.error("[query] failed to record run failure:", err instanceof Error ? err.message : err);
       }

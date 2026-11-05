@@ -2693,6 +2693,32 @@ class StateStore:
             self._db.commit()
         return superseded
 
+    def supersede_pending_removal(self, work: PendingWork) -> bool:
+        """Retire ONE still-owed removal obligation that current evidence proved obsolete (AIO-1167
+        R67): never sent, its page outcome recorded superseded so the page may commit — exactly as
+        ``supersede_pending_trash`` does for trash. Only this observation revision, only while it is
+        unacknowledged. Idempotent; returns whether anything changed."""
+        now = _now_iso()
+        cur = self._db.execute(
+            "UPDATE pending_work SET superseded_at=?,updated_at=? WHERE namespace=? AND generation=? "
+            "AND item_key=? AND action='remove' AND observation_revision=? "
+            "AND acknowledged_at IS NULL AND superseded_at IS NULL",
+            (now, now, work.namespace, work.generation, work.item_key, work.observation_revision),
+        )
+        if cur.rowcount:
+            self._db.execute(
+                "UPDATE page_obligation_outcomes SET status='superseded',updated_at=? WHERE namespace=? "
+                "AND generation=? AND page_id=? AND item_key=? AND observation_revision=? AND status='pending'",
+                (now, work.namespace, work.generation, work.page_id, work.item_key, work.observation_revision),
+            )
+            # Its barriers belonged to that removal, exactly as a newer observation retires them.
+            self._db.execute(
+                "DELETE FROM removal_barriers WHERE namespace=? AND generation=? AND item_key=?",
+                (work.namespace, work.generation, work.item_key),
+            )
+        self._db.commit()
+        return bool(cur.rowcount)
+
     def remove_membership(self, namespace: str, generation: int, provider_id: str,
                           *, snapshot_id: int | None = None) -> bool:
         selected = snapshot_id if snapshot_id is not None else self.snapshot_id(namespace)

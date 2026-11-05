@@ -1061,13 +1061,19 @@ export async function retrieve(
   // would run the item legs UNFILTERED (fail open), so a caller without a principal's view is a
   // bug and throws (the timeline's memberId==null rule, applied here). Both query routes
   // construct the view or 500 before calling.
-  enforce?: RetrieveEnforce | null
+  enforce?: RetrieveEnforce | null,
+  // AIO-1167 R67: the query's ONE authorization, captured by the route BEFORE it resolved the view
+  // (`enforce`) — the first authorization input that selects content. Carried, never recaptured: an
+  // epoch read after the view was accepted would certify a view it never saw. Absent only for a
+  // direct caller that dispatches nothing; then it is captured here, before any read.
+  captured?: ContextAuthorization,
 ): Promise<RetrievedContext> {
   if (enforce == null) throw new Error("retrieve without an enforcement view (fail closed)");
   const provider = selectedProviderName() === "external" ? externalProvider : nativeProvider;
   // AIO-1167 R66: the revocation epoch is captured BEFORE any read it certifies, and the context
   // carries exactly that capture — never one read afterwards. Every dispatch re-checks it.
-  const authorization = await ContextAuthorization.capture(db, teamId);
+  const authorization = captured ?? await ContextAuthorization.capture(db, teamId);
+  if (authorization.teamId !== teamId) throw new QueryContextAuthorizationChangedError("inconsistent");
   const ctx = await provider.retrieve({
     db, teamId, tier, question, projectSlug: projectSlug ?? null, enforce, authorization,
   });

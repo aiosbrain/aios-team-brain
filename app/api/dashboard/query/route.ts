@@ -25,6 +25,7 @@ import { GraphProvenanceUnavailableError } from "@/lib/graph/provenance-read";
 import { AttributionRepairPendingError } from "@/lib/access/authorization-epoch";
 import {
   CONTEXT_AUTHORIZATION_CLIENT_MESSAGE,
+  ContextAuthorization,
   QueryContextAuthorizationChangedError,
   requireContextAuthorization,
 } from "@/lib/query/context-authorization";
@@ -205,6 +206,17 @@ export async function POST(req: NextRequest) {
 
   // Access enforcement (Phase B slice 2; TIERRET-1): same as the API query route — retrieval is
   // filtered by the admission resolver's arm for this session member, unconditionally.
+  // AIO-1167 R67: the query's one authorization is captured BEFORE the view below — the first input
+  // that selects content — and carried unchanged through retrieval and every output boundary.
+  let authorization: ContextAuthorization;
+  try {
+    authorization = await ContextAuthorization.capture(db, team.id);
+  } catch (e) {
+    if (e instanceof QueryContextAuthorizationChangedError) {
+      return errorResponse("temporarily_unavailable", CONTEXT_AUTHORIZATION_CLIENT_MESSAGE, 503);
+    }
+    throw e;
+  }
   let enforce: import("@/lib/query/retrieve").RetrieveEnforce | null = null;
   try {
     // PRET-6: enforcing is the only behavior — enforcement is always constructed.
@@ -230,7 +242,7 @@ export async function POST(req: NextRequest) {
   // raw error, and never a conversation, message or run row for a turn that did not happen.
   let ctx: Awaited<ReturnType<typeof retrieve>>;
   try {
-    ctx = await retrieve(db, team.id, memberTier, question, project, enforce);
+    ctx = await retrieve(db, team.id, memberTier, question, project, enforce, authorization);
   } catch (e) {
     if (e instanceof GraphProvenanceUnavailableError || e instanceof AttributionRepairPendingError) {
       return errorResponse("temporarily_unavailable", "query context is temporarily unavailable; retry shortly", 503);

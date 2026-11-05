@@ -24,6 +24,23 @@ vi.mock("@/lib/graph/provenance-read", async (importOriginal) => ({
   }),
 }));
 
+const anthropic = vi.hoisted(() => ({ streams: 0 }));
+vi.mock("@anthropic-ai/sdk", () => ({
+  default: class {
+    messages = {
+      stream: () => {
+        anthropic.streams += 1;
+        return {
+          async *[Symbol.asyncIterator]() {
+            yield { type: "content_block_delta", delta: { type: "text_delta", text: "anthropic answer" } };
+          },
+          finalMessage: async () => ({ usage: { input_tokens: 1, output_tokens: 1 } }),
+        };
+      },
+    };
+  },
+}));
+
 const DB = {} as DbClient;
 const SOURCES = [
   { sid: "S1", text: "first captured text" },
@@ -119,5 +136,85 @@ describe("ContextAuthorization — trusted capture, consistency, current at disp
     expect(isRetryableStreamError(refusal)).toBe(false);
     expect(clientErrorMessage(refusal)).toBe(CONTEXT_AUTHORIZATION_CLIENT_MESSAGE);
     expect(CONTEXT_AUTHORIZATION_CLIENT_MESSAGE).not.toMatch(/epoch|item|graph/i);
+  });
+});
+
+
+// ── R67: every provider request re-checks, the inline size fallback included ────────────────────
+
+function sizeRefusal(onBody: () => void) {
+  return {
+    ok: false, status: 400, body: null,
+    // The body is read while the request is still being answered: revocation lands here.
+    text: async () => {
+      onBody();
+      return "max_tokens is too large for this model";
+    },
+  } as unknown as Response;
+}
+
+function answerStream(text: string): Response {
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      const encoder = new TextEncoder();
+      controller.enqueue(encoder.encode(`data: ${JSON.stringify({ choices: [{ delta: { content: text } }] })}\n\n`));
+      controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+      controller.close();
+    },
+  });
+  return { ok: true, status: 200, body, text: async () => "" } as unknown as Response;
+}
+
+async function answer(keys: Record<string, string>) {
+  const { ContextAuthorization } = await import("@/lib/query/context-authorization");
+  const { streamAnswer } = await import("@/lib/query/claude");
+  const ctx = {
+    sources: SOURCES, structured: "", grounded: true,
+    authorization: await ContextAuthorization.capture(DB, "team-1"),
+  } as unknown as import("@/lib/query/retrieve").RetrievedContext;
+  let text = "";
+  for await (const event of streamAnswer(ctx, "q", keys, [], undefined, "UTC", { sleep: async () => undefined })) {
+    if (event.type === "delta") text += event.text;
+  }
+  return text;
+}
+
+describe("R67 — the inline size fallback and every adapter re-check before dispatch", () => {
+  const OPENROUTER = { openrouterKey: "k", openrouterModel: "m" };
+
+  it.each([
+    ["changed", () => { epochs.value = 2; }, "changed"],
+    ["unreadable", () => { epochs.value = new Error("epoch read failed"); }, "unreadable"],
+  ] as const)("revoked (%s) while the first response is pending: exactly one request, no fallback", async (_label, revoke, reason) => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(sizeRefusal(revoke)).mockResolvedValueOnce(answerStream("leaked"));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(answer(OPENROUTER)).rejects.toMatchObject({ name: "QueryContextAuthorizationChangedError", reason });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("unchanged authority: the reduced-budget fallback is sent and answers", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(sizeRefusal(() => undefined)).mockResolvedValueOnce(answerStream("ok"));
+    vi.stubGlobal("fetch", fetchMock);
+    expect(await answer(OPENROUTER)).toBe("ok");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const budgets = fetchMock.mock.calls.map((call) => JSON.parse(String((call[1] as { body: string }).body)).max_tokens);
+    expect(budgets[1]).toBeLessThan(budgets[0]);
+  });
+
+  it("the Anthropic adapter re-checks immediately before its request too", async () => {
+    anthropic.streams = 0;
+    const ANTHROPIC = { activeProvider: "anthropic", anthropicKey: "k" };
+    expect(await answer(ANTHROPIC)).toBe("anthropic answer");
+    expect(anthropic.streams).toBe(1);
+    const { ContextAuthorization } = await import("@/lib/query/context-authorization");
+    const { streamAnswerOnce } = await import("@/lib/query/claude");
+    const ctx = {
+      sources: SOURCES, structured: "", grounded: true,
+      authorization: await ContextAuthorization.capture(DB, "team-1"),
+    } as unknown as import("@/lib/query/retrieve").RetrievedContext;
+    epochs.value = 2;
+    const drain = async () => { for await (const _e of streamAnswerOnce(ctx, "q", ANTHROPIC)) void _e; };
+    await expect(drain()).rejects.toMatchObject({ reason: "changed" });
+    expect(anthropic.streams).toBe(1);
   });
 });
