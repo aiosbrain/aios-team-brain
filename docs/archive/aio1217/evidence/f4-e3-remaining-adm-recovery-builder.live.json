@@ -1,0 +1,11 @@
+{
+  "state": "STOP",
+  "stage": "f4-e3-remaining-adm-recovery-builder",
+  "wrapperPid": 45641,
+  "childPid": 47996,
+  "modelRequested": "claude-opus-5-5",
+  "updatedAt": "2026-10-06T04:52:44Z",
+  "exit": 0,
+  "terminalCaptured": true,
+  "model": "claude-opus-5-5"
+}

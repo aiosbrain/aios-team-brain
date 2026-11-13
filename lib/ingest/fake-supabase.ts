@@ -3,6 +3,11 @@
  * Supports exactly the PostgREST fluent chain ingestItem() uses: from().upsert/
  * insert/update/delete/select with eq()/maybeSingle()/single()/not(col,'is',null).
  * Not a general mock — faithful to the calls in index.ts, deliberately small.
+ *
+ * AIO-1217: an update/delete followed by select() returns the rows it actually matched (the pg
+ * adapter's RETURNING), and limit() bounds a select. Both exist so lib/actions' checked state
+ * transitions run against this double unweakened; they prove no constraint, cardinality under
+ * concurrency or atomicity — that is the real-Postgres tier's job.
  */
 type Row = Record<string, unknown>;
 type Filter =
@@ -148,6 +153,7 @@ class Builder implements PromiseLike<{ data: unknown; error: null }> {
   private conflict: string[] = [];
   private filters: Filter[] = [];
   private wantSelect = false;
+  private limitN: number | null = null;
 
   constructor(private rows: Row[]) {}
 
@@ -199,6 +205,11 @@ class Builder implements PromiseLike<{ data: unknown; error: null }> {
   order(_col: string, _opts?: { ascending?: boolean }) {
     return this; // ordering is irrelevant to these unit tests
   }
+  /** Bounds a select only — the pg adapter compiles LIMIT into no mutation either. */
+  limit(n: number) {
+    this.limitN = n;
+    return this;
+  }
 
   // -- terminals ----------------------------------------------------------
   async single() {
@@ -242,18 +253,24 @@ class Builder implements PromiseLike<{ data: unknown; error: null }> {
         return [row];
       }
       case "update": {
-        for (const r of this.rows.filter((r) => this.match(r))) Object.assign(r, this.payload);
-        return [];
+        // Matched BEFORE the payload lands, so a predicate on a column the update changes still
+        // decides which rows are written — and which are returned.
+        const matched = this.rows.filter((r) => this.match(r));
+        for (const r of matched) Object.assign(r, this.payload);
+        return this.wantSelect ? matched : [];
       }
       case "delete": {
+        const removed: Row[] = [];
         for (let i = this.rows.length - 1; i >= 0; i--) {
-          if (this.match(this.rows[i])) this.rows.splice(i, 1);
+          if (this.match(this.rows[i])) removed.unshift(...this.rows.splice(i, 1));
         }
-        return [];
+        return this.wantSelect ? removed : [];
       }
       case "select":
-      default:
-        return this.rows.filter((r) => this.match(r));
+      default: {
+        const found = this.rows.filter((r) => this.match(r));
+        return this.limitN === null ? found : found.slice(0, this.limitN);
+      }
     }
   }
 }

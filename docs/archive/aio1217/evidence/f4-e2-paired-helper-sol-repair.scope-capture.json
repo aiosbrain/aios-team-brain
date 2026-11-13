@@ -1,0 +1,13 @@
+{
+  "utc": "2026-10-06T01:40:16.425150+00:00",
+  "actualModel": "gpt-5.6-sol",
+  "actualEffort": "medium",
+  "thread": "01a10edc-94bb-7f02-a08c-24c6cbf086b0",
+  "scope": "only2outputfiles",
+  "inputHashesUnchanged": true,
+  "outputs": {
+    "campaign-contract.json": "c32ba90529a56b923d5f3bff507ac82976cee3a29f4cbdae97edc4509bb19081",
+    "run_paired_e2.sh": "e6afee0a9bb444b5a0029b5dbe2b43c49cb9335d266b64c66eac92ce41fffe1c"
+  },
+  "terminalReaped": true
+}

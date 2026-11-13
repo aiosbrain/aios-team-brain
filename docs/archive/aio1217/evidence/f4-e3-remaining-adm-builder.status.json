@@ -1,0 +1,102 @@
+{
+  "exit": 0,
+  "success": false,
+  "model": "claude-opus-5-5",
+  "denied": 0,
+  "duration": 859.307765458012,
+  "terminal": {
+    "duration_api_ms": 840265,
+    "stop_reason": "tool_use",
+    "session_id": "759558bf-501b-48ad-b2f0-a538e5cf7140",
+    "total_cost_usd": 3.8955762,
+    "usage": {
+      "input_tokens": 30,
+      "cache_creation_input_tokens": 255661,
+      "cache_read_input_tokens": 2246641,
+      "output_tokens": 70042,
+      "output_tokens_details": {
+        "thinking_tokens": 41474
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 255661,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "not_available",
+      "iterations": [
+        {
+          "input_tokens": 2,
+          "output_tokens": 24297,
+          "cache_read_input_tokens": 258084,
+          "cache_creation_input_tokens": 3039,
+          "cache_creation": {
+            "ephemeral_5m_input_tokens": 0,
+            "ephemeral_1h_input_tokens": 3039
+          },
+          "type": "message"
+        }
+      ],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "claude-opus-5-5": {
+        "inputTokens": 30,
+        "outputTokens": 70042,
+        "cacheReadInputTokens": 2246641,
+        "cacheCreationInputTokens": 255661,
+        "webSearchRequests": 0,
+        "costUSD": 3.8955762,
+        "contextWindow": 1000000,
+        "maxOutputTokens": 128000,
+        "thinkingTokens": 41474,
+        "canonicalModel": "claude-opus-5-5",
+        "provider": "firstParty",
+        "costBasis": "list"
+      }
+    },
+    "permission_denials": [],
+    "terminal_reason": "aborted_streaming",
+    "fast_mode_state": "off",
+    "fast_mode_disabled_reason": "sdk_opt_in_required",
+    "subagent_stats": {
+      "spawned": 0,
+      "requested": {
+        "background": 0,
+        "foreground": 0,
+        "unset": 0
+      },
+      "started_in_background": 0,
+      "max_depth": 0,
+      "spawned_by_subagents": 0,
+      "completed": 0,
+      "failed": 0,
+      "killed": {
+        "parent": 0,
+        "user": 0,
+        "system": 0
+      },
+      "refused": {
+        "depth_limit": 0,
+        "concurrency_limit": 0,
+        "budget": 0
+      },
+      "by_type": {}
+    },
+    "is_error": true,
+    "num_turns": 55,
+    "subtype": "error_during_execution",
+    "errors": [
+      "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use"
+    ],
+    "type": "result",
+    "duration_ms": 856494,
+    "uuid": "b64b5258-2b0e-4255-8710-72326713e553",
+    "queued_turn_count": 0,
+    "result_index": 0
+  }
+}

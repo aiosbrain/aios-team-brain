@@ -1,0 +1,233 @@
+{
+  "kind": "AIO-1217_F4_E3_REMAINING_ADM_INTERRUPTED_BUILDER_RECOVERY",
+  "status": "PREPARED_NOT_LAUNCHED",
+  "requestedByCoordinator": {
+    "identity": "01a10f03-e9c0-7b33-88dd-c1c6a6125dae",
+    "model": "gpt-5.6-sol",
+    "reasoning": "MEDIUM",
+    "authority": "ACTIVE_SOLE_SOL_MEDIUM_BOUNDED_REPAIR"
+  },
+  "parentRole": "sole owner of independent repository/remote preflight, subscription admission, actual model launch, foreground monitoring, stream capture, terminal validation/reap, diff/hash validation, scoped local checkpoint if needed, and focused host checks",
+  "packetRoot": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/review-public-support/f4-e3-remaining-adm-recovery/packet",
+  "workingDirectory": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-worktree",
+  "artifacts": {
+    "admission": {
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/review-public-support/f4-e3-remaining-adm-recovery/packet/admission.prompt.md",
+      "sha256": "2a7fa1d0e886bcc4ed9d73d2017096b6ef608789b5361f42a31400babc07fa7c",
+      "bytes": 120,
+      "exactExpectedFinal": "E3_REMAINING_ADM_RECOVERY_ADMISSION_OK"
+    },
+    "prompt": {
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/review-public-support/f4-e3-remaining-adm-recovery/packet/recovery.prompt.md",
+      "sha256": "5043368b52e8ee14a2932169de0702e3aff30993847f4720317a2cd6d38cb7ca",
+      "bytes": 8573
+    },
+    "manifest": {
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/review-public-support/f4-e3-remaining-adm-recovery/packet/manifest.json",
+      "sha256": "84ccd059df866cdb3ae8310ab068ebe6724a6327120a4ca0086c0c845efe895d",
+      "bytes": 14801,
+      "inputCount": 35
+    },
+    "coordinatorValidation": {
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/review-public-support/f4-e3-remaining-adm-recovery/packet/validation.json",
+      "sha256": "ae6387b68d23e237a67a5be554793cc9983d41a305ef8e4afb7591eb117f57a5",
+      "bytes": 1407,
+      "qualification": "not a substitute for parent independent verification"
+    }
+  },
+  "preservedPriorEvidence": [
+    {"path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e3-remaining-adm-prewriter-remote-proof.json", "sha256": "bb7c4f6336c046cdbc499c68269ab5441729ba370e13f2a377800eebe183bc28", "bytes": 599},
+    {"path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e3-remaining-adm-admission.final.md", "sha256": "b4b51de2b67dec533cc917e9ff2fcb19afcebcd0f876f957297f64982d90dcdf", "bytes": 37},
+    {"path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e3-remaining-adm-admission.jsonl", "sha256": "c8c045916c10c47d245c59ebbf6fcb2c8f854acbdb831fade45e4aa6143e2428", "bytes": 5266},
+    {"path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e3-remaining-adm-admission.live.json", "sha256": "e7d05e5ff19d0e73df2e52f935cd0c7032b3a91a6008f7f84110ad9f8f45601b", "bytes": 259},
+    {"path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e3-remaining-adm-admission.status.json", "sha256": "86243b48b3da3021cf8c02a773abefc8b7ed565730bdd3526ab337bcc9aecf39", "bytes": 2742},
+    {"path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e3-remaining-adm-admission.stderr", "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "bytes": 0},
+    {"path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e3-remaining-adm-builder.jsonl", "sha256": "0b8903ec76c2f4f895167b7cc4037dd6b61fa61c692a126a157759ea355ed390", "bytes": 1795618},
+    {"path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e3-remaining-adm-builder.status.json", "sha256": "2198c2f0e81d4a1048de96c151295397b95a684d37a00325dc97323cb6d6ec68", "bytes": 2717},
+    {"path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e3-remaining-adm-builder.final.md", "sha256": "e449ccb2333991b7180b1d9fc2ee96cafe9dde6456f6532c747a80c07375dda5", "bytes": 142},
+    {"path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e3-remaining-adm-builder.stderr", "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "bytes": 0},
+    {"path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e3-remaining-adm-builder.live.json", "sha256": "34312c491ad544d77aa4b8deb11d835437a0bb0d677a60f3db1f7fc7051caa9e", "bytes": 257},
+    {"path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e3-remaining-adm-builder.patch", "sha256": "61235d43666574cd360666e5bfe58714d2c0c0e4a9f11c59089ba51c5db4334e", "bytes": 57811},
+    {"path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e3-remaining-adm-builder.parent-capture.json", "sha256": "504235bec3f8f2d1f6a3f8969e42c62a9fcf7b5b45e66322728338cb38477ee1", "bytes": 930}
+  ],
+  "snapshot": {
+    "task": "AIO-1217",
+    "branch": "codex/aio-1217-server-action-auth",
+    "localHead": "d8427efdfc3498a167e3b4155ca22b9278d5eb29",
+    "remote": "2437df69f2146e84a646a46f288c555dd2ad032a",
+    "targetBase": "c5e832c2ff179ee5c99f95966fba1ed9ce77ae3e",
+    "localRemoteRelationship": "local is an intentional clean one-file WIP checkpoint ahead/divergent from the pushed remote; equality is not required and must not be manufactured",
+    "fixture": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-worktree/test/datamechanics/aio1217-pm-reconcile-action-native.datamechanics.test.ts",
+    "fixtureSha256": "7ae552da7d3d637a5c545caca92322f7f3330294c696cabf7de1873bc42e3407",
+    "fixtureBytes": 200634,
+    "rawPatchSha256": "61235d43666574cd360666e5bfe58714d2c0c0e4a9f11c59089ba51c5db4334e",
+    "retainedInsertionBytes": 56102,
+    "oldBytes": "exact 136595-byte prefix plus exact 7937-byte suffix",
+    "priorBuilder": {
+      "session": "759558bf-501b-48ad-b2f0-a538e5cf7140",
+      "disposition": "INCOMPLETE_INTERRUPTED_REAPED",
+      "wrapperExitReportedByParent": 2,
+      "terminal": "error_during_execution / is_error=true / aborted_streaming",
+      "denials": 0,
+      "subagents": 0,
+      "noCompletionToken": true,
+      "noChecks": true
+    },
+    "cadence": {
+      "proofPath": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e3-remaining-adm-prewriter-remote-proof.json",
+      "proofSha256": "bb7c4f6336c046cdbc499c68269ab5441729ba370e13f2a377800eebe183bc28",
+      "readbackAt": "2026-10-06T03:02:08.229672Z",
+      "deadline": "2026-10-06T03:32:08.229672Z",
+      "deadlineState": "ELAPSED",
+      "lateAtParentCaptureSeconds": 3532.223361,
+      "reconciliation": "The 03:02 proof validly reset cadence under the canonical unchanged-source/no-empty-commit exception; the earlier packet prohibition was overstrict. It does not reset cadence after the local source WIP was created."
+    }
+  },
+  "builderContract": {
+    "role": "fresh continuation of the same Opus builder role; not a fallback, reviewer, restart, or resumed CLI session",
+    "provider": "Anthropic subscription authentication only",
+    "model": "claude-opus-5-5",
+    "effort": "high",
+    "freshSession": true,
+    "safeMode": true,
+    "permissionMode": "acceptEdits",
+    "tools": "Read,Glob,Grep,Edit,Write",
+    "bash": false,
+    "network": false,
+    "nestedWorkers": false,
+    "strictEmptyMcp": true,
+    "noSessionPersistence": true,
+    "environmentVariablesRequiredAbsent": [
+      "ANTHROPIC_API_KEY",
+      "ANTHROPIC_AUTH_TOKEN"
+    ],
+    "soleWritablePath": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-worktree/test/datamechanics/aio1217-pm-reconcile-action-native.datamechanics.test.ts",
+    "recoveryRule": "inspect retained cases 11-15; no edit if complete, otherwise only the smallest source-supported correction within that insertion; preserve all other bytes",
+    "escalation": "Consequential architecture/shared-contract/security ambiguity returns ASTRA_HIGH_REQUIRED; builder does not decide it."
+  },
+  "parentPreflight": [
+    "Verify canonical CURRENT names sole bounded Sol 01a10f03-e9c0-7b33-88dd-c1c6a6125dae, Terra remains SUSPENDED, the interrupted worker is reaped, and no writer/reviewer/check worker is live.",
+    "Verify all four packet artifact hashes/sizes. Parse the manifest; require exactly 35 inputs, recompute every input hash/size, require regular non-symlink leaves, and require exactly one writable fixture.",
+    "Independently require branch codex/aio-1217-server-action-auth, clean/no-pending worktree, local HEAD exactly d8427efdfc3498a167e3b4155ca22b9278d5eb29, fixture exactly 7ae552da7d3d637a5c545caca92322f7f3330294c696cabf7de1873bc42e3407/200634, upstream remote exactly 2437df69f2146e84a646a46f288c555dd2ad032a, and origin/staging exactly c5e832c2ff179ee5c99f95966fba1ed9ce77ae3e. Abort rather than repair/reset/rebase/pull/edit on mismatch.",
+    "Record a fresh independent remote readback before the writer. Do not require or manufacture local==remote, do not create an empty commit, and do not claim a cadence reset: source is locally changed and unpushed. Preserve the elapsed 03:32:08.229672Z deadline and record actual further delay.",
+    "Run one fresh minimal no-tools subscription admission from admission.prompt.md. Require exit 0, successful terminal, exact expected final, actual claude-opus-5-5, zero denials, usable capacity, and reap. Authentication failure is not quota evidence and never permits API-key billing or substitution.",
+    "Only after all guards pass, launch exactly one fresh recovery worker. No concurrent writer and no reuse/resume of the old session."
+  ],
+  "admissionLaunch": {
+    "cwd": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-worktree",
+    "environment": "env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN",
+    "argv": [
+      "claude",
+      "--safe-mode",
+      "-p",
+      "--model",
+      "claude-opus-5-5",
+      "--effort",
+      "high",
+      "--tools",
+      "",
+      "--strict-mcp-config",
+      "--mcp-config",
+      "{\"mcpServers\":{}}",
+      "--no-session-persistence",
+      "--output-format",
+      "stream-json",
+      "--verbose"
+    ],
+    "stdin": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/review-public-support/f4-e3-remaining-adm-recovery/packet/admission.prompt.md"
+  },
+  "builderLaunch": {
+    "cwd": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-worktree",
+    "environment": "env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN",
+    "argv": [
+      "claude",
+      "--safe-mode",
+      "-p",
+      "--model",
+      "claude-opus-5-5",
+      "--effort",
+      "high",
+      "--permission-mode",
+      "acceptEdits",
+      "--tools",
+      "Read,Glob,Grep,Edit,Write",
+      "--add-dir",
+      "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/review-public-support/f4-e3-remaining-adm-recovery/packet",
+      "--add-dir",
+      "/Users/chetan/.agents/skills/astra-spec-claude-build",
+      "--add-dir",
+      "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/review-public-support/f4-e3-affected-review-frozen/packet/admission",
+      "--add-dir",
+      "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/review-public-support/f4-e3-remaining-adm-builder/packet",
+      "--strict-mcp-config",
+      "--mcp-config",
+      "{\"mcpServers\":{}}",
+      "--no-session-persistence",
+      "--output-format",
+      "stream-json",
+      "--verbose"
+    ],
+    "stdin": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/review-public-support/f4-e3-remaining-adm-recovery/packet/recovery.prompt.md"
+  },
+  "requiredCapture": {
+    "admissionPrefix": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e3-remaining-adm-recovery-admission",
+    "builderPrefix": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e3-remaining-adm-recovery-builder",
+    "items": [
+      "stream-json, stderr, status and final text separately",
+      "wrapper/child PIDs and terminal reap",
+      "actual model and fresh session",
+      "terminal event, exit, success, final text and denials",
+      "parent-computed SHA-256 for every capture"
+    ]
+  },
+  "terminalSuccessGuard": "Accept only wrapper exit 0, successful terminal result, actual claude-opus-5-5, zero denials, reaped process, and substantive final containing E3_REMAINING_ADM_RECOVERY_COMPLETE. ASTRA_HIGH_REQUIRED or SOURCE_IDENTITY_BLOCKED is a bounded stop, not completion. Partial stream, timeout, empty result, denied edit, or unreaped process is incomplete.",
+  "parentPostflight": [
+    "After reap, independently inspect the worktree. Require no untracked file and no changed path except the sole fixture. Preserve evidence and stop on scope escape; do not silently clean.",
+    "Compute actual final fixture SHA/bytes and raw diff. Reprove exact old prefix/suffix preservation and that any new recovery edit stayed within retained cases 11-15. If no edit, retain local checkpoint d8427efdfc3498a167e3b4155ca22b9278d5eb29 and do not create an empty commit. If edited and scope guards pass, create one normal scoped local WIP checkpoint with required AIOS-Work trailer; do not push.",
+    "Only after terminal completion and scope/source-completeness guards pass, run the two focused host checks below serially through the exact canonical runner. Parent owns them; the model and coordinator do not. Capture command, copied runner, logs, results, production/test fingerprints and exit codes. Stop after a failure; do not auto-launch another writer.",
+    "Do not run PG or create/reuse a campaign helper in this request. A later helper must bind the actual final fixture hash and reject 9297..., 7ae552... if superseded, and stale helper 9ae265....",
+    "Return complete admission/builder/postflight/check captures, actual final fixture hash/diff hash, resulting local checkpoint, clean status, fresh remote readback/cadence record, and all artifact hashes to the bounded Sol. No review or push is authorized."
+  ],
+  "focusedChecks": {
+    "runner": {
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/run_check.py",
+      "sha256": "9252586f8c222d44351b12b5ab89d9ee5a63da14d8ed8021079fd15f79e3cdb6",
+      "bytes": 7009
+    },
+    "order": [
+      {
+        "stage": "f4e3_remaining_adm_recovery_lint",
+        "argv": [
+          "python3",
+          "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/run_check.py",
+          "f4e3_remaining_adm_recovery_lint",
+          "lint",
+          "test/datamechanics/aio1217-pm-reconcile-action-native.datamechanics.test.ts"
+        ]
+      },
+      {
+        "stage": "f4e3_remaining_adm_recovery_typecheck",
+        "argv": [
+          "python3",
+          "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/run_check.py",
+          "f4e3_remaining_adm_recovery_typecheck",
+          "typecheck"
+        ]
+      }
+    ],
+    "requirements": "exact runner identity before each call; serial; normal host environment isolation from runner; exit 0 and unchanged source/test fingerprints; no rerun on unchanged successful evidence"
+  },
+  "nextGate": "After successful recovery and focused checks, bounded Sol prepares fixture-hash-specific native PG evidence and then fresh normal pre-push affected review. No push precedes that review.",
+  "continuity": {
+    "coordinator": "01a10f03-e9c0-7b33-88dd-c1c6a6125dae remains sole bounded Sol MEDIUM",
+    "terra": "01a10e94 remains SUSPENDED; no automatic resume",
+    "unrelatedThread": "no outbound reply/action"
+  },
+  "nonGrants": [
+    "No production/application/runtime/schema/helper/setup/documentation edit.",
+    "No builder Bash/check/PG/network/nested worker or external write.",
+    "No PG, review, push, PR, Linear, merge, main, deployment or Done action in this request.",
+    "No historical admission waiver or E4 whole, E6/UI, whole-E3/full-task/final acceptance.",
+    "No fallback or API-key billing absent separately qualifying quota evidence and coordinator reconciliation."
+  ]
+}

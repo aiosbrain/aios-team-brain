@@ -1,0 +1,165 @@
+{
+  "kind": "AIO-1217_F4_E3_REMAINING_ADM_SERIAL_PAIRED_NATIVE_PG",
+  "status": "PREPARED_NOT_EXECUTED",
+  "preparedAt": "2026-10-06T04:59:17Z",
+  "requestedByCoordinator": {
+    "identity": "01a10f03-e9c0-7b33-88dd-c1c6a6125dae",
+    "model": "gpt-5.6-sol",
+    "reasoning": "MEDIUM",
+    "authority": "ACTIVE_SOLE_SOL_MEDIUM_BOUNDED_REPAIR"
+  },
+  "owner": "parent host only; one serialized dedicated PostgreSQL campaign",
+  "packetRoot": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/review-public-support/f4-e3-remaining-adm-paired-pg/packet",
+  "workingDirectory": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-worktree",
+  "localCheckpoint": "d8427efdfc3498a167e3b4155ca22b9278d5eb29",
+  "remoteAtPreparation": "2437df69f2146e84a646a46f288c555dd2ad032a",
+  "targetBase": "c5e832c2ff179ee5c99f95966fba1ed9ce77ae3e",
+  "candidateRuntimeBase": "9cd35756ce9459a4c389803714fc06e34192c108",
+  "referenceOwnerCommit": "ceb184db9991dc9c6bb5ba3cb3b249cf6c480834",
+  "fixture": {
+    "path": "test/datamechanics/aio1217-pm-reconcile-action-native.datamechanics.test.ts",
+    "sha256": "7ae552da7d3d637a5c545caca92322f7f3330294c696cabf7de1873bc42e3407",
+    "bytes": 200634,
+    "rawDiffSha256": "61235d43666574cd360666e5bfe58714d2c0c0e4a9f11c59089ba51c5db4334e",
+    "rawDiffBytes": 57811
+  },
+  "helper": {
+    "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/review-public-support/f4-e3-remaining-adm-paired-pg/packet/run_paired_remaining_adm.sh",
+    "sha256": "ca4d160e638e3c88b3680fd3f5490c0335d9889fd3e2066e517fb847683bc730",
+    "bytes": 2632,
+    "derivation": "minimal fixture-pin update of the previously executed accepted E3 helper; same five-argument/no-extra-separator mechanism"
+  },
+  "hostScript": {
+    "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/review-public-support/f4-e3-remaining-adm-paired-pg/packet/parent_campaign.py",
+    "sha256": "0d23bf8757c0ee9ec965036ad926369e510456019edfe6ff8ba722285c0e98c6",
+    "bytes": 14951
+  },
+  "runner": {
+    "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/review-public-support/f4-e2-affected-review-frozen/packet/runner/01-immutable-e4-runner.py",
+    "sha256": "5ec2b76bdb536bef088f8a461155e3abf7f61b59215d46b5aa7a858e7083682d",
+    "bytes": 7384
+  },
+  "manifest": {
+    "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/review-public-support/f4-e3-remaining-adm-paired-pg/packet/campaign.manifest.json",
+    "sha256": "f4ab78706de74a40c4e23a86471f9cdf2e3681eb1934146ecc4dc3cf056b742d",
+    "bytes": 25780,
+    "inputCount": 75
+  },
+  "database": {
+    "container": "aios-aio1217-pg-8a4e78cb",
+    "mapping": "127.0.0.1:50538",
+    "database": "app_test",
+    "credentials": "synthetic app/app confined to owned container",
+    "otherDatabaseUse": "FORBIDDEN"
+  },
+  "referenceOwnerBlobPaths": [
+    "lib/pm-sync/reconcile.ts",
+    "app/t/[team]/admin/pm-sync/actions.ts"
+  ],
+  "recoveryReconciliation": {
+    "admission": {
+      "systemInitSession": "83868746-d3dc-4af6-abc6-d0dafd9367da",
+      "model": "claude-opus-5-5",
+      "exit": 0,
+      "success": true,
+      "denied": 0,
+      "rateLimits": "7% five-hour / 79% weekly as parent reported"
+    },
+    "builder": {
+      "systemInitSession": "ab715acb-7fd8-42fa-babf-1056601916b0",
+      "model": "claude-opus-5-5",
+      "effort": "high",
+      "exit": 0,
+      "success": true,
+      "denied": 0,
+      "reaped": true,
+      "terminalMarker": "E3_REMAINING_ADM_RECOVERY_COMPLETE",
+      "edit": "none"
+    },
+    "scope": "Only the previously checkpointed fixture addition remains; exact old prefix 136595/suffix 7937 and 32 unchanged non-fixture manifest inputs were parent-verified; no empty commit.",
+    "checks": "Focused fixture ESLint passed and full project typecheck passed through canonical runner 9252586; production/test fingerprints unchanged. Typecheck excludes test and *.test.ts, so no test-type validation is claimed."
+  },
+  "reuseChecks": {
+    "lint": {
+      "stage": "f4e3_remaining_adm_recovery_lint",
+      "resultSha256": "b6321200edbfefe57fb8389a9c75c5aec5f1b7c4cde319789f493571098f3462",
+      "provenanceSha256": "b801df144163fe4e069f7f251bc533fd3f0c3deb1857b80758f80c35501f14e8",
+      "exit": 0
+    },
+    "typecheck": {
+      "stage": "f4e3_remaining_adm_recovery_typecheck",
+      "resultSha256": "d016886cdf05d38133bdd0604739a42619bd224292b6ef12dbd4721cad175210",
+      "provenanceSha256": "01495b1d70939366b3efc413ed66deeffad1aa8c1f2b8e4250e1e9c841a13a56",
+      "exit": 0,
+      "qualification": "tsconfig excludes test and **/*.test.ts"
+    },
+    "runnerSha256": "9252586f8c222d44351b12b5ab89d9ee5a63da14d8ed8021079fd15f79e3cdb6",
+    "action": "reuse unchanged evidence; do not rerun lint or typecheck in this campaign"
+  },
+  "cadence": {
+    "authoritativeDeadline": "2026-10-06T03:32:08.229672Z",
+    "freshRecoveryPrewriterProof": {
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e3-remaining-adm-recovery.prewriter-proof.json",
+      "sha256": "e69d9dc936a8adcde2ec4d3b2ac92b388c805468428223f0cf6f945a800bb629",
+      "utc": "2026-10-06T04:43:35.702111Z",
+      "cadenceReset": false
+    },
+    "state": "OVERDUE; parent must record actual further delay. No readback while local d842 remains unpushed resets the clock."
+  },
+  "parentPreflight": [
+    "Verify canonical CURRENT still names sole bounded Sol 01a10f03-e9c0-7b33-88dd-c1c6a6125dae, Terra remains SUSPENDED, recovery builder is reaped, and no worker/check/PG process is live.",
+    "Verify helper, host script, immutable runner, manifest and this request hashes/sizes. Parse the 75-input manifest and independently require every input exact hash/size, regular file and non-symlink.",
+    "Freshly require branch codex/aio-1217-server-action-auth, clean/no-pending local HEAD d8427efdfc3498a167e3b4155ca22b9278d5eb29, fixture 7ae552da7d3d637a5c545caca92322f7f3330294c696cabf7de1873bc42e3407/200634, remote 2437df69f2146e84a646a46f288c555dd2ad032a and origin/staging c5e832c2ff179ee5c99f95966fba1ed9ce77ae3e. Abort rather than modify/reset/rebase/pull.",
+    "Record a fresh independent remote readback and current UTC before execution. Do not require local==remote, create an empty commit, or reset cadence; report actual lateness from 03:32:08.229672Z.",
+    "Require /aios-aio1217-pg-8a4e78cb to be the owned PostgreSQL container, image identity PostgreSQL, and its sole mapping exactly 127.0.0.1:50538. Abort on mismatch. Do not address any other database.",
+    "Require output paths f4-e3-remaining-adm-paired-reference, f4-e3-remaining-adm-paired-candidate and f4-e3-remaining-adm-paired-parent.result.json absent. Do not overwrite earlier evidence.",
+    "Run only the exact execution command below in the parent foreground and supervise/reap it. Do not invoke a model, lint, typecheck, another test, or a second campaign."
+  ],
+  "execution": {
+    "cwd": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff",
+    "argv": [
+      "python3",
+      "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/review-public-support/f4-e3-remaining-adm-paired-pg/packet/parent_campaign.py"
+    ],
+    "serial": "reference then candidate; never concurrent",
+    "layouts": "Both detached from exact 9cd35756ce9459a4c389803714fc06e34192c108 with the exact current fixture overlay. Reference substitutes only the two exact ceb184 owner blobs; candidate retains the cd038 owner bytes.",
+    "commandShape": "helper receives exactly five arguments and calls `pg` followed directly by the fixture path; no extra `--` separator"
+  },
+  "successGuards": [
+    "Host process exits 0 and is reaped; original worktree remains clean at d8427efdfc3498a167e3b4155ca22b9278d5eb29 with fixture hash unchanged.",
+    "Both runtime helpers exit 0 under their expected class, but exit class alone is never behavioral proof.",
+    "Every raw record is retained and duplicated as full named JSONL with UTC start/end, outcome, trace, bindings, seams, acquisitions, revalidation, refusal, empty violations, and complete before/after rows for exactly ten tables.",
+    "Both actual logs report cases 9 through 15 passing, preserving case-9 controls and exercising cases 10-15 against both layouts.",
+    "Reference has exactly six case-4 failures covering linear/plane × missing/disabled/secret-less. Actual records classify each as false success with audit/revalidation. Candidate records classify each as exact unavailable refusal with no durable effect.",
+    "All six reference repeats are actually absent/NOT REACHED after the expected assertion failures; all six candidate repeats are reached and trace/state-identical.",
+    "Full tracked-file maps differ only in the two owner paths. Full owner bytes, environment, result, provenance, copied runner, command log, raw/named JSONL, source maps, UTC and artifact hashes are preserved.",
+    "Within each runtime production/test fingerprints are unchanged; the test fingerprint and fixture are identical across runtimes."
+  ],
+  "actualCounts": "Do not pre-credit any count. The host script knows the complete semantic request-name schedule only to reject missing/extra records; all record counts, pass/fail totals and classifications must come from the actual run and frozen artifacts.",
+  "limitationsToPreserve": [
+    "Builder read v9 sections 1-9, but Appendix A/v6 ADM only by targeted search; never claim full-spec inspection.",
+    "Builder did not open Plane/provider and range-read some sources. Future review receives full exact bytes rather than inheriting its coverage claim.",
+    "Typecheck excludes the test fixture; fixture type coherence requires native execution and review.",
+    "Expired-cookie and guard-read-fault arms remain unconstructed and uncredited.",
+    "Historical PM admission/census remains blocked; no runtime waiver, whole-E3/E4/E6/UI/full-task/final acceptance."
+  ],
+  "parentPostflight": [
+    "Return exact stdout/stderr/exit/reap plus the final parent result and every runtime artifact hash/size. Do not summarize counts without the underlying logs, raw/named JSONL and classifications.",
+    "Freeze/copy the complete successful evidence into a new immutable packet with regular-file/no-symlink inventory, including this request/helper/host/manifest, full accepted v9 and canonical shared skill, all exact source inputs (including query-builder, member-kind migration, tsconfig/package, full auth/guard/resolver/posture/admin/schema/helper/setup/Plane/provider bytes), recovery captures, canonical runner bytes and reused lint/typecheck proof.",
+    "Return to bounded Sol without launching a reviewer. Sol will prepare a fresh independent actual subscription Opus 5.5 HIGH read-only normal pre-push affected review prompt/manifest against the frozen actual campaign.",
+    "No push is authorized before that qualified review. Do not run PG again on unchanged evidence."
+  ],
+  "nextReviewContract": {
+    "role": "fresh independent actual subscription claude-opus-5-5 HIGH affected normal pre-push reviewer",
+    "tools": "Read,Glob,Grep only; permissionMode dontAsk; no Bash/Edit/Write/PG/network/nested workers",
+    "coverage": "full v9/Appendix, exact fixture/source interactions, both actual runtimes, named/raw whole-request traces, ten-table durable rows/timestamps, six reference false successes and NOT-REACHED repeats, cases 9-15 controls/guards, exact two-owner delta, helper/runner/host/request provenance, lint/typecheck qualification and all limitations",
+    "gate": "qualified review required before any normal checkpoint push"
+  },
+  "nonGrants": [
+    "No source/test/runtime/schema/helper edit in the application worktree.",
+    "No model launch, network, git commit/push, PR, Linear, merge, main, deployment or Done action.",
+    "No lint/typecheck rerun and no database other than the exact owned synthetic container.",
+    "No historical waiver, whole E3/E4/E6/UI/full-task/final acceptance, or unrelated-thread message.",
+    "No Terra resumption; Sol remains sole bounded coordinator."
+  ]
+}

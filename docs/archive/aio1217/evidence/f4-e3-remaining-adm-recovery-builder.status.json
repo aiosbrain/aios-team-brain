@@ -1,0 +1,105 @@
+{
+  "exit": 0,
+  "success": true,
+  "model": "claude-opus-5-5",
+  "denied": 0,
+  "duration": 549.0674614590826,
+  "terminal": {
+    "duration_api_ms": 542934,
+    "stop_reason": "end_turn",
+    "session_id": "ab715acb-7fd8-42fa-babf-1056601916b0",
+    "total_cost_usd": 3.1265131999999998,
+    "usage": {
+      "input_tokens": 36,
+      "cache_creation_input_tokens": 247047,
+      "cache_read_input_tokens": 2532066,
+      "output_tokens": 32179,
+      "output_tokens_details": {
+        "thinking_tokens": 20377
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 247047,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "not_available",
+      "iterations": [
+        {
+          "input_tokens": 2,
+          "output_tokens": 4204,
+          "cache_read_input_tokens": 251171,
+          "cache_creation_input_tokens": 1338,
+          "cache_creation": {
+            "ephemeral_5m_input_tokens": 0,
+            "ephemeral_1h_input_tokens": 1338
+          },
+          "type": "message"
+        }
+      ],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "claude-opus-5-5": {
+        "inputTokens": 36,
+        "outputTokens": 32179,
+        "cacheReadInputTokens": 2532066,
+        "cacheCreationInputTokens": 247047,
+        "webSearchRequests": 0,
+        "costUSD": 3.1265131999999998,
+        "contextWindow": 1000000,
+        "maxOutputTokens": 128000,
+        "thinkingTokens": 20377,
+        "canonicalModel": "claude-opus-5-5",
+        "provider": "firstParty",
+        "costBasis": "list"
+      }
+    },
+    "permission_denials": [],
+    "terminal_reason": "completed",
+    "fast_mode_state": "off",
+    "fast_mode_disabled_reason": "sdk_opt_in_required",
+    "subagent_stats": {
+      "spawned": 0,
+      "requested": {
+        "background": 0,
+        "foreground": 0,
+        "unset": 0
+      },
+      "started_in_background": 0,
+      "max_depth": 0,
+      "spawned_by_subagents": 0,
+      "completed": 0,
+      "failed": 0,
+      "killed": {
+        "parent": 0,
+        "user": 0,
+        "system": 0
+      },
+      "refused": {
+        "depth_limit": 0,
+        "concurrency_limit": 0,
+        "budget": 0
+      },
+      "by_type": {}
+    },
+    "is_error": false,
+    "num_turns": 66,
+    "subtype": "success",
+    "api_error_status": null,
+    "result": "**E3_REMAINING_ADM_RECOVERY_COMPLETE**\n\n**No edit made.** The retained cases-11\u201315 insertion is syntactically closed, fits the existing fixture's types and seams, and every assertion I traced follows from the supplied source. Nothing has been run.\n\n- **Authorized path:** `/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-worktree/test/datamechanics/aio1217-pm-reconcile-action-native.datamechanics.test.ts`\n- **Other paths:** none created or edited; only Read/Glob/Grep were used.\n- **Bytes outside the insertion:** preserved. With no edit, the whole file is as it stood at launch, so the expected fixture identity remains `7ae552...`.\n- **Insertion location as read:** it begins after case 10's closing `});` (line 2672) and ends at line 3699, immediately before `// Each TODO names evidence\u2026` and the Z block.\n\n## Checklist disposition\n\n| Case | Disposition | What the retained code does |\n| --- | --- | --- |\n| 11 \u2014 invalid session | Present, source-supported | Three non-empty cookies (not a token; Alice's session with an altered signature; a real `signSession` token under another `AUTH_SECRET`), each read back as null from the real `verifySession`. The trace is exactly the cookie read, with no server or service client and no statement. Alice's valid session at the same slug is the admitted control, then the other-secret cookie is repeated. Missing cookie stays in case 3; expired is stated as not constructed. |\n| 12 \u2014 membership and role | Present, source-supported | The `member_status` catalog is read back as `invited, active, disabled` (no `suspended`). Memberless, `invited` and `disabled` callers stop at the active-member read with zero rows, and their member row is never bound. The active role-`lead` runs the whole chain through posture (one row) and is refused on role. Alice's first pass is the control. |\n| 13 \u2014 stale legacy tier | Present, source-supported | Legacy `team` with only the External row is refused after the posture read. Legacy `external` with the Everyone row is admitted through the existing `admit` (three provider reads, two link updates, audit row under that member's own id). The refusal is repeated afterwards with an identical trace. Stored role/status/tier/builtin rows are read back before and after. |\n| 14 \u2014 association removed and restored | Present, source-supported | Admit, move the board, delete the one `group_members` row, then a fresh invocation is refused with a zero-row posture read and the moved link still `Done`. Restore through `placeMemberByTier`, then a fresh invocation is admitted with one link update and a second audit row. Setup changes are isolated by `changes(first.after, denied.before)` and `changes(denied.after, restored.before)`; request effects are asserted separately. |\n| 15 \u2014 reverse-team binding | Present, source-supported | Bob at A and Alice at B are each refused with exact bindings. Bob at B's own slug, over a team-B board that forbids A's secret and Linear team id, decrypts only B's secret, reads one link, updates it, audits under team B and revalidates B's path. No team A identifier appears in statements, return, trace or revalidation, and team A's rows are unchanged. Alice's first pass afterwards shows team A's rows stayed live. |\n\nCross-cutting items hold:\n\n- **Real chain:** every refusal goes through the exported `reconcileDivergenceAction` and the existing `request`/`refuse`, so `getSessionUser \u2192 verifySession \u2192 resolveIntegrationsAdmin \u2192 resolveViewerPosture \u2192 canAccessAdmin` runs for real. No guard verdict or owner answer is substituted; the new helpers are setup, readbacks and assertions only.\n- **Whole-request assertions:** each refusal asserts the exact trace, acquisition counts, the two-key DTO, empty seam logs, and `after` equal to `before` across all ten tables, timestamps included.\n- **Non-claims:** the insertion's own bounds disclaim E4, mutants, Next wire/cache behavior, whole-E3 and acceptance.\n\n## Source files used\n\n- `app/t/[team]/admin/pm-sync/actions.ts`\n- `lib/auth/guard.ts`, `lib/auth/session.ts`, `lib/auth/pg-session.ts`, `lib/auth/admin-access.ts`, `lib/auth/visibility.ts`\n- `lib/integrations/read.ts`, `lib/access/posture.ts`\n- `lib/access/groups.ts` (lines 1\u2013160, `ensureBuiltins`)\n- `postgres/schema.sql` (enums, `auth_users`, `teams`, `members`, `audit_log`, `groups`, `group_members`, and a trigger/index search)\n- `lib/pm-sync/reconcile.ts`, `lib/pm-sync/linear-client.ts`, `lib/api/audit.ts`, `lib/secrets/crypto.ts`\n- `lib/pm-sync/project.ts` (100\u2013149), `lib/integrations/manage.ts` (240\u2013279), `lib/pm-sync/linear.ts` (90\u2013289)\n- `lib/db/admin.ts`, `lib/db/server.ts`, `lib/db/pg/client.ts`, `lib/db/pg/pool.ts`, `lib/db/types.ts`\n- `test/datamechanics/helpers.ts`, `test/datamechanics/setup.ts`\n- `test/datamechanics/aio1217-admin-guard-association.datamechanics.test.ts` (authority, `seedAdmin`, `removeEveryone`, guard chain, removal/restoration case)\n- The whole current fixture, `AGENTS.md`, the workflow skill, the Astra disposition, the Next Server Actions guide, both manifests, the original builder prompt and `validation.json`\n\nOutside the manifest, read-only: `lib/db/pg/query-builder.ts`, `postgres/migrations` (trigger search and the member-kind migration), `tsconfig.json`, `package.json`.\n\n## NOT RUN\n\nNo PG, test, lint, typecheck, review, commit or push was performed or is claimed.\n\n## Remaining limitations\n\n- **Identity not re-hashed by me.** Without Bash I could not compute SHA-256 or byte counts. I relied on the packet's `validation.json` and your stated checkpoint; what I read is consistent with them.\n- **Not read in full.** Accepted v9 \u00a7\u00a71\u20139 were read, but Appendix A (the v6 body) only by targeted search for the ADM definition. `lib/pm-sync/plane.ts` and `lib/pm-sync/provider.ts` were not opened, since cases 11\u201315 are Linear-only. The files listed above with line ranges were read in those ranges only.\n- **Typecheck will not cover this file.** `tsconfig.json` excludes `test` and `**/*.test.ts`, so type coherence here is by reading alone.\n- **Not exercised by this slice.** An expired cookie, and a guard read that Postgres refuses. v9 F4-E3 says to preserve current guard-fault outcomes; that was not on this recovery checklist and the fixture says it is still open.\n- **Style only, left untouched.** Lines 3509 and 3556 run slightly past the roughly 120-column width the surrounding code keeps, and the `premise` call at 3140 is wrapped oddly. `package.json` configures no formatter.\n- **Stale prose preserved as instructed.** The header's `NO ADMITTED OTHER-TEAM INVOCATION`, `World.bob`'s comment and Z's TODOs are unchanged; the insertion's own header names itself as their later exception.",
+    "ttft_ms": 31547,
+    "type": "result",
+    "duration_ms": 546917,
+    "uuid": "6279557f-a32e-4256-b79a-15d52bfcd5c2",
+    "ttft_stream_ms": 31519,
+    "time_to_request_ms": 1420,
+    "first_content_frame_ms": 31520,
+    "queued_turn_count": 0,
+    "result_index": 0
+  }
+}

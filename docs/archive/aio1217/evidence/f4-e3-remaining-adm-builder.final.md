@@ -1,0 +1,1 @@
+Sources read and the design is settled; writing the single contiguous insertion (cases 11–15 plus their local helpers) into the fixture now.

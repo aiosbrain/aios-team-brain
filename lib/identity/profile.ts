@@ -1,6 +1,7 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { audit } from "@/lib/api/audit";
+import { isUniqueViolation } from "@/lib/ids";
 import {
   WEEKDAYS,
   CHANNEL_KINDS,
@@ -81,6 +82,37 @@ export interface ProfileActor {
   memberId?: string | null;
 }
 
+/**
+ * WHO a goal write is bound to — deliberately separate from `GoalInput` (browser-supplied) and
+ * from the audit actor, so neither can select it. There is no default: a caller must say which.
+ *
+ *   browser_member — the positional `memberId` is the server-authorized target. An explicit id or
+ *     an imported dedup match is honored only for a goal that member already owns, and the owner
+ *     is a predicate of the final write, never a written value (no reassignment).
+ *   system_import  — a trusted non-browser importer. Keeps the team-wide (team, source,
+ *     external_id) convergence: an explicit id or a dedup match is team-bound and MAY move the
+ *     goal to `memberId`. Authenticates nobody; never reachable from browser input.
+ */
+export type GoalWriteScope = { mode: "browser_member" } | { mode: "system_import" };
+
+/**
+ * The write was refused because the row it names is not owned by the (team, member) scope the
+ * caller is bound to — a peer's / foreign / absent child id, a contradictory legacy profile
+ * tuple, or an ownership race that never resolved in scope. Distinct from a validation error and
+ * from an infrastructure fault; the People actions map it to their fixed "not allowed". The
+ * message is fixed so nothing about the unowned row rides along.
+ */
+export class ProfileScopeRefusal extends Error {
+  readonly code = "profile_scope_refused";
+  constructor() {
+    super("profile scope refused");
+    this.name = "ProfileScopeRefusal";
+  }
+}
+
+// A lost race is re-read in scope at most this many times before the write is refused.
+const MAX_SCOPE_CONFLICT_RETRIES = 2;
+
 // ── Validation ───────────────────────────────────────────────────────────────
 
 const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
@@ -140,8 +172,60 @@ function assertDate(label: string, value: string): void {
 // ── Writers ──────────────────────────────────────────────────────────────────
 
 /**
- * Upsert the 1:1 profile row for a member. Only provided fields are written (an undefined
- * field is left untouched on an existing row); validation runs before any DB write.
+ * Persist profile columns for exactly the (team, member) tuple. `member_profiles` is keyed on
+ * `member_id` alone with an independent `team_id`, so a `member_id` upsert would re-home another
+ * team's row (the builder's upsert writes `team_id` from EXCLUDED and cannot express a conflict
+ * WHERE). Instead: update the scoped row and check it matched; if absent, insert. An insert that
+ * loses the primary-key race is re-read IN SCOPE and updated there; a row that holds this member
+ * under a different team never matches, so the write is refused — never repaired or re-homed.
+ */
+async function persistProfileFields(
+  admin: DbClient,
+  teamId: string,
+  memberId: string,
+  fields: Record<string, unknown>,
+  label: "profile" | "avatar"
+): Promise<void> {
+  const updateScoped = async (): Promise<boolean> => {
+    const { data, error } = await admin
+      .from("member_profiles")
+      .update(fields)
+      .eq("team_id", teamId)
+      .eq("member_id", memberId)
+      .select("member_id");
+    if (error) throw new Error(`${label} update failed: ${error.message}`);
+    return (data ?? []).length > 0;
+  };
+
+  if (await updateScoped()) return;
+  for (let conflicts = 0; ; conflicts++) {
+    const { data, error } = await admin
+      .from("member_profiles")
+      .insert({ member_id: memberId, team_id: teamId, ...fields })
+      .select("member_id");
+    if (!error) {
+      if ((data ?? []).length !== 1) throw new Error(`${label} insert failed: no row returned`);
+      return;
+    }
+    if (!isUniqueViolation(error.message)) throw new Error(`${label} insert failed: ${error.message}`);
+
+    // Some row already holds this member id. Only OUR tenant's row may be written.
+    const reread = await admin
+      .from("member_profiles")
+      .select("member_id")
+      .eq("team_id", teamId)
+      .eq("member_id", memberId)
+      .maybeSingle();
+    if (reread.error) throw new Error(`${label} reread failed: ${reread.error.message}`);
+    if (reread.data && (await updateScoped())) return;
+    if (conflicts >= MAX_SCOPE_CONFLICT_RETRIES) throw new ProfileScopeRefusal();
+  }
+}
+
+/**
+ * Write the 1:1 profile row for a member, bound to (team, member). Only provided fields are
+ * written (an undefined field is left untouched on an existing row); validation runs before any
+ * DB write. Throws ProfileScopeRefusal when the member's row belongs to a different team.
  */
 export async function setMemberProfile(
   admin: DbClient,
@@ -154,20 +238,17 @@ export async function setMemberProfile(
     throw new Error(`invalid IANA timezone "${input.timezone}"`);
   }
 
-  const row: Record<string, unknown> = {
-    member_id: memberId,
-    team_id: teamId,
+  const fields: Record<string, unknown> = {
     updated_at: new Date().toISOString(),
     updated_by: opts.actor?.memberId ?? null,
   };
-  if (input.timezone !== undefined) row.timezone = input.timezone.trim();
-  if (input.workingHours !== undefined) row.working_hours = normalizeWorkingHours(input.workingHours);
-  if (input.preferredChannels !== undefined) row.preferred_channels = normalizeChannels(input.preferredChannels);
-  if (input.location !== undefined) row.location = input.location.trim();
-  if (input.bio !== undefined) row.bio = input.bio.trim();
+  if (input.timezone !== undefined) fields.timezone = input.timezone.trim();
+  if (input.workingHours !== undefined) fields.working_hours = normalizeWorkingHours(input.workingHours);
+  if (input.preferredChannels !== undefined) fields.preferred_channels = normalizeChannels(input.preferredChannels);
+  if (input.location !== undefined) fields.location = input.location.trim();
+  if (input.bio !== undefined) fields.bio = input.bio.trim();
 
-  const { error } = await admin.from("member_profiles").upsert(row, { onConflict: "member_id" });
-  if (error) throw new Error(`profile upsert failed: ${error.message}`);
+  await persistProfileFields(admin, teamId, memberId, fields, "profile");
 
   await audit(admin, {
     team_id: teamId,
@@ -250,17 +331,17 @@ export async function setMemberAvatar(
     }
   }
 
-  const { error } = await admin.from("member_profiles").upsert(
+  await persistProfileFields(
+    admin,
+    teamId,
+    memberId,
     {
-      member_id: memberId,
-      team_id: teamId,
       avatar_data_url: dataUrl,
       updated_at: new Date().toISOString(),
       updated_by: opts.actor?.memberId ?? null,
     },
-    { onConflict: "member_id" }
+    "avatar"
   );
-  if (error) throw new Error(`avatar upsert failed: ${error.message}`);
 
   await audit(admin, {
     team_id: teamId,
@@ -289,15 +370,31 @@ export async function getMemberAvatar(db: DbClient, memberId: string): Promise<s
   return (data as { avatar_data_url: string | null } | null)?.avatar_data_url ?? null;
 }
 
-/** Remove a time-off row (team-scoped so an id can't be deleted across teams). */
+/**
+ * Remove one of `memberId`'s time-off rows. The delete is bound to (team, member, id) in one
+ * statement, so an id can't be deleted across teams or out from under a teammate; a statement
+ * that matched nothing throws ProfileScopeRefusal and is never audited as a removal.
+ */
 export async function removeTimeOff(
   admin: DbClient,
   teamId: string,
+  memberId: string,
   id: string,
   opts: { actor?: ProfileActor } = {}
 ): Promise<void> {
-  const { error } = await admin.from("member_time_off").delete().eq("team_id", teamId).eq("id", id);
+  // An untyped caller still on the old (team, id) shape must not reach the table.
+  if (typeof memberId !== "string" || !memberId || typeof id !== "string" || !id) {
+    throw new ProfileScopeRefusal();
+  }
+  const { data, error } = await admin
+    .from("member_time_off")
+    .delete()
+    .eq("team_id", teamId)
+    .eq("member_id", memberId)
+    .eq("id", id)
+    .select("id");
   if (error) throw new Error(`time-off delete failed: ${error.message}`);
+  if ((data ?? []).length === 0) throw new ProfileScopeRefusal();
   await audit(admin, {
     team_id: teamId,
     actor_kind: opts.actor?.kind ?? "system",
@@ -313,14 +410,28 @@ export async function removeTimeOff(
  * (source ≠ 'manual' with an externalId) the write is idempotent: an existing row with the
  * same (team, source, external_id) is updated in place, so re-running an importer never
  * duplicates. Returns the goal id.
+ *
+ * `scope` is required and decides ownership (see GoalWriteScope): under `browser_member` an
+ * existing row is written only while `memberId` owns it; under `system_import` the team-wide
+ * match may be reassigned to `memberId`. Either way an update that matched no row — or that
+ * collides with the team-wide import key — throws ProfileScopeRefusal and is never audited.
  */
 export async function setMemberGoal(
   admin: DbClient,
   teamId: string,
   memberId: string,
   input: GoalInput,
+  scope: GoalWriteScope,
   opts: { actor?: ProfileActor } = {}
 ): Promise<string> {
+  // Checked at runtime, before anything else: an untyped caller that omits the mode (or still
+  // passes the actor options in this position) must not fall through to either behavior.
+  const mode = (scope as { mode?: unknown } | null | undefined)?.mode;
+  if (mode !== "browser_member" && mode !== "system_import") {
+    throw new Error("goal write scope is required: browser_member or system_import");
+  }
+  const memberBound = mode === "browser_member";
+
   const title = input.title.trim();
   if (!title) throw new Error("goal title is required");
   const kind = input.kind ?? "goal";
@@ -350,36 +461,75 @@ export async function setMemberGoal(
     updated_at: new Date().toISOString(),
   };
 
-  // Resolve the target row: explicit id → that row; else an imported dedup match; else insert.
-  let existingId = input.id ?? null;
-  if (!existingId && source !== "manual" && externalId) {
-    const { data: dup } = await admin
+  // Update one existing row and report whether it matched. Member-bound: the owner is part of the
+  // predicate and is not written, so an owner that changed since any earlier read cannot be
+  // overwritten. Trusted import: team-bound, and the row is (re)assigned to `memberId`.
+  const updateGoal = async (id: string): Promise<boolean> => {
+    const teamBound = admin
       .from("member_goals")
-      .select("id")
+      .update(memberBound ? fields : { member_id: memberId, ...fields })
       .eq("team_id", teamId)
-      .eq("source", source)
-      .eq("external_id", externalId)
-      .maybeSingle();
-    existingId = (dup as { id: string } | null)?.id ?? null;
-  }
+      .eq("id", id);
+    const { data, error } = await (memberBound ? teamBound.eq("member_id", memberId) : teamBound).select("id");
+    if (error) {
+      // Taking another row's (team, source, external_id) key is an ownership collision.
+      if (isUniqueViolation(error.message)) throw new ProfileScopeRefusal();
+      throw new Error(`goal update failed: ${error.message}`);
+    }
+    return (data ?? []).length > 0;
+  };
 
-  let goalId: string;
-  if (existingId) {
-    const { error } = await admin
-      .from("member_goals")
-      .update({ member_id: memberId, ...fields })
-      .eq("team_id", teamId)
-      .eq("id", existingId);
-    if (error) throw new Error(`goal update failed: ${error.message}`);
-    goalId = existingId;
-  } else {
+  // Insert a new row for `memberId`; null means the team-wide import key was taken first.
+  const insertGoal = async (): Promise<string | null> => {
     const { data, error } = await admin
       .from("member_goals")
       .insert({ team_id: teamId, member_id: memberId, ...fields })
       .select("id")
       .single();
-    if (error || !data) throw new Error(`goal insert failed: ${error?.message}`);
-    goalId = (data as { id: string }).id;
+    if (error || !data) {
+      if (isUniqueViolation(error?.message)) return null;
+      throw new Error(`goal insert failed: ${error?.message}`);
+    }
+    return (data as { id: string }).id;
+  };
+
+  // Imported dedup: find the team-wide key's row and write it in place, else insert. The key's
+  // owner is read explicitly — a peer's match is a refusal, never "no match" (that would insert
+  // into the unique index) and never a silent move. A lost insert race or an owner that changed
+  // before the scoped update re-reads the owner, a bounded number of times.
+  const convergeImportedGoal = async (): Promise<string> => {
+    for (let conflicts = 0; ; conflicts++) {
+      const { data, error } = await admin
+        .from("member_goals")
+        .select("id, member_id")
+        .eq("team_id", teamId)
+        .eq("source", source)
+        .eq("external_id", externalId)
+        .maybeSingle();
+      if (error) throw new Error(`goal lookup failed: ${error.message}`);
+      const dup = data as { id: string; member_id: string } | null;
+      if (dup) {
+        if (memberBound && dup.member_id !== memberId) throw new ProfileScopeRefusal();
+        if (await updateGoal(dup.id)) return dup.id;
+      } else {
+        const inserted = await insertGoal();
+        if (inserted) return inserted;
+      }
+      if (conflicts >= MAX_SCOPE_CONFLICT_RETRIES) throw new ProfileScopeRefusal();
+    }
+  };
+
+  // Resolve the target row: explicit id → that row; else an imported dedup match; else insert.
+  let goalId: string;
+  if (input.id) {
+    if (!(await updateGoal(input.id))) throw new ProfileScopeRefusal();
+    goalId = input.id;
+  } else if (source !== "manual" && externalId) {
+    goalId = await convergeImportedGoal();
+  } else {
+    const inserted = await insertGoal();
+    if (!inserted) throw new ProfileScopeRefusal();
+    goalId = inserted;
   }
 
   await audit(admin, {
@@ -394,15 +544,29 @@ export async function setMemberGoal(
   return goalId;
 }
 
-/** Remove a goal (team-scoped). */
+/**
+ * Remove one of `memberId`'s goals, bound to (team, member, id) exactly as `removeTimeOff`: a
+ * statement that matched nothing throws ProfileScopeRefusal and is never audited as a removal.
+ */
 export async function removeMemberGoal(
   admin: DbClient,
   teamId: string,
+  memberId: string,
   id: string,
   opts: { actor?: ProfileActor } = {}
 ): Promise<void> {
-  const { error } = await admin.from("member_goals").delete().eq("team_id", teamId).eq("id", id);
+  if (typeof memberId !== "string" || !memberId || typeof id !== "string" || !id) {
+    throw new ProfileScopeRefusal();
+  }
+  const { data, error } = await admin
+    .from("member_goals")
+    .delete()
+    .eq("team_id", teamId)
+    .eq("member_id", memberId)
+    .eq("id", id)
+    .select("id");
   if (error) throw new Error(`goal delete failed: ${error.message}`);
+  if ((data ?? []).length === 0) throw new ProfileScopeRefusal();
   await audit(admin, {
     team_id: teamId,
     actor_kind: opts.actor?.kind ?? "system",

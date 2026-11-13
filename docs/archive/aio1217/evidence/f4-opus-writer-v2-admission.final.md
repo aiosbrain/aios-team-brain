@@ -1,0 +1,1 @@
+ADMISSION_OK claude-opus-5-5

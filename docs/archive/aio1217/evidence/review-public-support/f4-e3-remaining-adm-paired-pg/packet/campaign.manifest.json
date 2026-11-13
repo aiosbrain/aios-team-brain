@@ -1,0 +1,500 @@
+{
+  "kind": "AIO-1217_F4_E3_REMAINING_ADM_PAIRED_PG_CAMPAIGN_MANIFEST",
+  "status": "PREPARED_NOT_EXECUTED",
+  "packetRoot": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/review-public-support/f4-e3-remaining-adm-paired-pg/packet",
+  "localCheckpoint": "d8427efdfc3498a167e3b4155ca22b9278d5eb29",
+  "remoteAtPreparation": "2437df69f2146e84a646a46f288c555dd2ad032a",
+  "targetBase": "c5e832c2ff179ee5c99f95966fba1ed9ce77ae3e",
+  "candidateRuntimeBase": "9cd35756ce9459a4c389803714fc06e34192c108",
+  "referenceOwnerCommit": "ceb184db9991dc9c6bb5ba3cb3b249cf6c480834",
+  "fixture": {
+    "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-worktree/test/datamechanics/aio1217-pm-reconcile-action-native.datamechanics.test.ts",
+    "sha256": "7ae552da7d3d637a5c545caca92322f7f3330294c696cabf7de1873bc42e3407",
+    "bytes": 200634
+  },
+  "inputs": [
+    {
+      "role": "repository instructions",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-worktree/AGENTS.md",
+      "sha256": "e4117721d454be48f881a878037a07353ea7b355741e366169746276466bdb72",
+      "bytes": 13460
+    },
+    {
+      "role": "canonical shared workflow skill",
+      "path": "/Users/chetan/.agents/skills/astra-spec-claude-build/SKILL.md",
+      "sha256": "6a41d617810415980c209348d403e0dade7b52eae097b0105684b599c348284a",
+      "bytes": 32572
+    },
+    {
+      "role": "full accepted v9",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/review-public-support/f4-e3-affected-review-frozen/packet/admission/04-accepted-v9.md",
+      "sha256": "0a19ddf87f9247d960cd5ed0247e14962963df3f99ae3c4b1a1546cd4342985f",
+      "bytes": 203946
+    },
+    {
+      "role": "historical Astra disposition",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/review-public-support/f4-e3-affected-review-frozen/packet/admission/05-astra-disposition.md",
+      "sha256": "a91197e7ce7494a419e49de6351aeac55fc9c9e03aa90e04a96a2d7a29978f54",
+      "bytes": 7654
+    },
+    {
+      "role": "current Next Server Actions guide",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/review-public-support/f4-e3-affected-review-frozen/packet/admission/10-next-server-actions.md",
+      "sha256": "8063a28cde0495a61c5ac195b0b769d86a10740a673facdc5f3e2f80f0e59b77",
+      "bytes": 12720
+    },
+    {
+      "role": "current native fixture and sole writable file",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-worktree/test/datamechanics/aio1217-pm-reconcile-action-native.datamechanics.test.ts",
+      "sha256": "7ae552da7d3d637a5c545caca92322f7f3330294c696cabf7de1873bc42e3407",
+      "bytes": 200634
+    },
+    {
+      "role": "existing association/stale-tier fixture reference",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-worktree/test/datamechanics/aio1217-admin-guard-association.datamechanics.test.ts",
+      "sha256": "5218c3a7d92c68872a0dabd2e914c7abcf617c16efe9950d9f4967dea80c62a7",
+      "bytes": 47966
+    },
+    {
+      "role": "datamechanics helper",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-worktree/test/datamechanics/helpers.ts",
+      "sha256": "ac1f8d546c077bdbb633cfff3c08d8e325749cde0727e30fc50924b07fe76558",
+      "bytes": 9999
+    },
+    {
+      "role": "datamechanics setup",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-worktree/test/datamechanics/setup.ts",
+      "sha256": "d5f6ac9493392b242e81b8b5bd768854e8fca8b025ae26ecfd6279a8c95ad464",
+      "bytes": 2025
+    },
+    {
+      "role": "actual action",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-worktree/app/t/[team]/admin/pm-sync/actions.ts",
+      "sha256": "85fe8b5c647c119735664ce6640fd027fe9d4347304e813a98f4083fa0619ca9",
+      "bytes": 4310
+    },
+    {
+      "role": "actual admin guard",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-worktree/lib/auth/guard.ts",
+      "sha256": "fcc026722da9939047e91f6a0d634fc3748c48c563a40623ed7662568a603bac",
+      "bytes": 2180
+    },
+    {
+      "role": "actual team/member resolver",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-worktree/lib/integrations/read.ts",
+      "sha256": "d9967cfc6fc420b4666e4d23a31ef04500f405140e2f2b0dc8c863a2c8f40138",
+      "bytes": 4116
+    },
+    {
+      "role": "actual cookie session entry",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-worktree/lib/auth/session.ts",
+      "sha256": "8c23edcda8f2f9455217132e03c4334990b6ed6bb8b85b3ac6e6edd25619cf4a",
+      "bytes": 698
+    },
+    {
+      "role": "actual signed session implementation",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-worktree/lib/auth/pg-session.ts",
+      "sha256": "2fbb6c45e33156490ce0cfeb96bb6aa8cf0b2b9dc3630cc2da4c198be275bf9c",
+      "bytes": 1673
+    },
+    {
+      "role": "actual membership-derived posture",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-worktree/lib/access/posture.ts",
+      "sha256": "e4215d32976a1657f64a8c3f1451a9daa3d001385d9a6ffbbf2b5cb12eb06b33",
+      "bytes": 2117
+    },
+    {
+      "role": "actual admin access predicate",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-worktree/lib/auth/admin-access.ts",
+      "sha256": "3766702acabdbdad1e4c1a40e6f2bd2f89f10d71492b86f1a17f05a98306f9f4",
+      "bytes": 921
+    },
+    {
+      "role": "tier restriction predicate dependency",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-worktree/lib/auth/visibility.ts",
+      "sha256": "9815a8c2847151c8846e42e540add10b44ccbc6f957a871790fbb8868ef0e06d",
+      "bytes": 5029
+    },
+    {
+      "role": "builtin groups/association owner",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-worktree/lib/access/groups.ts",
+      "sha256": "3d163347585ec62307a5fe45602754f325371a9853e70eb7733b8c5cbcf43d07",
+      "bytes": 52775
+    },
+    {
+      "role": "full teams/member/group schema source",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-worktree/postgres/schema.sql",
+      "sha256": "23c79fcdce11c7dd1171c06d79b9ab3ad80d745a5c7879c3f90837e2490b5eca",
+      "bytes": 177596
+    },
+    {
+      "role": "actual reconciliation owner",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-worktree/lib/pm-sync/reconcile.ts",
+      "sha256": "9cad6dcd76888ac124559dcd904c8ac2afc8c261c80bf102e2e0b99c43d81f78",
+      "bytes": 5689
+    },
+    {
+      "role": "actual primary resolver",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-worktree/lib/pm-sync/project.ts",
+      "sha256": "f84f7e9562601e2ac7c7e49e727f57808de50cbb826decd79601344cd81eb3df",
+      "bytes": 24887
+    },
+    {
+      "role": "actual integration/secret resolver",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-worktree/lib/integrations/manage.ts",
+      "sha256": "abe0d3b8f7a367fd7c008e325c48fc0bc87c52e442f0854d704a5d5b7a2a8683",
+      "bytes": 16436
+    },
+    {
+      "role": "actual Linear adapter",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-worktree/lib/pm-sync/linear.ts",
+      "sha256": "e0d72f723527aab3a88190f3ffea3b70f6fe994db6b63093b1b901a29432acf6",
+      "bytes": 24456
+    },
+    {
+      "role": "actual Linear transport",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-worktree/lib/pm-sync/linear-client.ts",
+      "sha256": "a2496a8c05fb27d704728c3e9476efe0bc7423d5004ab91ad183ddde2264d627",
+      "bytes": 8961
+    },
+    {
+      "role": "actual Plane adapter",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-worktree/lib/pm-sync/plane.ts",
+      "sha256": "e5bcee664014486461a15609a96908145b903ffb623ec1736f3f155e9fba0b49",
+      "bytes": 12875
+    },
+    {
+      "role": "actual provider contracts",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-worktree/lib/pm-sync/provider.ts",
+      "sha256": "05209f399c0d4c15e605ae05b248166362094dfe3a05b150103d49967579790b",
+      "bytes": 10995
+    },
+    {
+      "role": "actual audit owner",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-worktree/lib/api/audit.ts",
+      "sha256": "5edd45176510c9c4a9150c03431ca9af363f0c15c51c87d17c4e5d72311e7dd6",
+      "bytes": 2048
+    },
+    {
+      "role": "actual secret crypto",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-worktree/lib/secrets/crypto.ts",
+      "sha256": "e5c191939a162490412472161011e307bfcc7f985f2f3e062c43a4cc98b89d89",
+      "bytes": 3934
+    },
+    {
+      "role": "actual service client owner",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-worktree/lib/db/admin.ts",
+      "sha256": "7a9172fa39a043d7d347eb70f0991cdfd4d537500bf24c216018ee478d2d7a13",
+      "bytes": 499
+    },
+    {
+      "role": "actual server client owner",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-worktree/lib/db/server.ts",
+      "sha256": "38321a314d133d4a649598a45a5d3dc4fdd911a87030955d8002a31879729322",
+      "bytes": 469
+    },
+    {
+      "role": "actual PG client",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-worktree/lib/db/pg/client.ts",
+      "sha256": "d8ae792a1f1a3c500e51815a5e8bf00ece649468708e555f584447246d22e7db",
+      "bytes": 4736
+    },
+    {
+      "role": "actual PG pool",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-worktree/lib/db/pg/pool.ts",
+      "sha256": "039406836d3ee39caa5f0082e74cc6e88be4597c65842d1f2e27bd79cd4d1819",
+      "bytes": 4383
+    },
+    {
+      "role": "actual DB contracts",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-worktree/lib/db/types.ts",
+      "sha256": "0ce10eda0063ed24d272dd4d73acf6267a90e834627abf0e0741438b1012cad1",
+      "bytes": 3867
+    },
+    {
+      "role": "original interrupted-builder prompt (historical launch contract)",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/review-public-support/f4-e3-remaining-adm-builder/packet/builder.prompt.md",
+      "sha256": "4f6f362cfa0c20f0af50a9753b42b8701cff20877c14a2e0a2867ea772e17541",
+      "bytes": 10830
+    },
+    {
+      "role": "original interrupted-builder manifest (historical pre-edit identities)",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/review-public-support/f4-e3-remaining-adm-builder/packet/manifest.json",
+      "sha256": "d0bfb0847d59f70b940f07d14f1fd419896914bccda0ed80fdb3215632498e68",
+      "bytes": 11042
+    },
+    {
+      "role": "actual query builder read outside original manifest",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-worktree/lib/db/pg/query-builder.ts",
+      "sha256": "c5d18a3a3a62ff8a19b0a13c4e8182f1d5b49af9ae9e514e5cff668c4be1fc3c",
+      "bytes": 17027
+    },
+    {
+      "role": "member-kind/group migration read outside original manifest",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-worktree/postgres/migrations/20260809120000_access_member_kind_and_fk_targets.sql",
+      "sha256": "ebfd401ab8389ad99e438e751da768d214b853ec94b2d3fd7b021e9962404cee",
+      "bytes": 1398
+    },
+    {
+      "role": "actual TypeScript scope config",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-worktree/tsconfig.json",
+      "sha256": "c4bd397a21baee9654f03b622f587918c9d6df3634f9baa7e3d54a11d9053512",
+      "bytes": 734
+    },
+    {
+      "role": "actual package scripts/config",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-worktree/package.json",
+      "sha256": "a29bfa2129bbec35b0270be083a1bfe0e67a8457475f7db68d91c1270c8a32ef",
+      "bytes": 5708
+    },
+    {
+      "role": "recovery prompt",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/review-public-support/f4-e3-remaining-adm-recovery/packet/recovery.prompt.md",
+      "sha256": "5043368b52e8ee14a2932169de0702e3aff30993847f4720317a2cd6d38cb7ca",
+      "bytes": 8573
+    },
+    {
+      "role": "recovery manifest",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/review-public-support/f4-e3-remaining-adm-recovery/packet/manifest.json",
+      "sha256": "84ccd059df866cdb3ae8310ab068ebe6724a6327120a4ca0086c0c845efe895d",
+      "bytes": 14801
+    },
+    {
+      "role": "recovery local validation",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/review-public-support/f4-e3-remaining-adm-recovery/packet/validation.json",
+      "sha256": "ae6387b68d23e237a67a5be554793cc9983d41a305ef8e4afb7591eb117f57a5",
+      "bytes": 1407
+    },
+    {
+      "role": "executed recovery launch contract",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/review-public-support/f4-e3-remaining-adm-recovery/parent-launch-request.json",
+      "sha256": "587b546d4afcd5a0b797f537d3d8dbd28f013d51569549c1208431257eb2c0f4",
+      "bytes": 16506
+    },
+    {
+      "role": "fresh recovery prewriter remote proof",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e3-remaining-adm-recovery.prewriter-proof.json",
+      "sha256": "e69d9dc936a8adcde2ec4d3b2ac92b388c805468428223f0cf6f945a800bb629",
+      "bytes": 340
+    },
+    {
+      "role": "recovery admission final",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e3-remaining-adm-recovery-admission.final.md",
+      "sha256": "8acfa78a946645fb70f6fce62d5be55a75cb0133e6c5e943a762471995b78f98",
+      "bytes": 38
+    },
+    {
+      "role": "recovery admission JSONL",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e3-remaining-adm-recovery-admission.jsonl",
+      "sha256": "6a960dd7a35e09c5ebb188a8f7cbd238a04186967b4b6cbc8f6c446f3c2847bf",
+      "bytes": 5274
+    },
+    {
+      "role": "recovery admission live state",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e3-remaining-adm-recovery-admission.live.json",
+      "sha256": "9b2ae85de104cf0eaa9ffdc37cf2a662b7344e1a51c457e61d88b9bfa704e436",
+      "bytes": 268
+    },
+    {
+      "role": "recovery admission status",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e3-remaining-adm-recovery-admission.status.json",
+      "sha256": "1ac2cd97bf7a7ac9e1d0604dad2a580cf03373f666dae855d3ae8e526465daa1",
+      "bytes": 2747
+    },
+    {
+      "role": "recovery admission stderr",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e3-remaining-adm-recovery-admission.stderr",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "role": "recovery builder final",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e3-remaining-adm-recovery-builder.final.md",
+      "sha256": "b1007ac07ac093e67880672de924648c81c86abcdf98bf3ce7ee59cf86e83346",
+      "bytes": 6734
+    },
+    {
+      "role": "recovery builder JSONL",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e3-remaining-adm-recovery-builder.jsonl",
+      "sha256": "f98d8d72a281568e0e65688ee894d03b6752d4f6085c5cb31a254d0b07fc82cb",
+      "bytes": 1355914
+    },
+    {
+      "role": "recovery builder live state",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e3-remaining-adm-recovery-builder.live.json",
+      "sha256": "f3125825fa8ca6bf9181080c4d2c56c0b988563ea7c60d2dffb53ed75f5b6a2f",
+      "bytes": 266
+    },
+    {
+      "role": "recovery builder status",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e3-remaining-adm-recovery-builder.status.json",
+      "sha256": "df2f9ae72c815081524528197ba8e4820bdd4846cfb1308c259f87c755105e83",
+      "bytes": 9617
+    },
+    {
+      "role": "recovery builder stderr",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e3-remaining-adm-recovery-builder.stderr",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "role": "recovery unchanged raw patch",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e3-remaining-adm-recovery-builder.patch",
+      "sha256": "61235d43666574cd360666e5bfe58714d2c0c0e4a9f11c59089ba51c5db4334e",
+      "bytes": 57811
+    },
+    {
+      "role": "recovery parent scope/check capture",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e3-remaining-adm-recovery-builder.parent-capture.json",
+      "sha256": "bde11801a197d00841a65364608e657910bf1e5a0460fe3b3caf72f814ca1b6c",
+      "bytes": 2324
+    },
+    {
+      "role": "focused lint result",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4e3_remaining_adm_recovery_lint.result.json",
+      "sha256": "b6321200edbfefe57fb8389a9c75c5aec5f1b7c4cde319789f493571098f3462",
+      "bytes": 552
+    },
+    {
+      "role": "focused lint log",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4e3_remaining_adm_recovery_lint.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "role": "focused lint provenance",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4e3_remaining_adm_recovery_lint.provenance.json",
+      "sha256": "b801df144163fe4e069f7f251bc533fd3f0c3deb1857b80758f80c35501f14e8",
+      "bytes": 518
+    },
+    {
+      "role": "focused lint copied runner",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4e3_remaining_adm_recovery_lint.runner.py",
+      "sha256": "9252586f8c222d44351b12b5ab89d9ee5a63da14d8ed8021079fd15f79e3cdb6",
+      "bytes": 7009
+    },
+    {
+      "role": "focused lint launch runner",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4e3_remaining_adm_recovery_lint.launch-runner.py",
+      "sha256": "9252586f8c222d44351b12b5ab89d9ee5a63da14d8ed8021079fd15f79e3cdb6",
+      "bytes": 7009
+    },
+    {
+      "role": "focused typecheck result",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4e3_remaining_adm_recovery_typecheck.result.json",
+      "sha256": "d016886cdf05d38133bdd0604739a42619bd224292b6ef12dbd4721cad175210",
+      "bytes": 488
+    },
+    {
+      "role": "focused typecheck log",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4e3_remaining_adm_recovery_typecheck.log",
+      "sha256": "6a570794574f624455d929b4b9b35a115e3e433631bb3f256ffd32b53e0d8109",
+      "bytes": 52
+    },
+    {
+      "role": "focused typecheck provenance",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4e3_remaining_adm_recovery_typecheck.provenance.json",
+      "sha256": "01495b1d70939366b3efc413ed66deeffad1aa8c1f2b8e4250e1e9c841a13a56",
+      "bytes": 449
+    },
+    {
+      "role": "focused typecheck copied runner",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4e3_remaining_adm_recovery_typecheck.runner.py",
+      "sha256": "9252586f8c222d44351b12b5ab89d9ee5a63da14d8ed8021079fd15f79e3cdb6",
+      "bytes": 7009
+    },
+    {
+      "role": "focused typecheck launch runner",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4e3_remaining_adm_recovery_typecheck.launch-runner.py",
+      "sha256": "9252586f8c222d44351b12b5ab89d9ee5a63da14d8ed8021079fd15f79e3cdb6",
+      "bytes": 7009
+    },
+    {
+      "role": "canonical host check runner",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/run_check.py",
+      "sha256": "9252586f8c222d44351b12b5ab89d9ee5a63da14d8ed8021079fd15f79e3cdb6",
+      "bytes": 7009
+    },
+    {
+      "role": "coordination protocol",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/review-public-support/f4-bounded-sol-transfer/packet/inputs/03-coordination-protocol.md",
+      "sha256": "54ee11e8acd6a660dd59d7fd848f1ae1ec8b200f0cf14da890cd7d50f0fe51aa",
+      "bytes": 7451
+    },
+    {
+      "role": "accepted immutable PG runner",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/review-public-support/f4-e2-affected-review-frozen/packet/runner/01-immutable-e4-runner.py",
+      "sha256": "5ec2b76bdb536bef088f8a461155e3abf7f61b59215d46b5aa7a858e7083682d",
+      "bytes": 7384
+    },
+    {
+      "role": "prior accepted E3 helper provenance",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/review-public-support/f4-e3-paired-evidence/packet/output/run_paired_e3.sh",
+      "sha256": "9ae2658399f570500cee42ab17ef320b30b8449693fa815c4fb8b7dd4692f7f5",
+      "bytes": 2619
+    },
+    {
+      "role": "prior executed E3 host script provenance",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e3-paired-parent-campaign.py",
+      "sha256": "c975dc900afd5bb4f0e478aedfb573ce630395f44aa1b0e06ffaeb02c5a5f3ef",
+      "bytes": 4824
+    },
+    {
+      "role": "prior executed E3 parent result provenance",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e3-paired-parent.result.json",
+      "sha256": "39b4d2b731b5a4c8331a9f0fd94b7b32c82285425aeaa34629436a4acfddb5b7",
+      "bytes": 543514
+    },
+    {
+      "role": "prior E3 execution request provenance",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e3-paired-pg-parent-execution-request.json",
+      "sha256": "6e86bbdfecdfea5556984ef66db2d9f45bb9e1f6a5b030ec898d98b22dfb974d",
+      "bytes": 3907
+    },
+    {
+      "role": "new fixture-bound paired helper",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/review-public-support/f4-e3-remaining-adm-paired-pg/packet/run_paired_remaining_adm.sh",
+      "sha256": "ca4d160e638e3c88b3680fd3f5490c0335d9889fd3e2066e517fb847683bc730",
+      "bytes": 2632
+    },
+    {
+      "role": "new parent campaign script",
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/review-public-support/f4-e3-remaining-adm-paired-pg/packet/parent_campaign.py",
+      "sha256": "0d23bf8757c0ee9ec965036ad926369e510456019edfe6ff8ba722285c0e98c6",
+      "bytes": 14951
+    }
+  ],
+  "inputCount": 75,
+  "guards": {
+    "everyInputMustExist": true,
+    "everyInputMustBeRegularFile": true,
+    "noInputMayBeSymlink": true,
+    "exactHashAndSizeRequired": true,
+    "localHeadMustEqual": "d8427efdfc3498a167e3b4155ca22b9278d5eb29",
+    "worktreeMustBeClean": true,
+    "remoteMustRemain": "2437df69f2146e84a646a46f288c555dd2ad032a",
+    "localRemoteEqualityRequired": false,
+    "fixtureMustMatch": true,
+    "onlyDatabase": "owned synthetic /aios-aio1217-pg-8a4e78cb at 127.0.0.1:50538",
+    "serialOrder": [
+      "reference",
+      "candidate"
+    ],
+    "noExtraSeparator": true,
+    "noLintOrTypecheckRerun": true
+  },
+  "coverage": {
+    "runtimeLayouts": "both start at 9cd357; identical current fixture; reference substitutes only the two exact ceb184 owner blobs; candidate retains cd038 owner bytes",
+    "actualClassification": "host script requires six exact reference case-4 failures, validates false-success audit/revalidation records versus candidate exact refusal/no-effects records, requires reference repeats absent and candidate repeats reached, and never treats exit class alone as proof",
+    "native": "cases 9-15 must be reported passing by both actual runtimes; every recorded request must contain complete ten-table before/after snapshots, UTC endpoints, traces, bindings, seams and empty violations",
+    "provenance": "full tracked-file maps, full two-owner bytes, raw and named JSONL, environment/result/provenance/log/runner/command, UTC boundaries and hashes"
+  },
+  "limitations": [
+    "Recovery builder read v9 sections 1-9 but Appendix A/v6 ADM only by targeted search; no whole-spec-read claim.",
+    "Recovery builder did not open Plane/provider source and range-read several other files; review packet must include complete exact bytes.",
+    "Typecheck passed but excludes test and *.test.ts; it does not validate fixture types.",
+    "Expired-cookie and guard-read-fault arms remain unconstructed and uncredited.",
+    "Historical pre-edit census/runtime admission remains blocked; no whole-E3/E4/E6/UI/full-task/final credit."
+  ],
+  "nextGate": "After actual campaign success, parent freezes all evidence; bounded Sol prepares a fresh independent actual subscription Opus 5.5 HIGH affected normal pre-push review packet. No push before qualified review."
+}

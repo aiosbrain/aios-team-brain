@@ -1,0 +1,39 @@
+{
+  "kind": "AIO-1217_F4_E3_REMAINING_ADM_PAIRED_PG_PACKET_VALIDATION",
+  "status": "PASS_COORDINATOR_READ_ONLY_NOT_EXECUTED",
+  "validatedAt": "2026-10-06T05:00:26Z",
+  "artifacts": {
+    "helper": {
+      "sha256": "ca4d160e638e3c88b3680fd3f5490c0335d9889fd3e2066e517fb847683bc730",
+      "bytes": 2632
+    },
+    "hostScript": {
+      "sha256": "0d23bf8757c0ee9ec965036ad926369e510456019edfe6ff8ba722285c0e98c6",
+      "bytes": 14951
+    },
+    "manifest": {
+      "sha256": "f4ab78706de74a40c4e23a86471f9cdf2e3681eb1934146ecc4dc3cf056b742d",
+      "bytes": 25780,
+      "inputCount": 75
+    },
+    "request": {
+      "sha256": "5a0d87dee9140e3707a8b2e9e72f696e2ff015c3d12c606aacdfbc4ff702b8c9",
+      "bytes": 12222
+    },
+    "immutablePgRunner": {
+      "sha256": "5ec2b76bdb536bef088f8a461155e3abf7f61b59215d46b5aa7a858e7083682d",
+      "bytes": 7384
+    }
+  },
+  "checks": [
+    "manifest and request parsed as JSON",
+    "all 75 manifest inputs matched SHA-256 and byte size",
+    "all 75 inputs were regular non-symlink files",
+    "packet contains no symlinks",
+    "helper pins only fixture 7ae552da7d3d637a5c545caca92322f7f3330294c696cabf7de1873bc42e3407",
+    "helper invokes pg directly with fixture and contains no extra separator",
+    "request binds local d8427efd, remote 2437df69, base 9cd357, two ceb184 reference owners and only owned PG 127.0.0.1:50538"
+  ],
+  "qualification": "Artifact/input identity validation only. The Python host campaign and shell helper were not executed or syntax-tested by the coordinator; parent must independently verify and execute under the exact request.",
+  "scope": "No source, model, check, PG, git, network, push or review action."
+}

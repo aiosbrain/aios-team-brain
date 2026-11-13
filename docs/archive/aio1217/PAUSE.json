@@ -1,0 +1,16 @@
+{
+  "state": "PAUSED_BY_USER",
+  "at": "2026-10-06T05:12:34.465423+00:00",
+  "userInstruction": "Please stop and post everything to GitHub so that we can pick it up later.",
+  "sourceCheckpoint": "d8427efdfc3498a167e3b4155ca22b9278d5eb29",
+  "fixtureSha256": "7ae552da7d3d637a5c545caca92322f7f3330294c696cabf7de1873bc42e3407",
+  "builder": "original writer interrupted/reaped after saved edit; fresh same-role continuation successfully completed/reaped with no edit",
+  "coordinator": "STOPPED_REAPED; turn.completed/exit0 but reconnect errors mean wrapper success=false; prepared package not executed or parent-validated",
+  "coordinatorThread": "01a10f03-e9c0-7b33-88dd-c1c6a6125dae",
+  "Terra": "SUSPENDED; do not blindly resume",
+  "checksRunning": false,
+  "PGCampaign": "PREPARED_NOT_EXECUTED",
+  "historicalAcceptance": "BLOCKED",
+  "mergeReady": false,
+  "nextAction": "Obtain explicit user resume instruction; then read README and validate/rebind pending campaign. Do not automatically execute archived commands."
+}

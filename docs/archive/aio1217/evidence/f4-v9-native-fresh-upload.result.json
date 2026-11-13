@@ -1,0 +1,172 @@
+{
+  "terminal": "NATIVE_V9_FRESH_ATTACHMENT_VERIFIED",
+  "records": [
+    {
+      "label": "before",
+      "exit": 0,
+      "stdoutSha256": "3b4ff5159c7a3318d3a485410aea46ef0af3b47b119f3eaacc64f04bb0e1caff",
+      "stdoutBytes": 186193,
+      "stderr": "linear: deprecated compatibility command — use `aios linear query …` (this bin will be removed no earlier than v3.0.0)\n",
+      "at": "2026-10-06T00:16:36.383Z"
+    },
+    {
+      "label": "before-verified",
+      "descriptionSha256": "fa17678bd795a64c207e42443c52f2b9a9c66e6bc7144cb046eb60e08020c9ac",
+      "descriptionBytes": 185181,
+      "state": "In Progress",
+      "v6Exact": true,
+      "v7Exact": true,
+      "attachments": []
+    },
+    {
+      "label": "fileUpload-attempt",
+      "at": "2026-10-06T00:16:36.386Z"
+    },
+    {
+      "label": "fileUpload",
+      "exit": 0,
+      "stdoutSha256": "079262532c15f1a6038c022f8e7e96ffc20709708e4849537d835f19a651366f",
+      "stdoutBytes": 1731,
+      "stderr": "linear: deprecated compatibility command — use `aios linear query …` (this bin will be removed no earlier than v3.0.0)\n",
+      "at": "2026-10-06T00:16:37.628Z"
+    },
+    {
+      "label": "safe-grant-capture-before-guards",
+      "success": true,
+      "uploadFilePresent": true,
+      "filename": "93b53c03-8973-4ed0-bcf9-81c360f22b0b/fd20425e-1399-431b-8c86-d23ecb691d27/e1530eba-7781-4b33-bea0-538b109954e1",
+      "contentType": "text/markdown; charset=utf-8",
+      "size": 203946,
+      "echoComparisons": {
+        "filename": false,
+        "contentType": true,
+        "size": true
+      },
+      "uploadUrlSha256": "6c4a9783ce7b1409f31a1b4453c08c0eb94a7fdca4da95e49a880e387f3d8c1d",
+      "assetUrlSha256": "8027af8e76a5b65bff2d67cfdd5703c67a47cb0883f800c2bbd916baf4ea8826",
+      "headerNames": [
+        "x-goog-content-length-range",
+        "content-disposition"
+      ]
+    },
+    {
+      "label": "grant-host-classification",
+      "uploadScheme": "https:",
+      "uploadHost": "storage.googleapis.com",
+      "assetScheme": "https:",
+      "assetHost": "uploads.linear.app"
+    },
+    {
+      "label": "put-attempt",
+      "at": "2026-10-06T00:16:37.650Z"
+    },
+    {
+      "label": "signedPUT",
+      "status": 200,
+      "redirected": false,
+      "at": "2026-10-06T00:16:39.951Z"
+    },
+    {
+      "label": "afterPUT-asset",
+      "status": 200,
+      "redirected": false,
+      "host": "uploads.linear.app",
+      "at": "2026-10-06T00:16:41.595Z"
+    },
+    {
+      "label": "afterPUT-asset-bytes",
+      "bytes": 203946,
+      "sha256": "0a19ddf87f9247d960cd5ed0247e14962963df3f99ae3c4b1a1546cd4342985f"
+    },
+    {
+      "label": "afterPUT-ticket",
+      "exit": 0,
+      "stdoutSha256": "3b4ff5159c7a3318d3a485410aea46ef0af3b47b119f3eaacc64f04bb0e1caff",
+      "stdoutBytes": 186193,
+      "stderr": "linear: deprecated compatibility command — use `aios linear query …` (this bin will be removed no earlier than v3.0.0)\n",
+      "at": "2026-10-06T00:16:43.794Z"
+    },
+    {
+      "label": "afterPUT-ticket-verified",
+      "descriptionSha256": "fa17678bd795a64c207e42443c52f2b9a9c66e6bc7144cb046eb60e08020c9ac",
+      "descriptionBytes": 185181,
+      "state": "In Progress",
+      "v6Exact": true,
+      "v7Exact": true,
+      "attachments": []
+    },
+    {
+      "label": "attachmentCreate-attempt",
+      "at": "2026-10-06T00:16:43.797Z"
+    },
+    {
+      "label": "attachmentCreate",
+      "exit": 0,
+      "stdoutSha256": "9891329988b8c779425a9caa221985dfb5bd2546df7d19e508c99cfc91735bd5",
+      "stdoutBytes": 1579,
+      "stderr": "linear: deprecated compatibility command — use `aios linear query …` (this bin will be removed no earlier than v3.0.0)\n",
+      "at": "2026-10-06T00:16:44.953Z"
+    },
+    {
+      "label": "afterAttachment-ticket",
+      "exit": 0,
+      "stdoutSha256": "8c56056336bd7b9db94c12ec4c64f1217a990e95269864e3f1d1743a1526fe83",
+      "stdoutBytes": 187812,
+      "stderr": "linear: deprecated compatibility command — use `aios linear query …` (this bin will be removed no earlier than v3.0.0)\n",
+      "at": "2026-10-06T00:16:46.566Z"
+    },
+    {
+      "label": "afterAttachment-ticket-verified",
+      "descriptionSha256": "fa17678bd795a64c207e42443c52f2b9a9c66e6bc7144cb046eb60e08020c9ac",
+      "descriptionBytes": 185181,
+      "state": "In Progress",
+      "v6Exact": true,
+      "v7Exact": true,
+      "attachments": [
+        {
+          "id": "bba1ee93-a5e2-4a09-8289-528b6aa0e46c",
+          "title": "AIO-1217 accepted v9 F4-E4 reviewed specification",
+          "urlSha256": "8027af8e76a5b65bff2d67cfdd5703c67a47cb0883f800c2bbd916baf4ea8826"
+        }
+      ]
+    },
+    {
+      "label": "afterAttachment-asset",
+      "status": 200,
+      "redirected": false,
+      "host": "uploads.linear.app",
+      "at": "2026-10-06T00:16:46.863Z"
+    },
+    {
+      "label": "afterAttachment-asset-bytes",
+      "bytes": 203946,
+      "sha256": "0a19ddf87f9247d960cd5ed0247e14962963df3f99ae3c4b1a1546cd4342985f"
+    }
+  ],
+  "phases": {
+    "counters": {
+      "fileUpload": 1,
+      "put": 1,
+      "attachmentCreate": 1
+    },
+    "flags": {
+      "fileUploadIssued": true,
+      "fileUploadCompleted": true,
+      "putAttempted": true,
+      "putQualified": true,
+      "attachmentCreateAttempted": true,
+      "attachmentQualified": true
+    }
+  },
+  "attachmentId": "bba1ee93-a5e2-4a09-8289-528b6aa0e46c",
+  "uploadUrlSha256": "6c4a9783ce7b1409f31a1b4453c08c0eb94a7fdca4da95e49a880e387f3d8c1d",
+  "assetUrlSha256": "8027af8e76a5b65bff2d67cfdd5703c67a47cb0883f800c2bbd916baf4ea8826",
+  "verified": true,
+  "checkpoint": "9cd35756ce9459a4c389803714fc06e34192c108",
+  "specSha256": "0a19ddf87f9247d960cd5ed0247e14962963df3f99ae3c4b1a1546cd4342985f",
+  "specBytes": 203946,
+  "descriptionUnchanged": true,
+  "state": "In Progress",
+  "noRetry": true,
+  "qualification": "No historical-gap disposition; dependent PM acceptance remains BLOCKED. No runtime, E4 execution, E6 UI/action-wire, PR, merge, or final-task credit."
+}

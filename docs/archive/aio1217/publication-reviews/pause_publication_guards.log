@@ -1,0 +1,21 @@
+
+[1m[30m[46m RUN [49m[39m[22m [36mv4.1.9 [39m[90m/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-worktree[39m
+
+From /var/folders/88/x2rpnd7x43j8jz8wrmm_8scw0000gn/T/instruction base 'fixture-YK6h4V/path remote
+ * branch            main       -> FETCH_HEAD
+   0083659..7e5ce8f  main       -> origin/main
+From /var/folders/88/x2rpnd7x43j8jz8wrmm_8scw0000gn/T/instruction base 'fixture-oEwPoO/path remote
+ * branch            staging    -> FETCH_HEAD
+   0083659..7e5ce8f  staging    -> origin/staging
+ [32m✓[39m test/guards/instruction-base.test.ts [2m([22m[2m79 tests[22m[2m)[22m[33m 1961[2mms[22m[39m
+     [33m[2m✓[22m[39m inventory equals an independent git ls-files minus independently specified exclusions, also from nested cwd [33m 469[2mms[22m[39m
+     [33m[2m✓[22m[39m has no operative path-form regression (mirrors must be generated) [33m 339[2mms[22m[39m
+     [33m[2m✓[22m[39m executes the sanctioned sequence with fresh main from nested cwd [33m 471[2mms[22m[39m
+     [33m[2m✓[22m[39m executes the sanctioned sequence with fresh staging from nested cwd [33m 453[2mms[22m[39m
+ [32m✓[39m test/guards/server-action-auth.test.ts [2m([22m[2m241 tests[22m[2m | [22m[90m3 todo[39m[2m)[22m[33m 867[2mms[22m[39m
+
+[2m Test Files [22m [1m[32m2 passed[39m[22m[90m (2)[39m
+[2m      Tests [22m [1m[32m317 passed[39m[22m[2m | [22m[90m3 todo[39m[90m (320)[39m
+[2m   Start at [22m 10:59:30
+[2m   Duration [22m 4.31s[2m (transform 287ms, setup 0ms, import 3.37s, tests 2.83s, environment 0ms)[22m
+

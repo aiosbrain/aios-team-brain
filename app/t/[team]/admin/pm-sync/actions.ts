@@ -91,6 +91,11 @@ export async function reconcileDivergenceAction(teamSlug: string): Promise<Recon
   const db = adminClient();
   const result = await reconcileProviderState(db, ctx.teamId);
   if (result.provider === null) return { ok: false, error: result.reason ?? "no primary PM provider configured" };
+  // F4 (AIO-1217): a named primary whose integration is missing, disabled or secret-less was never
+  // checked — refuse before the audit and revalidation rather than report an empty pass.
+  if (result.notRunReason === "integration_unavailable") {
+    return { ok: false, error: "primary PM integration is unavailable" };
+  }
 
   await audit(db, {
     team_id: ctx.teamId,

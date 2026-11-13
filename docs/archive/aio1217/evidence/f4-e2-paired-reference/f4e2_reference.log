@@ -1,0 +1,763 @@
+
+[1m[30m[46m RUN [49m[39m[22m [36mv4.1.9 [39m[90m/private/tmp/aio1217-paired-e2-20261006T014155Z/reference/aio1217-worktree[39m
+
+ [31m❯[39m test/datamechanics/aio1217-pm-reconcile-action-native.datamechanics.test.ts [2m([22m[2m30 tests[22m[2m | [22m[31m6 failed[39m[2m | [22m[90m13 todo[39m[2m)[22m[33m 8250[2mms[22m[39m
+     [33m[2m✓[22m[39m 1 — team A and team B each name `linear` and hold an ENABLED `linear` integration with its own synthetic secret and Linear team id; the synthetic board lists two of team A's three projected resources and team B's one: `reconcileDivergenceAction(<team A's slug>)` by team A's admitted admin is admitted by the guard's real reads; hands the real `reconcileProviderState` the server-resolved team and no options; the real resolution reads `integrations` bound to team A's id and `status = enabled` — answered with ONE row where two are enabled — decrypts ONE secret, team A's, and reads team A's primary; the link read is bound to team A's id and `linear` and answered with THREE rows where four hold a resource id; exactly three read-only queries reach the provider, each naming team A's configured Linear team, and no mutation; `provider_seen_status` is recorded on the two answered links by id (`Done`, `In Progress`); the owner answers `{ provider: "linear", seenUpdated: 2, divergences: [<the Backlog → Done row>] }`; and only after it returns the action writes one `team.reconcile_divergence` audit row (team A, the server-resolved member, `meta` of the provider, `seenUpdated: 2`, `divergences: 1`), asks one revalidation of `/t/<slug>/admin/pm-sync` and returns `{ ok: true, … }` — every brain task status as it was, no `tasks` statement, no run, neither secret in the return, the trace, a statement or a durable row, no statement binding a team B identifier, and every row team B holds unchanged although the board reads its resource as `Done` [33m 573[2mms[22m[39m
+     [33m[2m✓[22m[39m 2 — idempotent rerun, with the synthetic board as the explicit provider read control: after the first pass of case 1, the SAME call under the same session over the UNCHANGED board is admitted again, resolves and decrypts as before, reads the same three links, and is served the IDENTICAL three provider reads — so its zero is an answer to a board that was read, not a pass that did not look — and the owner answers `seenUpdated: 0` with the same one divergence: no `task_pm_links` update is issued, no link row differs (`updated_at` included), no brain task status differs, team B's rows are unchanged, and the only durable difference is the second audit row, whose `meta` reads `seenUpdated: 0`, `divergences: 1`, followed by the second revalidation [33m 449[2mms[22m[39m
+     [33m[2m✓[22m[39m 3 — refusals by real session and row state, none by a mocked guard, after a control in which the admitted admin's same call resolves, decrypts, reads the provider, records two seen statuses, stores an audit row and asks a revalidation: each a new invocation with the board still armed to answer that returns exactly `{ ok: false, error: "admins only" }`, issues the gate's own reads and nothing after them, never acquires the service client (so reads no integration and no link and hands nothing down), reaches neither the real owner nor `decryptSecret`, sends nothing to the provider, asks no revalidation, trips no tripwire and changes no durable row of either team — no session cookie, handed team A's slug (the cookie read alone; the server client is never acquired); an active role-member of team A holding the builtin Everyone row; an active role-admin of team A holding only the builtin External row; and team B's admitted admin, under their own valid session, handed team A's slug, where the only identifiers of either team any statement binds are that slug, the team id it resolved to and their own auth user; read back raw, the only reconcile audit row is the control's [33m 595[2mms[22m[39m
+[31m     [31m×[31m 4 — F4, `'linear'` named as team A's primary and team A's `'linear'` integration 'missing', while team A holds an ENABLED usable integration of the OTHER provider, team B an ENABLED usable `'linear'` integration, and team A two `'linear'` links holding a resource id: a role-member of team A is still refused as `admins only` before the service client; then team A's admitted admin's call resolves over team A's enabled rows alone, decrypts only team A's other-provider secret, and the real owner answers `{ provider: "'linear'", seenUpdated: 0, divergences: [], reason, notRunReason: "integration_unavailable" }` — those five keys — with NO link read; the action returns exactly `{ ok: false, error: "primary PM integration is unavailable" }` — two keys — with no provider request, no audit row, no revalidation, no run and no durable difference in any table of either team; nothing of team B's is bound or decrypted and neither usable integration rescues the named primary; and the SAME call again, nothing changed, issues the identical trace and leaves every row as it was[39m[33m 468[2mms[22m[39m
+[31m     [31m×[31m 4 — F4, `'linear'` named as team A's primary and team A's `'linear'` integration 'disabled', while team A holds an ENABLED usable integration of the OTHER provider, team B an ENABLED usable `'linear'` integration, and team A two `'linear'` links holding a resource id: a role-member of team A is still refused as `admins only` before the service client; then team A's admitted admin's call resolves over team A's enabled rows alone, decrypts only team A's other-provider secret, and the real owner answers `{ provider: "'linear'", seenUpdated: 0, divergences: [], reason, notRunReason: "integration_unavailable" }` — those five keys — with NO link read; the action returns exactly `{ ok: false, error: "primary PM integration is unavailable" }` — two keys — with no provider request, no audit row, no revalidation, no run and no durable difference in any table of either team; nothing of team B's is bound or decrypted and neither usable integration rescues the named primary; and the SAME call again, nothing changed, issues the identical trace and leaves every row as it was[39m[33m 454[2mms[22m[39m
+[31m     [31m×[31m 4 — F4, `'linear'` named as team A's primary and team A's `'linear'` integration 'secret-less', while team A holds an ENABLED usable integration of the OTHER provider, team B an ENABLED usable `'linear'` integration, and team A two `'linear'` links holding a resource id: a role-member of team A is still refused as `admins only` before the service client; then team A's admitted admin's call resolves over team A's enabled rows alone, decrypts only team A's other-provider secret, and the real owner answers `{ provider: "'linear'", seenUpdated: 0, divergences: [], reason, notRunReason: "integration_unavailable" }` — those five keys — with NO link read; the action returns exactly `{ ok: false, error: "primary PM integration is unavailable" }` — two keys — with no provider request, no audit row, no revalidation, no run and no durable difference in any table of either team; nothing of team B's is bound or decrypted and neither usable integration rescues the named primary; and the SAME call again, nothing changed, issues the identical trace and leaves every row as it was[39m[33m 457[2mms[22m[39m
+[31m     [31m×[31m 4 — F4, `'plane'` named as team A's primary and team A's `'plane'` integration 'missing', while team A holds an ENABLED usable integration of the OTHER provider, team B an ENABLED usable `'plane'` integration, and team A two `'plane'` links holding a resource id: a role-member of team A is still refused as `admins only` before the service client; then team A's admitted admin's call resolves over team A's enabled rows alone, decrypts only team A's other-provider secret, and the real owner answers `{ provider: "'plane'", seenUpdated: 0, divergences: [], reason, notRunReason: "integration_unavailable" }` — those five keys — with NO link read; the action returns exactly `{ ok: false, error: "primary PM integration is unavailable" }` — two keys — with no provider request, no audit row, no revalidation, no run and no durable difference in any table of either team; nothing of team B's is bound or decrypted and neither usable integration rescues the named primary; and the SAME call again, nothing changed, issues the identical trace and leaves every row as it was[39m[33m 519[2mms[22m[39m
+[31m     [31m×[31m 4 — F4, `'plane'` named as team A's primary and team A's `'plane'` integration 'disabled', while team A holds an ENABLED usable integration of the OTHER provider, team B an ENABLED usable `'plane'` integration, and team A two `'plane'` links holding a resource id: a role-member of team A is still refused as `admins only` before the service client; then team A's admitted admin's call resolves over team A's enabled rows alone, decrypts only team A's other-provider secret, and the real owner answers `{ provider: "'plane'", seenUpdated: 0, divergences: [], reason, notRunReason: "integration_unavailable" }` — those five keys — with NO link read; the action returns exactly `{ ok: false, error: "primary PM integration is unavailable" }` — two keys — with no provider request, no audit row, no revalidation, no run and no durable difference in any table of either team; nothing of team B's is bound or decrypted and neither usable integration rescues the named primary; and the SAME call again, nothing changed, issues the identical trace and leaves every row as it was[39m[33m 604[2mms[22m[39m
+[31m     [31m×[31m 4 — F4, `'plane'` named as team A's primary and team A's `'plane'` integration 'secret-less', while team A holds an ENABLED usable integration of the OTHER provider, team B an ENABLED usable `'plane'` integration, and team A two `'plane'` links holding a resource id: a role-member of team A is still refused as `admins only` before the service client; then team A's admitted admin's call resolves over team A's enabled rows alone, decrypts only team A's other-provider secret, and the real owner answers `{ provider: "'plane'", seenUpdated: 0, divergences: [], reason, notRunReason: "integration_unavailable" }` — those five keys — with NO link read; the action returns exactly `{ ok: false, error: "primary PM integration is unavailable" }` — two keys — with no provider request, no audit row, no revalidation, no run and no durable difference in any table of either team; nothing of team B's is bound or decrypted and neither usable integration rescues the named primary; and the SAME call again, nothing changed, issues the identical trace and leaves every row as it was[39m[33m 408[2mms[22m[39m
+     [33m[2m✓[22m[39m 5 — resolved `linear`, no link of team A holding a resource id (its one link was never projected; team B's projected link is listed `Done` on the board): admitted, resolved and decrypted as case 1, the link read bound to team A and `linear` is answered with ZERO rows, and the owner answers `{ provider: "linear", seenUpdated: 0, divergences: [] }` — three keys, no reason, no marker — before any provider read; the action reports it as before: `{ ok: true, provider: "linear", seenUpdated: 0, divergences: [] }`, one audit row whose `meta` reads `seenUpdated: 0`, `divergences: 0`, then the revalidation — a zero-work success, not the F4 refusal [33m 529[2mms[22m[39m
+     [33m[2m✓[22m[39m 6 — `plane` named, an ENABLED usable `plane` integration, team A holding 'two `plane` links holding a resource …' (PINNED AS CURRENT, NOT ENDORSED — residual R1): the adapter has no inbound support, so the owner answers `{ provider: "plane", seenUpdated: 0, divergences: [], reason: "plane has no inbound reconcile support" }` — four keys, NO marker — after the resolution alone, with no link read and no provider request; the action drops the reason and reports `{ ok: true, provider: "plane", seenUpdated: 0, divergences: [] }`, one audit row and the revalidation, as it did before F4; repeated, the trace is identical, no link row differs and the only durable difference per call is its audit row — none of which is evidence that a Plane board was read [33m 389[2mms[22m[39m
+     [33m[2m✓[22m[39m 6 — `plane` named, an ENABLED usable `plane` integration, team A holding 'no link at all' (PINNED AS CURRENT, NOT ENDORSED — residual R1): the adapter has no inbound support, so the owner answers `{ provider: "plane", seenUpdated: 0, divergences: [], reason: "plane has no inbound reconcile support" }` — four keys, NO marker — after the resolution alone, with no link read and no provider request; the action drops the reason and reports `{ ok: true, provider: "plane", seenUpdated: 0, divergences: [] }`, one audit row and the revalidation, as it did before F4; repeated, the trace is identical, no link row differs and the only durable difference per call is its audit row — none of which is evidence that a Plane board was read [33m 455[2mms[22m[39m
+     [33m[2m✓[22m[39m 7 — no provider resolved, none enabled: team A names no primary and its one `linear` integration is DISABLED, while team B's is enabled and usable and both hold a projected link the board lists: the enabled read bound to team A is answered with ZERO rows, nothing is decrypted, and the owner answers `{ provider: null, seenUpdated: 0, divergences: [], reason: "no enabled PM integration" }` — four keys, NO marker; the action returns its existing `{ ok: false, error: "no enabled PM integration" }` — the owner's reason, not the F4 message — with no link read, provider request, audit row, revalidation or durable difference [33m 427[2mms[22m[39m
+     [33m[2m✓[22m[39m 7 — no provider resolved, two enabled: team A names no primary and holds an ENABLED usable `linear` AND an ENABLED usable `plane` integration: the enabled read is answered with both rows, both of team A's secrets are decrypted and neither of anyone else's, and the owner answers `{ provider: null, …, reason: "multiple PM integrations enabled but teams.primary_pm_provider is unset" }` — four keys, NO marker; the action returns that reason as its existing refusal, with no link read, provider request, audit row, revalidation or durable difference [33m 634[2mms[22m[39m
+     [33m[2m✓[22m[39m 8 — sole-enabled fallback, `linear`: team A names NO primary and its one enabled PM integration is the usable `linear` one of case 1: the same call is admitted, resolves `linear`, reads the three links and the board, records two seen statuses, and is audited, revalidated and returned exactly as case 1 is — an unset primary is not a refusal, and the owner's answer is unmarked; team A still names no primary afterwards [33m 405[2mms[22m[39m
+     [33m[2m✓[22m[39m 8 — sole-enabled fallback, `plane` (PINNED AS CURRENT, NOT ENDORSED — residual R1): team A names NO primary and its one enabled PM integration is a usable `plane` one, with two `plane` links holding a resource id: resolved to `plane`, the owner answers the unsupported reason UNMARKED with no link read and no provider request, and the action reports `{ ok: true, provider: "plane", seenUpdated: 0, divergences: [] }`, audits and revalidates exactly as case 6; team A still names no primary afterwards [33m 398[2mms[22m[39m
+     [33m[2m✓[22m[39m 9 — changed state, then unchanged: after the first pass of case 1 recorded `Done` and `In Progress` on team A's two answered links, the fixture moves the board — team A's diverged resource `Done` → `In Progress`, team A's other listed resource still `In Progress`, team B's still `Done` — and the SAME call under the same session is admitted, resolves and decrypts as before, reads team A's three links and is served the same three provider reads; ONE `task_pm_links` update is issued, by the moved link's id, and the owner answers `{ provider: "linear", seenUpdated: 1, divergences: [<the Backlog → In Progress row>] }` — three keys, no marker; only after it returns the action writes one audit row (`seenUpdated: 1`, `divergences: 1`), asks one revalidation and returns `{ ok: true, … }`; the moved link's row differs in `provider_seen_status` and a LATER `updated_at` and in nothing else, and every other link row — the listed link whose state did not move among them — is equal in every column; then the same call again over that board held fixed is served the same three reads, issues NO link update, leaves every link row equal in every column, answers `seenUpdated: 0` with the same one divergence, and adds only the third audit row before the third revalidation — across all three requests no brain task status, no integration, no primary, no run and no row of team B differs, team B's link is still unrecorded although the board lists it, and the board is as this file moved it [33m 479[2mms[22m[39m
+     [2m[90m□[39m[22m LINEAR CLIENT ENVELOPE · lib/pm-sync/linear-client.ts was outside this slice's read list: the endpoint URL, the HTTP method, the header the decrypted key travels in, and `linearGraphql`'s handling of a non-2xx answer, a GraphQL `errors` array, a retry or a rate limit are not asserted; this file assumes only the `{ query, variables }` string body and the `{ data }` answer, and shows that the acting team's key was DECRYPTED and that no request carried the other team's — not where or whether the acting key is presented
+     [2m[90m□[39m[22m PROVIDER SERVICE BEHAVIOR · the provider is a value in this file: nothing here is evidence of Linear's schema, of what its API answers to these three queries, of its authorization of any key, of pagination past one page (`hasNextPage: true` on issues or members is never answered), or of an issue carrying no state; no live or recorded provider exchange takes place
+     [2m[90m□[39m[22m TRANSPORTS OTHER THAN GLOBAL FETCH · `no provider mutation` is a count of what reached global `fetch` during a request, beside source that issues only reads on this path; a transport that is not global `fetch`, and the `fetchImpl` option the action never hands down, are not counted
+     [2m[90m□[39m[22m ACTION WIRE AND NEXT CACHE · the export is called directly: the Next Server Action transport, POST dispatch, action id encryption, origin and CSRF checks, argument deserialization and what a non-string `teamSlug` would do are not exercised; `revalidatePath` is a recording seam showing only that the action ASKED for `/t/<slug>/admin/pm-sync`, with no `type`, after the owner returned and the audit insert was issued — that Next invalidates anything is not evidenced
+     [2m[90m□[39m[22m COORDINATOR · F4 RED AND MUTANTS (isolated-copy actual-import run; cases 4 to 8 are read from source and NEITHER a RED run NOR any mutant has been observed): against the sources BEFORE the marker, each of case 4's six cells must fail on the outcome (`ok: true`), the answered key list, the ledger (an audit insert and a revalidation after the owner's return) and the durable difference, with its admitted controls passing — that RED is not recorded by this file; then, on isolated copies of the candidate: omit `notRunReason` from the owner's named-unavailable return (case 4: answered keys, outcome, ledger); ignore the marker in the action (case 4: outcome, ledger, durable difference); move the audit write, `revalidatePath`, or both above the marker check (case 4: ledger, `revalidated`, durable difference); set the marker on the no-link, unsupported or null-provider return, or on every return even as `undefined` (cases 1, 2, 5, 6, 7, 8: answered keys, and the outcome where the action then refuses); refuse on `seenUpdated === 0`, an empty divergence list or a present `reason` (cases 2, 5, 6, 8); resolve the named primary through another provider or another team's row (case 4: outcome, decrypts, foreign bindings) — each must fail on those, not on a compile or fixture error; this action records no `ingest_runs` row on any branch
+     [2m[90m□[39m[22m RECONCILE ERROR POLICY · a provider read that throws or answers an error (thrown out of `reconcileProviderState` and so out of this action, with no audit row by source reading, possibly after some links were rewritten), a `decryptSecret` that throws on a stored value, a refused `integrations` read, a refused link read or link update (reconcile.ts:99-104 and :119-122 read no `error`), a refused `teams` read beneath the resolution, and a refused `audit_log` insert (swallowed) are not reached; every request here holds as a premise that Postgres refused no statement and that the responder refused no request
+     [2m[90m□[39m[22m OTHER OWNER BRANCHES · a link whose stored seen status differs from a changed board on a LATER pass (a moved board after the first pass is not constructed: the rerun holds the board fixed) and a link with an empty `last_projected_status` are not exercised; PLANE INBOUND RECONCILIATION does not exist on this snapshot (`planeAdapter` has no `fetchSeenStates`): cases 6 and 8 pin the unsupported-adapter success, audit row and revalidation as current behavior (residual R1, pending separate intake) and are not evidence that a Plane board was read, that it holds no divergence, or of any Plane no-link, changed-state or unchanged-board pass; F4's cells are `missing`, `disabled` and `secret-less` by row state only — a `decryptSecret` that throws on a stored value is the error policy's, above, and is not an F4 state
+     [2m[90m□[39m[22m ADMITTED TEAM-B INVOCATION · team B's admin is seeded and is only ever refused at team A's slug: the reverse direction — that team B's own call decrypts team B's secret alone, reads team B's Linear team and rewrites team B's link alone — is not evidenced; the responder answers for team A's Linear team only and would refuse that call
+     [2m[90m□[39m[22m OTHER REFUSAL FAMILIES · a session cookie the real verifier rejects (expired, malformed, signed under another secret), a session whose auth user has no member row anywhere, a role-`lead` member, a suspended or invited member of the right team, a slug that names no team and a guard read that Postgres refuses are not exercised; broad guard enumeration and the legacy `members.tier` column's two stale directions are the association file's
+     [2m[90m□[39m[22m TASK CONTENT POLICY · the link read names six bookkeeping columns and no `tasks` statement is issued on this path; the returned divergence carries a row key and two state names; nothing here is evidence of, or a ruling on, a task-level content boundary for what an admin of the team may be shown
+     [2m[90m□[39m[22m CONCURRENCY AND FRESHNESS · two overlapping passes, a link rewritten between the owner's read and its update, and membership revoked mid-request are not constructed; membership is read per request and no linearizability claim is made
+     [2m[90m□[39m[22m COORDINATOR · MUTANTS (isolated-copy actual-import run; every expectation below is read from source and NO mutant has been run): against this fixture, drop the `team_id` equality from the link read in lib/pm-sync/reconcile.ts (the bound equalities, the row count, team B's link rewritten and a second divergence); drop it from the integrations read in lib/integrations/manage.ts (the row count and a second decrypt); bind either to a team other than the one the owner was handed (the foreign bindings); write `provider_seen_status` unconditionally (case 2: an update, a changed row and `seenUpdated`); write the seen state back to `tasks.status` or send any mutation (the durable difference; a transport violation); move the audit write or `revalidatePath` before the owner call, drop either, or swap them (the ledger and the durable difference); ignore the null `requireAdmin` verdict (case 3) — each must then fail on the outcome, the trace, the stored row or the durable difference, not on a compile or fixture error; NOT killed by this fixture, and named so none is counted: dropping the `provider` equality from the link read (every link here is `linear`), and dropping the resource-id filter (the unprojected link would be read and then skipped, changing only the row count); no mutation evidence is supplied here
+     [2m[90m□[39m[22m EXCLUDED ACTIONS AND ACCEPTANCE · projectBoardAction of the same file, every other admin export and every other caller of reconcileProviderState are not executed here; nothing about API keys, AIO-1226 or PR714; no provider mutation is executed; this file is not an AC-04 pass, not the AIO-1217 Server Action inventory, and not acceptance, full-suite checks or final review of any criterion
+
+[31m⎯⎯⎯⎯⎯⎯⎯[39m[1m[41m Failed Tests 6 [49m[22m[31m⎯⎯⎯⎯⎯⎯⎯[39m
+
+[41m[1m FAIL [22m[49m test/datamechanics/aio1217-pm-reconcile-action-native.datamechanics.test.ts[2m > [22mAIO-1217 F4 — app/t/[team]/admin/pm-sync/actions.ts#reconcileDivergenceAction over real Postgres, real guard, real resolution and real reconcileProviderState when the pass never reaches the provider: the unavailable-integration refusal, and the branches it must leave as they were (direct calls; the same seams, the synthetic board armed to answer throughout)[2m > [22m4 — F4, `'linear'` named as team A's primary and team A's `'linear'` integration 'missing', while team A holds an ENABLED usable integration of the OTHER provider, team B an ENABLED usable `'linear'` integration, and team A two `'linear'` links holding a resource id: a role-member of team A is still refused as `admins only` before the service client; then team A's admitted admin's call resolves over team A's enabled rows alone, decrypts only team A's other-provider secret, and the real owner answers `{ provider: "'linear'", seenUpdated: 0, divergences: [], reason, notRunReason: "integration_unavailable" }` — those five keys — with NO link read; the action returns exactly `{ ok: false, error: "primary PM integration is unavailable" }` — two keys — with no provider request, no audit row, no revalidation, no run and no durable difference in any table of either team; nothing of team B's is bound or decrypted and neither usable integration rescues the named primary; and the SAME call again, nothing changed, issues the identical trace and leaves every row as it was
+[31m[1mAssertionError[22m: Alice on team A: expected { …(12) } to deeply equal { …(12) }[39m
+
+[32m- Expected[39m
+[31m+ Received[39m
+
+[33m@@ -4,17 +4,39 @@[39m
+[2m      "server": 1,[22m
+[2m    },[22m
+[2m    "answeredKeys": [[22m
+[2m      [[22m
+[2m        "divergences",[22m
+[32m-       "notRunReason",[39m
+[2m        "provider",[22m
+[2m        "reason",[22m
+[2m        "seenUpdated",[22m
+[2m      ],[22m
+[2m    ],[22m
+[32m-   "changed": {},[39m
+[31m+   "changed": {[39m
+[31m+     "audit_log": {[39m
+[31m+       "added": [[39m
+[31m+         {[39m
+[31m+           "action": "team.reconcile_divergence",[39m
+[31m+           "actor_kind": "member",[39m
+[31m+           "api_key_id": null,[39m
+[31m+           "created_at": "2026-10-06T01:42:01.051992+00:00",[39m
+[31m+           "id": 5,[39m
+[31m+           "ip": null,[39m
+[31m+           "member_id": "29976b69-6e9b-4353-8e00-041775e536cd",[39m
+[31m+           "meta": {[39m
+[31m+             "divergences": 0,[39m
+[31m+             "provider": "linear",[39m
+[31m+             "seenUpdated": 0,[39m
+[31m+           },[39m
+[31m+           "target_id": "eb2c0960-62e9-4be4-a101-b36c6e3c6e85",[39m
+[31m+           "target_type": "team",[39m
+[31m+           "team_id": "eb2c0960-62e9-4be4-a101-b36c6e3c6e85",[39m
+[31m+         },[39m
+[31m+       ],[39m
+[31m+       "removed": [],[39m
+[31m+     },[39m
+[31m+   },[39m
+[2m    "decrypted": [[22m
+[2m      "team A's other-provider synthetic secret",[22m
+[2m    ],[22m
+[2m    "foreign": [],[22m
+[2m    "guard": [[22m
+[33m@@ -66,11 +88,10 @@[39m
+[2m        "via": "admin",[22m
+[2m      },[22m
+[2m      {[22m
+[2m        "answered": {[22m
+[2m          "divergences": [],[22m
+[32m-         "notRunReason": "integration_unavailable",[39m
+[2m          "provider": "linear",[22m
+[2m          "reason": "linear integration is not enabled or has no secret",[22m
+[2m          "seenUpdated": 0,[22m
+[2m        },[22m
+[2m        "args": {[22m
+[33m@@ -103,24 +124,43 @@[39m
+[2m        },[22m
+[2m      },[22m
+[2m      {[22m
+[2m        "owner": "reconcileProviderState",[22m
+[2m        "step": "returned",[22m
+[31m+     },[39m
+[31m+     {[39m
+[31m+       "op": "insert",[39m
+[31m+       "step": "write",[39m
+[31m+       "table": "audit_log",[39m
+[31m+       "via": "admin",[39m
+[2m      },[22m
+[31m+     {[39m
+[31m+       "path": "/t/team-3a910206/admin/pm-sync",[39m
+[31m+       "step": "revalidate",[39m
+[31m+     },[39m
+[2m    ],[22m
+[2m    "outcome": {[22m
+[2m      "returned": {[22m
+[32m-       "error": "primary PM integration is unavailable",[39m
+[32m-       "ok": false,[39m
+[31m+       "divergences": [],[39m
+[31m+       "ok": true,[39m
+[31m+       "provider": "linear",[39m
+[31m+       "seenUpdated": 0,[39m
+[2m      },[22m
+[2m    },[22m
+[32m-   "revalidated": [],[39m
+[31m+   "revalidated": [[39m
+[31m+     [[39m
+[31m+       "/t/team-3a910206/admin/pm-sync",[39m
+[31m+     ],[39m
+[31m+   ],[39m
+[2m    "seams": {[22m
+[2m      "decryptSecret": 1,[22m
+[2m      "reconcileProviderState": 1,[22m
+[31m+     "revalidatePath": 1,[39m
+[2m    },[22m
+[2m    "shape": [[22m
+[32m-     "error",[39m
+[31m+     "divergences",[39m
+[2m      "ok",[22m
+[31m+     "provider",[39m
+[31m+     "seenUpdated",[39m
+[2m    ],[22m
+[2m    "surfaced": [],[22m
+[2m  }[22m
+
+[36m [2m❯[22m reach test/datamechanics/aio1217-pm-reconcile-action-native.datamechanics.test.ts:[2m1722:5[22m[39m
+    [90m1720|[39m     },
+    [90m1721|[39m     label,
+    [90m1722|[39m   ).toEqual({
+    [90m   |[39m     [31m^[39m
+    [90m1723|[39m     outcome: { returned: late.returned },
+    [90m1724|[39m     shape: Object.keys(late.returned).sort(),
+[90m [2m❯[22m test/datamechanics/aio1217-pm-reconcile-action-native.datamechanics.test.ts:[2m2056:20[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/6]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m test/datamechanics/aio1217-pm-reconcile-action-native.datamechanics.test.ts[2m > [22mAIO-1217 F4 — app/t/[team]/admin/pm-sync/actions.ts#reconcileDivergenceAction over real Postgres, real guard, real resolution and real reconcileProviderState when the pass never reaches the provider: the unavailable-integration refusal, and the branches it must leave as they were (direct calls; the same seams, the synthetic board armed to answer throughout)[2m > [22m4 — F4, `'linear'` named as team A's primary and team A's `'linear'` integration 'disabled', while team A holds an ENABLED usable integration of the OTHER provider, team B an ENABLED usable `'linear'` integration, and team A two `'linear'` links holding a resource id: a role-member of team A is still refused as `admins only` before the service client; then team A's admitted admin's call resolves over team A's enabled rows alone, decrypts only team A's other-provider secret, and the real owner answers `{ provider: "'linear'", seenUpdated: 0, divergences: [], reason, notRunReason: "integration_unavailable" }` — those five keys — with NO link read; the action returns exactly `{ ok: false, error: "primary PM integration is unavailable" }` — two keys — with no provider request, no audit row, no revalidation, no run and no durable difference in any table of either team; nothing of team B's is bound or decrypted and neither usable integration rescues the named primary; and the SAME call again, nothing changed, issues the identical trace and leaves every row as it was
+[31m[1mAssertionError[22m: Alice on team A: expected { …(12) } to deeply equal { …(12) }[39m
+
+[32m- Expected[39m
+[31m+ Received[39m
+
+[33m@@ -4,17 +4,39 @@[39m
+[2m      "server": 1,[22m
+[2m    },[22m
+[2m    "answeredKeys": [[22m
+[2m      [[22m
+[2m        "divergences",[22m
+[32m-       "notRunReason",[39m
+[2m        "provider",[22m
+[2m        "reason",[22m
+[2m        "seenUpdated",[22m
+[2m      ],[22m
+[2m    ],[22m
+[32m-   "changed": {},[39m
+[31m+   "changed": {[39m
+[31m+     "audit_log": {[39m
+[31m+       "added": [[39m
+[31m+         {[39m
+[31m+           "action": "team.reconcile_divergence",[39m
+[31m+           "actor_kind": "member",[39m
+[31m+           "api_key_id": null,[39m
+[31m+           "created_at": "2026-10-06T01:42:01.512194+00:00",[39m
+[31m+           "id": 7,[39m
+[31m+           "ip": null,[39m
+[31m+           "member_id": "b9a18f5d-3657-40aa-9390-6f3c03d6b8cc",[39m
+[31m+           "meta": {[39m
+[31m+             "divergences": 0,[39m
+[31m+             "provider": "linear",[39m
+[31m+             "seenUpdated": 0,[39m
+[31m+           },[39m
+[31m+           "target_id": "692f67ba-c91e-463b-a950-f44553e48f24",[39m
+[31m+           "target_type": "team",[39m
+[31m+           "team_id": "692f67ba-c91e-463b-a950-f44553e48f24",[39m
+[31m+         },[39m
+[31m+       ],[39m
+[31m+       "removed": [],[39m
+[31m+     },[39m
+[31m+   },[39m
+[2m    "decrypted": [[22m
+[2m      "team A's other-provider synthetic secret",[22m
+[2m    ],[22m
+[2m    "foreign": [],[22m
+[2m    "guard": [[22m
+[33m@@ -66,11 +88,10 @@[39m
+[2m        "via": "admin",[22m
+[2m      },[22m
+[2m      {[22m
+[2m        "answered": {[22m
+[2m          "divergences": [],[22m
+[32m-         "notRunReason": "integration_unavailable",[39m
+[2m          "provider": "linear",[22m
+[2m          "reason": "linear integration is not enabled or has no secret",[22m
+[2m          "seenUpdated": 0,[22m
+[2m        },[22m
+[2m        "args": {[22m
+[33m@@ -103,24 +124,43 @@[39m
+[2m        },[22m
+[2m      },[22m
+[2m      {[22m
+[2m        "owner": "reconcileProviderState",[22m
+[2m        "step": "returned",[22m
+[31m+     },[39m
+[31m+     {[39m
+[31m+       "op": "insert",[39m
+[31m+       "step": "write",[39m
+[31m+       "table": "audit_log",[39m
+[31m+       "via": "admin",[39m
+[2m      },[22m
+[31m+     {[39m
+[31m+       "path": "/t/team-7b85a7cf/admin/pm-sync",[39m
+[31m+       "step": "revalidate",[39m
+[31m+     },[39m
+[2m    ],[22m
+[2m    "outcome": {[22m
+[2m      "returned": {[22m
+[32m-       "error": "primary PM integration is unavailable",[39m
+[32m-       "ok": false,[39m
+[31m+       "divergences": [],[39m
+[31m+       "ok": true,[39m
+[31m+       "provider": "linear",[39m
+[31m+       "seenUpdated": 0,[39m
+[2m      },[22m
+[2m    },[22m
+[32m-   "revalidated": [],[39m
+[31m+   "revalidated": [[39m
+[31m+     [[39m
+[31m+       "/t/team-7b85a7cf/admin/pm-sync",[39m
+[31m+     ],[39m
+[31m+   ],[39m
+[2m    "seams": {[22m
+[2m      "decryptSecret": 1,[22m
+[2m      "reconcileProviderState": 1,[22m
+[31m+     "revalidatePath": 1,[39m
+[2m    },[22m
+[2m    "shape": [[22m
+[32m-     "error",[39m
+[31m+     "divergences",[39m
+[2m      "ok",[22m
+[31m+     "provider",[39m
+[31m+     "seenUpdated",[39m
+[2m    ],[22m
+[2m    "surfaced": [],[22m
+[2m  }[22m
+
+[36m [2m❯[22m reach test/datamechanics/aio1217-pm-reconcile-action-native.datamechanics.test.ts:[2m1722:5[22m[39m
+    [90m1720|[39m     },
+    [90m1721|[39m     label,
+    [90m1722|[39m   ).toEqual({
+    [90m   |[39m     [31m^[39m
+    [90m1723|[39m     outcome: { returned: late.returned },
+    [90m1724|[39m     shape: Object.keys(late.returned).sort(),
+[90m [2m❯[22m test/datamechanics/aio1217-pm-reconcile-action-native.datamechanics.test.ts:[2m2056:20[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/6]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m test/datamechanics/aio1217-pm-reconcile-action-native.datamechanics.test.ts[2m > [22mAIO-1217 F4 — app/t/[team]/admin/pm-sync/actions.ts#reconcileDivergenceAction over real Postgres, real guard, real resolution and real reconcileProviderState when the pass never reaches the provider: the unavailable-integration refusal, and the branches it must leave as they were (direct calls; the same seams, the synthetic board armed to answer throughout)[2m > [22m4 — F4, `'linear'` named as team A's primary and team A's `'linear'` integration 'secret-less', while team A holds an ENABLED usable integration of the OTHER provider, team B an ENABLED usable `'linear'` integration, and team A two `'linear'` links holding a resource id: a role-member of team A is still refused as `admins only` before the service client; then team A's admitted admin's call resolves over team A's enabled rows alone, decrypts only team A's other-provider secret, and the real owner answers `{ provider: "'linear'", seenUpdated: 0, divergences: [], reason, notRunReason: "integration_unavailable" }` — those five keys — with NO link read; the action returns exactly `{ ok: false, error: "primary PM integration is unavailable" }` — two keys — with no provider request, no audit row, no revalidation, no run and no durable difference in any table of either team; nothing of team B's is bound or decrypted and neither usable integration rescues the named primary; and the SAME call again, nothing changed, issues the identical trace and leaves every row as it was
+[31m[1mAssertionError[22m: Alice on team A: expected { …(12) } to deeply equal { …(12) }[39m
+
+[32m- Expected[39m
+[31m+ Received[39m
+
+[33m@@ -4,17 +4,39 @@[39m
+[2m      "server": 1,[22m
+[2m    },[22m
+[2m    "answeredKeys": [[22m
+[2m      [[22m
+[2m        "divergences",[22m
+[32m-       "notRunReason",[39m
+[2m        "provider",[22m
+[2m        "reason",[22m
+[2m        "seenUpdated",[22m
+[2m      ],[22m
+[2m    ],[22m
+[32m-   "changed": {},[39m
+[31m+   "changed": {[39m
+[31m+     "audit_log": {[39m
+[31m+       "added": [[39m
+[31m+         {[39m
+[31m+           "action": "team.reconcile_divergence",[39m
+[31m+           "actor_kind": "member",[39m
+[31m+           "api_key_id": null,[39m
+[31m+           "created_at": "2026-10-06T01:42:01.968303+00:00",[39m
+[31m+           "id": 7,[39m
+[31m+           "ip": null,[39m
+[31m+           "member_id": "074a5d8d-d17e-4a4c-b080-b136d3c9cf32",[39m
+[31m+           "meta": {[39m
+[31m+             "divergences": 0,[39m
+[31m+             "provider": "linear",[39m
+[31m+             "seenUpdated": 0,[39m
+[31m+           },[39m
+[31m+           "target_id": "f5fd592c-e2c9-4bb0-b55d-a84bf2e63dba",[39m
+[31m+           "target_type": "team",[39m
+[31m+           "team_id": "f5fd592c-e2c9-4bb0-b55d-a84bf2e63dba",[39m
+[31m+         },[39m
+[31m+       ],[39m
+[31m+       "removed": [],[39m
+[31m+     },[39m
+[31m+   },[39m
+[2m    "decrypted": [[22m
+[2m      "team A's other-provider synthetic secret",[22m
+[2m    ],[22m
+[2m    "foreign": [],[22m
+[2m    "guard": [[22m
+[33m@@ -66,11 +88,10 @@[39m
+[2m        "via": "admin",[22m
+[2m      },[22m
+[2m      {[22m
+[2m        "answered": {[22m
+[2m          "divergences": [],[22m
+[32m-         "notRunReason": "integration_unavailable",[39m
+[2m          "provider": "linear",[22m
+[2m          "reason": "linear integration is not enabled or has no secret",[22m
+[2m          "seenUpdated": 0,[22m
+[2m        },[22m
+[2m        "args": {[22m
+[33m@@ -103,24 +124,43 @@[39m
+[2m        },[22m
+[2m      },[22m
+[2m      {[22m
+[2m        "owner": "reconcileProviderState",[22m
+[2m        "step": "returned",[22m
+[31m+     },[39m
+[31m+     {[39m
+[31m+       "op": "insert",[39m
+[31m+       "step": "write",[39m
+[31m+       "table": "audit_log",[39m
+[31m+       "via": "admin",[39m
+[2m      },[22m
+[31m+     {[39m
+[31m+       "path": "/t/team-c71e4e6f/admin/pm-sync",[39m
+[31m+       "step": "revalidate",[39m
+[31m+     },[39m
+[2m    ],[22m
+[2m    "outcome": {[22m
+[2m      "returned": {[22m
+[32m-       "error": "primary PM integration is unavailable",[39m
+[32m-       "ok": false,[39m
+[31m+       "divergences": [],[39m
+[31m+       "ok": true,[39m
+[31m+       "provider": "linear",[39m
+[31m+       "seenUpdated": 0,[39m
+[2m      },[22m
+[2m    },[22m
+[32m-   "revalidated": [],[39m
+[31m+   "revalidated": [[39m
+[31m+     [[39m
+[31m+       "/t/team-c71e4e6f/admin/pm-sync",[39m
+[31m+     ],[39m
+[31m+   ],[39m
+[2m    "seams": {[22m
+[2m      "decryptSecret": 1,[22m
+[2m      "reconcileProviderState": 1,[22m
+[31m+     "revalidatePath": 1,[39m
+[2m    },[22m
+[2m    "shape": [[22m
+[32m-     "error",[39m
+[31m+     "divergences",[39m
+[2m      "ok",[22m
+[31m+     "provider",[39m
+[31m+     "seenUpdated",[39m
+[2m    ],[22m
+[2m    "surfaced": [],[22m
+[2m  }[22m
+
+[36m [2m❯[22m reach test/datamechanics/aio1217-pm-reconcile-action-native.datamechanics.test.ts:[2m1722:5[22m[39m
+    [90m1720|[39m     },
+    [90m1721|[39m     label,
+    [90m1722|[39m   ).toEqual({
+    [90m   |[39m     [31m^[39m
+    [90m1723|[39m     outcome: { returned: late.returned },
+    [90m1724|[39m     shape: Object.keys(late.returned).sort(),
+[90m [2m❯[22m test/datamechanics/aio1217-pm-reconcile-action-native.datamechanics.test.ts:[2m2056:20[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/6]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m test/datamechanics/aio1217-pm-reconcile-action-native.datamechanics.test.ts[2m > [22mAIO-1217 F4 — app/t/[team]/admin/pm-sync/actions.ts#reconcileDivergenceAction over real Postgres, real guard, real resolution and real reconcileProviderState when the pass never reaches the provider: the unavailable-integration refusal, and the branches it must leave as they were (direct calls; the same seams, the synthetic board armed to answer throughout)[2m > [22m4 — F4, `'plane'` named as team A's primary and team A's `'plane'` integration 'missing', while team A holds an ENABLED usable integration of the OTHER provider, team B an ENABLED usable `'plane'` integration, and team A two `'plane'` links holding a resource id: a role-member of team A is still refused as `admins only` before the service client; then team A's admitted admin's call resolves over team A's enabled rows alone, decrypts only team A's other-provider secret, and the real owner answers `{ provider: "'plane'", seenUpdated: 0, divergences: [], reason, notRunReason: "integration_unavailable" }` — those five keys — with NO link read; the action returns exactly `{ ok: false, error: "primary PM integration is unavailable" }` — two keys — with no provider request, no audit row, no revalidation, no run and no durable difference in any table of either team; nothing of team B's is bound or decrypted and neither usable integration rescues the named primary; and the SAME call again, nothing changed, issues the identical trace and leaves every row as it was
+[31m[1mAssertionError[22m: Alice on team A: expected { …(12) } to deeply equal { …(12) }[39m
+
+[32m- Expected[39m
+[31m+ Received[39m
+
+[33m@@ -4,17 +4,39 @@[39m
+[2m      "server": 1,[22m
+[2m    },[22m
+[2m    "answeredKeys": [[22m
+[2m      [[22m
+[2m        "divergences",[22m
+[32m-       "notRunReason",[39m
+[2m        "provider",[22m
+[2m        "reason",[22m
+[2m        "seenUpdated",[22m
+[2m      ],[22m
+[2m    ],[22m
+[32m-   "changed": {},[39m
+[31m+   "changed": {[39m
+[31m+     "audit_log": {[39m
+[31m+       "added": [[39m
+[31m+         {[39m
+[31m+           "action": "team.reconcile_divergence",[39m
+[31m+           "actor_kind": "member",[39m
+[31m+           "api_key_id": null,[39m
+[31m+           "created_at": "2026-10-06T01:42:02.489687+00:00",[39m
+[31m+           "id": 5,[39m
+[31m+           "ip": null,[39m
+[31m+           "member_id": "69dd7c16-27ac-45f6-a870-177bc06b1b1b",[39m
+[31m+           "meta": {[39m
+[31m+             "divergences": 0,[39m
+[31m+             "provider": "plane",[39m
+[31m+             "seenUpdated": 0,[39m
+[31m+           },[39m
+[31m+           "target_id": "86197cc0-d380-43b6-bb76-17a6d44de370",[39m
+[31m+           "target_type": "team",[39m
+[31m+           "team_id": "86197cc0-d380-43b6-bb76-17a6d44de370",[39m
+[31m+         },[39m
+[31m+       ],[39m
+[31m+       "removed": [],[39m
+[31m+     },[39m
+[31m+   },[39m
+[2m    "decrypted": [[22m
+[2m      "team A's other-provider synthetic secret",[22m
+[2m    ],[22m
+[2m    "foreign": [],[22m
+[2m    "guard": [[22m
+[33m@@ -66,11 +88,10 @@[39m
+[2m        "via": "admin",[22m
+[2m      },[22m
+[2m      {[22m
+[2m        "answered": {[22m
+[2m          "divergences": [],[22m
+[32m-         "notRunReason": "integration_unavailable",[39m
+[2m          "provider": "plane",[22m
+[2m          "reason": "plane integration is not enabled or has no secret",[22m
+[2m          "seenUpdated": 0,[22m
+[2m        },[22m
+[2m        "args": {[22m
+[33m@@ -103,24 +124,43 @@[39m
+[2m        },[22m
+[2m      },[22m
+[2m      {[22m
+[2m        "owner": "reconcileProviderState",[22m
+[2m        "step": "returned",[22m
+[31m+     },[39m
+[31m+     {[39m
+[31m+       "op": "insert",[39m
+[31m+       "step": "write",[39m
+[31m+       "table": "audit_log",[39m
+[31m+       "via": "admin",[39m
+[2m      },[22m
+[31m+     {[39m
+[31m+       "path": "/t/team-a8663692/admin/pm-sync",[39m
+[31m+       "step": "revalidate",[39m
+[31m+     },[39m
+[2m    ],[22m
+[2m    "outcome": {[22m
+[2m      "returned": {[22m
+[32m-       "error": "primary PM integration is unavailable",[39m
+[32m-       "ok": false,[39m
+[31m+       "divergences": [],[39m
+[31m+       "ok": true,[39m
+[31m+       "provider": "plane",[39m
+[31m+       "seenUpdated": 0,[39m
+[2m      },[22m
+[2m    },[22m
+[32m-   "revalidated": [],[39m
+[31m+   "revalidated": [[39m
+[31m+     [[39m
+[31m+       "/t/team-a8663692/admin/pm-sync",[39m
+[31m+     ],[39m
+[31m+   ],[39m
+[2m    "seams": {[22m
+[2m      "decryptSecret": 1,[22m
+[2m      "reconcileProviderState": 1,[22m
+[31m+     "revalidatePath": 1,[39m
+[2m    },[22m
+[2m    "shape": [[22m
+[32m-     "error",[39m
+[31m+     "divergences",[39m
+[2m      "ok",[22m
+[31m+     "provider",[39m
+[31m+     "seenUpdated",[39m
+[2m    ],[22m
+[2m    "surfaced": [],[22m
+[2m  }[22m
+
+[36m [2m❯[22m reach test/datamechanics/aio1217-pm-reconcile-action-native.datamechanics.test.ts:[2m1722:5[22m[39m
+    [90m1720|[39m     },
+    [90m1721|[39m     label,
+    [90m1722|[39m   ).toEqual({
+    [90m   |[39m     [31m^[39m
+    [90m1723|[39m     outcome: { returned: late.returned },
+    [90m1724|[39m     shape: Object.keys(late.returned).sort(),
+[90m [2m❯[22m test/datamechanics/aio1217-pm-reconcile-action-native.datamechanics.test.ts:[2m2056:20[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[4/6]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m test/datamechanics/aio1217-pm-reconcile-action-native.datamechanics.test.ts[2m > [22mAIO-1217 F4 — app/t/[team]/admin/pm-sync/actions.ts#reconcileDivergenceAction over real Postgres, real guard, real resolution and real reconcileProviderState when the pass never reaches the provider: the unavailable-integration refusal, and the branches it must leave as they were (direct calls; the same seams, the synthetic board armed to answer throughout)[2m > [22m4 — F4, `'plane'` named as team A's primary and team A's `'plane'` integration 'disabled', while team A holds an ENABLED usable integration of the OTHER provider, team B an ENABLED usable `'plane'` integration, and team A two `'plane'` links holding a resource id: a role-member of team A is still refused as `admins only` before the service client; then team A's admitted admin's call resolves over team A's enabled rows alone, decrypts only team A's other-provider secret, and the real owner answers `{ provider: "'plane'", seenUpdated: 0, divergences: [], reason, notRunReason: "integration_unavailable" }` — those five keys — with NO link read; the action returns exactly `{ ok: false, error: "primary PM integration is unavailable" }` — two keys — with no provider request, no audit row, no revalidation, no run and no durable difference in any table of either team; nothing of team B's is bound or decrypted and neither usable integration rescues the named primary; and the SAME call again, nothing changed, issues the identical trace and leaves every row as it was
+[31m[1mAssertionError[22m: Alice on team A: expected { …(12) } to deeply equal { …(12) }[39m
+
+[32m- Expected[39m
+[31m+ Received[39m
+
+[33m@@ -4,17 +4,39 @@[39m
+[2m      "server": 1,[22m
+[2m    },[22m
+[2m    "answeredKeys": [[22m
+[2m      [[22m
+[2m        "divergences",[22m
+[32m-       "notRunReason",[39m
+[2m        "provider",[22m
+[2m        "reason",[22m
+[2m        "seenUpdated",[22m
+[2m      ],[22m
+[2m    ],[22m
+[32m-   "changed": {},[39m
+[31m+   "changed": {[39m
+[31m+     "audit_log": {[39m
+[31m+       "added": [[39m
+[31m+         {[39m
+[31m+           "action": "team.reconcile_divergence",[39m
+[31m+           "actor_kind": "member",[39m
+[31m+           "api_key_id": null,[39m
+[31m+           "created_at": "2026-10-06T01:42:03.092355+00:00",[39m
+[31m+           "id": 7,[39m
+[31m+           "ip": null,[39m
+[31m+           "member_id": "e081e539-e966-433a-905c-e6be0f16348b",[39m
+[31m+           "meta": {[39m
+[31m+             "divergences": 0,[39m
+[31m+             "provider": "plane",[39m
+[31m+             "seenUpdated": 0,[39m
+[31m+           },[39m
+[31m+           "target_id": "27b0e5ab-f45d-44a4-972e-1728b59ad929",[39m
+[31m+           "target_type": "team",[39m
+[31m+           "team_id": "27b0e5ab-f45d-44a4-972e-1728b59ad929",[39m
+[31m+         },[39m
+[31m+       ],[39m
+[31m+       "removed": [],[39m
+[31m+     },[39m
+[31m+   },[39m
+[2m    "decrypted": [[22m
+[2m      "team A's other-provider synthetic secret",[22m
+[2m    ],[22m
+[2m    "foreign": [],[22m
+[2m    "guard": [[22m
+[33m@@ -66,11 +88,10 @@[39m
+[2m        "via": "admin",[22m
+[2m      },[22m
+[2m      {[22m
+[2m        "answered": {[22m
+[2m          "divergences": [],[22m
+[32m-         "notRunReason": "integration_unavailable",[39m
+[2m          "provider": "plane",[22m
+[2m          "reason": "plane integration is not enabled or has no secret",[22m
+[2m          "seenUpdated": 0,[22m
+[2m        },[22m
+[2m        "args": {[22m
+[33m@@ -103,24 +124,43 @@[39m
+[2m        },[22m
+[2m      },[22m
+[2m      {[22m
+[2m        "owner": "reconcileProviderState",[22m
+[2m        "step": "returned",[22m
+[31m+     },[39m
+[31m+     {[39m
+[31m+       "op": "insert",[39m
+[31m+       "step": "write",[39m
+[31m+       "table": "audit_log",[39m
+[31m+       "via": "admin",[39m
+[2m      },[22m
+[31m+     {[39m
+[31m+       "path": "/t/team-b165f1c4/admin/pm-sync",[39m
+[31m+       "step": "revalidate",[39m
+[31m+     },[39m
+[2m    ],[22m
+[2m    "outcome": {[22m
+[2m      "returned": {[22m
+[32m-       "error": "primary PM integration is unavailable",[39m
+[32m-       "ok": false,[39m
+[31m+       "divergences": [],[39m
+[31m+       "ok": true,[39m
+[31m+       "provider": "plane",[39m
+[31m+       "seenUpdated": 0,[39m
+[2m      },[22m
+[2m    },[22m
+[32m-   "revalidated": [],[39m
+[31m+   "revalidated": [[39m
+[31m+     [[39m
+[31m+       "/t/team-b165f1c4/admin/pm-sync",[39m
+[31m+     ],[39m
+[31m+   ],[39m
+[2m    "seams": {[22m
+[2m      "decryptSecret": 1,[22m
+[2m      "reconcileProviderState": 1,[22m
+[31m+     "revalidatePath": 1,[39m
+[2m    },[22m
+[2m    "shape": [[22m
+[32m-     "error",[39m
+[31m+     "divergences",[39m
+[2m      "ok",[22m
+[31m+     "provider",[39m
+[31m+     "seenUpdated",[39m
+[2m    ],[22m
+[2m    "surfaced": [],[22m
+[2m  }[22m
+
+[36m [2m❯[22m reach test/datamechanics/aio1217-pm-reconcile-action-native.datamechanics.test.ts:[2m1722:5[22m[39m
+    [90m1720|[39m     },
+    [90m1721|[39m     label,
+    [90m1722|[39m   ).toEqual({
+    [90m   |[39m     [31m^[39m
+    [90m1723|[39m     outcome: { returned: late.returned },
+    [90m1724|[39m     shape: Object.keys(late.returned).sort(),
+[90m [2m❯[22m test/datamechanics/aio1217-pm-reconcile-action-native.datamechanics.test.ts:[2m2056:20[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[5/6]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m test/datamechanics/aio1217-pm-reconcile-action-native.datamechanics.test.ts[2m > [22mAIO-1217 F4 — app/t/[team]/admin/pm-sync/actions.ts#reconcileDivergenceAction over real Postgres, real guard, real resolution and real reconcileProviderState when the pass never reaches the provider: the unavailable-integration refusal, and the branches it must leave as they were (direct calls; the same seams, the synthetic board armed to answer throughout)[2m > [22m4 — F4, `'plane'` named as team A's primary and team A's `'plane'` integration 'secret-less', while team A holds an ENABLED usable integration of the OTHER provider, team B an ENABLED usable `'plane'` integration, and team A two `'plane'` links holding a resource id: a role-member of team A is still refused as `admins only` before the service client; then team A's admitted admin's call resolves over team A's enabled rows alone, decrypts only team A's other-provider secret, and the real owner answers `{ provider: "'plane'", seenUpdated: 0, divergences: [], reason, notRunReason: "integration_unavailable" }` — those five keys — with NO link read; the action returns exactly `{ ok: false, error: "primary PM integration is unavailable" }` — two keys — with no provider request, no audit row, no revalidation, no run and no durable difference in any table of either team; nothing of team B's is bound or decrypted and neither usable integration rescues the named primary; and the SAME call again, nothing changed, issues the identical trace and leaves every row as it was
+[31m[1mAssertionError[22m: Alice on team A: expected { …(12) } to deeply equal { …(12) }[39m
+
+[32m- Expected[39m
+[31m+ Received[39m
+
+[33m@@ -4,17 +4,39 @@[39m
+[2m      "server": 1,[22m
+[2m    },[22m
+[2m    "answeredKeys": [[22m
+[2m      [[22m
+[2m        "divergences",[22m
+[32m-       "notRunReason",[39m
+[2m        "provider",[22m
+[2m        "reason",[22m
+[2m        "seenUpdated",[22m
+[2m      ],[22m
+[2m    ],[22m
+[32m-   "changed": {},[39m
+[31m+   "changed": {[39m
+[31m+     "audit_log": {[39m
+[31m+       "added": [[39m
+[31m+         {[39m
+[31m+           "action": "team.reconcile_divergence",[39m
+[31m+           "actor_kind": "member",[39m
+[31m+           "api_key_id": null,[39m
+[31m+           "created_at": "2026-10-06T01:42:03.501251+00:00",[39m
+[31m+           "id": 7,[39m
+[31m+           "ip": null,[39m
+[31m+           "member_id": "7d05146e-4b19-4e49-985e-a4b97cd8cfc0",[39m
+[31m+           "meta": {[39m
+[31m+             "divergences": 0,[39m
+[31m+             "provider": "plane",[39m
+[31m+             "seenUpdated": 0,[39m
+[31m+           },[39m
+[31m+           "target_id": "8b7c4161-ac41-43f2-8c6f-cd611ace3551",[39m
+[31m+           "target_type": "team",[39m
+[31m+           "team_id": "8b7c4161-ac41-43f2-8c6f-cd611ace3551",[39m
+[31m+         },[39m
+[31m+       ],[39m
+[31m+       "removed": [],[39m
+[31m+     },[39m
+[31m+   },[39m
+[2m    "decrypted": [[22m
+[2m      "team A's other-provider synthetic secret",[22m
+[2m    ],[22m
+[2m    "foreign": [],[22m
+[2m    "guard": [[22m
+[33m@@ -66,11 +88,10 @@[39m
+[2m        "via": "admin",[22m
+[2m      },[22m
+[2m      {[22m
+[2m        "answered": {[22m
+[2m          "divergences": [],[22m
+[32m-         "notRunReason": "integration_unavailable",[39m
+[2m          "provider": "plane",[22m
+[2m          "reason": "plane integration is not enabled or has no secret",[22m
+[2m          "seenUpdated": 0,[22m
+[2m        },[22m
+[2m        "args": {[22m
+[33m@@ -103,24 +124,43 @@[39m
+[2m        },[22m
+[2m      },[22m
+[2m      {[22m
+[2m        "owner": "reconcileProviderState",[22m
+[2m        "step": "returned",[22m
+[31m+     },[39m
+[31m+     {[39m
+[31m+       "op": "insert",[39m
+[31m+       "step": "write",[39m
+[31m+       "table": "audit_log",[39m
+[31m+       "via": "admin",[39m
+[2m      },[22m
+[31m+     {[39m
+[31m+       "path": "/t/team-ca8ae54e/admin/pm-sync",[39m
+[31m+       "step": "revalidate",[39m
+[31m+     },[39m
+[2m    ],[22m
+[2m    "outcome": {[22m
+[2m      "returned": {[22m
+[32m-       "error": "primary PM integration is unavailable",[39m
+[32m-       "ok": false,[39m
+[31m+       "divergences": [],[39m
+[31m+       "ok": true,[39m
+[31m+       "provider": "plane",[39m
+[31m+       "seenUpdated": 0,[39m
+[2m      },[22m
+[2m    },[22m
+[32m-   "revalidated": [],[39m
+[31m+   "revalidated": [[39m
+[31m+     [[39m
+[31m+       "/t/team-ca8ae54e/admin/pm-sync",[39m
+[31m+     ],[39m
+[31m+   ],[39m
+[2m    "seams": {[22m
+[2m      "decryptSecret": 1,[22m
+[2m      "reconcileProviderState": 1,[22m
+[31m+     "revalidatePath": 1,[39m
+[2m    },[22m
+[2m    "shape": [[22m
+[32m-     "error",[39m
+[31m+     "divergences",[39m
+[2m      "ok",[22m
+[31m+     "provider",[39m
+[31m+     "seenUpdated",[39m
+[2m    ],[22m
+[2m    "surfaced": [],[22m
+[2m  }[22m
+
+[36m [2m❯[22m reach test/datamechanics/aio1217-pm-reconcile-action-native.datamechanics.test.ts:[2m1722:5[22m[39m
+    [90m1720|[39m     },
+    [90m1721|[39m     label,
+    [90m1722|[39m   ).toEqual({
+    [90m   |[39m     [31m^[39m
+    [90m1723|[39m     outcome: { returned: late.returned },
+    [90m1724|[39m     shape: Object.keys(late.returned).sort(),
+[90m [2m❯[22m test/datamechanics/aio1217-pm-reconcile-action-native.datamechanics.test.ts:[2m2056:20[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[6/6]⎯[22m[39m
+
+
+[2m Test Files [22m [1m[31m1 failed[39m[22m[90m (1)[39m
+[2m      Tests [22m [1m[31m6 failed[39m[22m[2m | [22m[1m[32m11 passed[39m[22m[2m | [22m[90m13 todo[39m[90m (30)[39m
+[2m   Start at [22m 07:11:58
+[2m   Duration [22m 9.16s[2m (transform 407ms, setup 40ms, import 755ms, tests 8.25s, environment 0ms)[22m
+

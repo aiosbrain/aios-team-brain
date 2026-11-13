@@ -946,7 +946,7 @@ function referencesOf(src: ts.SourceFile): { refs: ModuleRef[]; computed: Comput
  * directive either: ECMAScript's directive prologue is StringLiteral-only, even though this graph
  * does accept a template as a module NAME (Astra adjudication 3).
  */
-function prologueHasUseServer(statements: readonly ts.Statement[]): boolean {
+export function prologueHasUseServer(statements: readonly ts.Statement[]): boolean {
   for (const st of statements) {
     if (!ts.isExpressionStatement(st)) return false;
     if (st.expression.kind !== ts.SyntaxKind.StringLiteral) return false;
@@ -962,7 +962,7 @@ function prologueHasUseServer(statements: readonly ts.Statement[]): boolean {
  * enumerates the body-bearing subset with public type guards, so the `.body` read below is sound
  * without a cast; the set the directive walk actually visits is unchanged.
  */
-type BodyBearingFunction =
+export type BodyBearingFunction =
   | ts.FunctionDeclaration
   | ts.FunctionExpression
   | ts.ArrowFunction
@@ -971,7 +971,7 @@ type BodyBearingFunction =
   | ts.GetAccessorDeclaration
   | ts.SetAccessorDeclaration;
 
-function isBodyBearingFunction(node: ts.Node): node is BodyBearingFunction {
+export function isBodyBearingFunction(node: ts.Node): node is BodyBearingFunction {
   return (
     ts.isFunctionDeclaration(node) ||
     ts.isFunctionExpression(node) ||
@@ -983,7 +983,7 @@ function isBodyBearingFunction(node: ts.Node): node is BodyBearingFunction {
   );
 }
 
-function hasUseServerDirective(src: ts.SourceFile): boolean {
+export function hasUseServerDirective(src: ts.SourceFile): boolean {
   if (prologueHasUseServer(src.statements)) return true;
   let found = false;
   const visit = (node: ts.Node): void => {

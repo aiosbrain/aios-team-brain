@@ -1,0 +1,18 @@
+{
+  "exit": 1,
+  "tier": "pg",
+  "command": [
+    "npx",
+    "vitest",
+    "run",
+    "--config",
+    "vitest.datamechanics.config.ts",
+    "test/datamechanics/aio1217-pm-reconcile-action-native.datamechanics.test.ts"
+  ],
+  "productionBefore": "844e1fa98c0a6f8206e737f6cf65b6f0aad1bc943848f28e92770966ceeed66c",
+  "productionAfter": "844e1fa98c0a6f8206e737f6cf65b6f0aad1bc943848f28e92770966ceeed66c",
+  "unchanged": true,
+  "testBefore": "79bbfe3974d3aefb7c3c2997d6f9cd0fcc39f4c4087637bff86caf37f86c684e",
+  "testAfter": "79bbfe3974d3aefb7c3c2997d6f9cd0fcc39f4c4087637bff86caf37f86c684e",
+  "testUnchanged": true
+}
